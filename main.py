@@ -1,5 +1,3 @@
-# # This is a sample Python script.
-#
 import configparser
 import time
 from selenium import webdriver
