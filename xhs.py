@@ -125,7 +125,8 @@ class XHSCrawler:
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
             )
-            print("网页已加载")
+            print("网页已加载，再等待5s")
+            time.sleep(5)
 
             # 视频封面提取逻辑
             try:
