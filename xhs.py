@@ -99,7 +99,6 @@ class XHSCrawler:
                     link_element = item.find_element(By.CSS_SELECTOR, 'a.cover.mask.ld')
                     note_url = link_element.get_attribute('href')
                     print(note_url)
-
                     if note_url in self.seen_links:
                         continue
                     if self.url_checker and self.url_checker(note_url):
@@ -281,8 +280,9 @@ class XHSCrawler:
                 # real url
                 baseUrl = noteUrl.split('?')[0]
                 # 笔记连接是否在数据库中
+                logging.info("笔记连接是否在数据库中,url: %s" % baseUrl)
                 if self.url_checker and self.url_checker(baseUrl):
-                    logging.info(f"笔记已处理过，跳过: {noteUrl}")
+                    logging.info(f"笔记已处理过，跳过: {baseUrl}")
                     continue
                 detail = self.process_single_note(noteUrl)
                 if detail:
