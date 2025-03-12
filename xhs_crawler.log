@@ -31619,3 +31619,4 @@ Stacktrace:
 17  libsystem_pthread.dylib             0x00007ff80960b18b _pthread_start + 99
 18  libsystem_pthread.dylib             0x00007ff809606ae3 thread_start + 15
 
+2025-03-12 10:09:40,012 - INFO - 爬虫任务正常结束
