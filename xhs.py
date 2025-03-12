@@ -38,9 +38,17 @@ def convert_xhs_url(original_url):
 class XHSCrawler:
     def __init__(self, url_checker: Optional[Callable] = None, insert_callback: Optional[Callable] = None):
         options = webdriver.ChromeOptions()
+        options.add_argument("--headless")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument('user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, '
+                             'like Gecko) Chrome/86.0.4240.198 Safari/537.36')
         self.driver = webdriver.Chrome(options=options)
+        # 运行这段JS隐藏浏览器特征  https://github.com/berstend/puppeteer-extra/blob/stealth-js/stealth.min.js
+        with open('./stealth.min.js', 'r') as f:
+            stealth_script = f.read()
+        self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': stealth_script})
+
         self.seen_links = set()
         self.notes_data = []
         self.url_checker = url_checker
