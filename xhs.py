@@ -278,7 +278,8 @@ class XHSCrawler:
             # 处理每个笔记详情
             for noteUrl in self.all_links:
                 # real url
-                baseUrl = noteUrl.split('?')[0]
+                baseUrl = convert_xhs_url(noteUrl)
+                baseUrl = baseUrl.split('?')[0]
                 # 笔记连接是否在数据库中
                 logging.info("笔记连接是否在数据库中,url: %s" % baseUrl)
                 if self.url_checker and self.url_checker(baseUrl):
@@ -415,9 +416,7 @@ def main():
         for brand in db.fetch_brand_urls():
             try:
                 logging.info(f"处理品牌: {brand['brand_name']}")
-                real_url = convert_xhs_url(brand['rednote_url'])
-                real_url = real_url.split('?')[0]
-                brand['rednote_url'] = real_url
+
                 # if crawler.url_checker(brand['rednote_url']):
                 #     logging.info(f"已处理过，跳过: {brand['brand_name']}")
                 #     continue
