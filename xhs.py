@@ -53,6 +53,9 @@ class XHSCrawler:
         print("运行JS")
         self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': stealth_script})
         print("浏览器运行成功")
+
+        self.driver.get('https://bot.sannysoft.com/')
+        time.sleep(60)
         self.seen_links = set()
         self.notes_data = []
         self.url_checker = url_checker
