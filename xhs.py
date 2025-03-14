@@ -78,6 +78,7 @@ class XHSCrawler:
                 )
                 return
             except Exception as e:
+                print(f"页面访问失败，错误详情：\n{e.msg}")
                 print(f"Cookie加载失败: {str(e)}")
 
         # 手动登录流程
