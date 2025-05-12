@@ -35,6 +35,67 @@ def convert_xhs_url(original_url):
     return urllib.parse.urlunparse(new_parsed)
 
 
+
+def parse_xhs_time(time_str: str) -> int:
+    """解析小红书时间格式（增强版）"""
+    from datetime import datetime, timedelta
+    import re
+
+    # 清理字符串
+    clean_str = time_str.replace('编辑于 ', '').strip()
+
+    # 分离时间和地点（新增：使用更智能的分离方式）
+    parts = re.split(r'\s+(?=[\u4e00-\u9fa5]{2,5}$)', clean_str)  # 匹配结尾的中文地区
+    time_part = parts[0]
+
+    now = datetime.now()
+    current_year = now.year
+
+    try:
+        # 处理完整日期格式（新增）
+        if re.match(r'^\d{4}-\d{1,2}-\d{1,2}$', time_part):
+            dt = datetime.strptime(time_part, "%Y-%m-%d")
+            return int(dt.replace(hour=12, minute=0).timestamp())  # 设置默认中午12点
+
+        # 处理相对时间（原有逻辑保持不变）
+        if '昨天' in time_part:
+            date = now - timedelta(days=1)
+            time_str = re.sub(r'昨天', date.strftime('%Y-%m-%d'), time_part)
+        elif '今天' in time_part:
+            time_str = re.sub(r'今天', now.strftime('%Y-%m-%d'), time_part)
+        elif '分钟前' in time_part:
+            minutes = int(re.search(r'\d+', time_part).group())
+            return int((now - timedelta(minutes=minutes)).timestamp())
+        elif '小时前' in time_part:
+            hours = int(re.search(r'\d+', time_part).group())
+            return int((now - timedelta(hours=hours)).timestamp())
+        else:
+            time_str = time_part  # 原有其他格式处理
+
+        # 处理带时间的格式（增强匹配模式）
+        time_formats = [
+            (r'(\d{1,2})-(\d{1,2}) (\d{1,2}):(\d{2})', "%m-%d %H:%M"),  # 04-20 15:30
+            (r'(\d{4})-(\d{1,2})-(\d{1,2}) (\d{1,2}):(\d{2})', "%Y-%m-%d %H:%M"),  # 2023-04-20 15:30
+            (r'(\d{1,2})-(\d{1,2})', "%m-%d"),  # 04-20
+        ]
+
+        for pattern, time_format in time_formats:
+            if re.match(pattern, time_str):
+                dt = datetime.strptime(time_str, time_format)
+                # 自动补全年份（若需要）
+                if dt.year == 1900:  # strptime默认年份
+                    dt = dt.replace(year=current_year)
+                    # 处理跨年（如当前1月但解析到12月的情况）
+                    if dt > now + timedelta(days=60):
+                        dt = dt.replace(year=current_year - 1)
+                return int(dt.timestamp())
+
+        return 0
+    except Exception as e:
+        logging.warning(f"时间解析失败: {clean_str} ({str(e)})")
+        return 0
+
+
 class XHSCrawler:
     def __init__(self, url_checker: Optional[Callable] = None, insert_callback: Optional[Callable] = None):
         options = webdriver.ChromeOptions()
@@ -142,6 +203,16 @@ class XHSCrawler:
             print("网页已加载")
             # time.sleep(5)
 
+            try:
+                # 时间提取
+                time_element = self.driver.find_element(By.CSS_SELECTOR, '.bottom-container .date')
+                raw_time = time_element.text.strip()
+                auth_time = parse_xhs_time(raw_time)
+                print(f"解析时间: {raw_time} -> {auth_time}")
+            except Exception as te:
+                logging.warning(f"时间提取失败: {str(te)}")
+                auth_time = 0
+
             # 视频封面提取逻辑
             try:
                 # 通过更稳定的选择器判断视频类型
@@ -198,6 +269,7 @@ class XHSCrawler:
                 'content': content,
                 'url': baseUrl,
                 'title': title,
+                'auth_time': auth_time,
             }
 
         except Exception as e:
@@ -328,7 +400,7 @@ class DatabaseManager:
                 SELECT id, brand_name, rednote_url 
                 FROM brand 
                 WHERE rednote_url != '' AND is_delete = 0
-                ORDER BY id ASC
+                ORDER BY spider_index DESC
             """
             cursor.execute(sql)
             return cursor.fetchall()
@@ -346,11 +418,11 @@ class DatabaseManager:
                 INSERT INTO spider_log (
                     msg_type, status, origin_type, title, 
                     content, url, images, brand_id, 
-                    brand_name, created_at, updated_at
+                    brand_name, auth_time, created_at, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, 
                     %s, %s, %s, %s, 
-                    %s, %s, %s
+                    %s, %s, %s, %s
                 )
             """
             cursor.execute(sql, (
@@ -361,6 +433,7 @@ class DatabaseManager:
                 ','.join(data['images']),
                 data['brand_id'],
                 data['brand_name'],
+                data.get('auth_time', 0),
                 int(time.time()),
                 int(time.time())
             ))
