@@ -35,29 +35,24 @@ def convert_xhs_url(original_url):
     return urllib.parse.urlunparse(new_parsed)
 
 
-
 def parse_xhs_time(time_str: str) -> int:
-    """解析小红书时间格式（增强版）"""
+    """解析小红书时间格式（新增天前处理）"""
     from datetime import datetime, timedelta
     import re
 
-    # 清理字符串
     clean_str = time_str.replace('编辑于 ', '').strip()
-
-    # 分离时间和地点（新增：使用更智能的分离方式）
-    parts = re.split(r'\s+(?=[\u4e00-\u9fa5]{2,5}$)', clean_str)  # 匹配结尾的中文地区
+    parts = re.split(r'\s+(?=[\u4e00-\u9fa5]{2,5}$)', clean_str)
     time_part = parts[0]
 
     now = datetime.now()
     current_year = now.year
 
     try:
-        # 处理完整日期格式（新增）
-        if re.match(r'^\d{4}-\d{1,2}-\d{1,2}$', time_part):
-            dt = datetime.strptime(time_part, "%Y-%m-%d")
-            return int(dt.replace(hour=12, minute=0).timestamp())  # 设置默认中午12点
-
-        # 处理相对时间（原有逻辑保持不变）
+        # 新增天前处理（保持原有结构）
+        if '天前' in time_part:
+            days = int(re.search(r'\d+', time_part).group())
+            return int((now - timedelta(days=days)).timestamp())
+        # 原有时间处理逻辑保持不变...
         if '昨天' in time_part:
             date = now - timedelta(days=1)
             time_str = re.sub(r'昨天', date.strftime('%Y-%m-%d'), time_part)
@@ -70,7 +65,7 @@ def parse_xhs_time(time_str: str) -> int:
             hours = int(re.search(r'\d+', time_part).group())
             return int((now - timedelta(hours=hours)).timestamp())
         else:
-            time_str = time_part  # 原有其他格式处理
+            time_str = time_part
 
         # 处理带时间的格式（增强匹配模式）
         time_formats = [
@@ -122,6 +117,7 @@ class XHSCrawler:
         self.insert_callback = insert_callback
         self.main_window = None
         self.all_links = set()
+        self.collected_quick_data = []  # 快速模式数据缓存
 
     def login(self):
         """优化登录流程"""
@@ -306,80 +302,142 @@ class XHSCrawler:
             logging.warning(f"提取链接时遇到异常: {str(e)}")
         return current_links
 
-    def smart_scroll(self):
+    def smart_scroll(self, spd_setting=1):
+        """智能滚动采集（动态保存链接）"""
         total_scroll = 0
         max_scroll = 20
         no_new_count = 0
-        max_no_new = 3
+        max_no_new = 6
+        last_height = 0
 
-        prev_links = set()
         while no_new_count < max_no_new and total_scroll < max_scroll:
-            # 滚动前记录当前链接
-            before_links = self.extract_current_links()
+            # 获取当前屏幕可见链接
+            current_links = self.extract_current_links()
+            # 关键修复：逐个转换链接
+            converted_new_links = {
+                convert_xhs_url(link).split('?')[0]
+                for link in (current_links - self.all_links)
+            }
+            new_links = converted_new_links - self.all_links
+
+            # 快速模式即时处理
+            if spd_setting == 2 and new_links:
+                self.process_quick_data(new_links)  # 直接传递已转换的链接集合
+
+            # 更新全局链接集合（使用原始链接）
+            self.all_links.update(current_links)
+            logging.info(f"当前总链接数：{len(self.all_links)} 新增：{len(new_links)}")
 
             # 执行滚动
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
+            time.sleep(1.5)  # 等待新内容加载
 
-            # 滚动后捕获新链接
-            after_links = self.extract_current_links()
-
-            # 使用集合操作合并链接
-            self.all_links |= after_links  # 等价于union更新
-
-            print('当前链接数：', len(self.all_links))
-
-            # 判断是否有新内容
-            new_links = after_links - before_links
-            if new_links:
-                no_new_count = 0
-                logging.info(f"本次滚动获得 {len(new_links)} 个新链接")
-            else:
+            # 检查滚动是否生效
+            new_height = self.driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
                 no_new_count += 1
-                logging.info(f"无新内容计数：{no_new_count}/{max_no_new}")
+            else:
+                no_new_count = 0
+                last_height = new_height
 
-            # 底部检测逻辑保持不变...
             total_scroll += 1
 
     def crawl_author(self, brand: Dict):
-        """处理单个作者"""
+        """处理单个作者（支持三种采集模式）"""
         try:
+            spd_setting = brand.get('rednote_spd_setting', 1)  # 获取采集配置
+            logging.info(f"品牌[{brand['brand_name']}]采集配置: {spd_setting}")
+            # 配置检查
+            if spd_setting == 3:
+                logging.info(f"品牌[{brand['brand_name']}]配置不采集，跳过")
+                return True
+
             self.driver.get(brand['rednote_url'])
-            self.smart_scroll()
+            self.smart_scroll(spd_setting)  # 传入采集模式参数
 
-            # 提取基础笔记信息
-            # base_notes = self.extract_notes()
+            # 全量采集模式处理
+            if spd_setting == 1:
+                for note_url in self.all_links:
+                    base_url = convert_xhs_url(note_url).split('?')[0]
+                    if self.url_checker and self.url_checker(base_url):
+                        logging.info(f"已处理过，跳过: {base_url}")
+                        continue
 
-            # 处理每个笔记详情
-            for noteUrl in self.all_links:
-                # real url
-                baseUrl = convert_xhs_url(noteUrl)
-                baseUrl = baseUrl.split('?')[0]
-                # 笔记连接是否在数据库中
-                logging.info("笔记连接是否在数据库中,url: %s" % baseUrl)
-                if self.url_checker and self.url_checker(baseUrl):
-                    logging.info(f"笔记已处理过，跳过: {baseUrl}")
-                    continue
-                detail = self.process_single_note(noteUrl)
-                if detail:
-                    detail.update({
+                    detail = self.process_single_note(note_url)
+                    if detail:
+                        detail.update({
+                            'brand_id': brand['id'],
+                            'brand_name': brand['brand_name']
+                        })
+                        if self.insert_callback:
+                            try:
+                                self.insert_callback(detail)
+                            except Exception as e:
+                                logging.error(f"数据库插入失败: {str(e)}")
+
+            # 快速采集模式数据提交
+            elif spd_setting == 2:
+                for quick_data in self.collected_quick_data:
+                    logging.info(f"写入快速采集数据: {quick_data}")
+                    quick_data.update({
                         'brand_id': brand['id'],
-                        'brand_name': brand['brand_name']
+                        'brand_name': brand['brand_name'],
+                        'auth_time': 0  # 快速模式无时间信息
                     })
-                    print("笔记详情")
-                    print(detail)
-                    # self.notes_data.append(detail)
-                    # 直接调用插入回调函数
                     if self.insert_callback:
                         try:
-                            self.insert_callback(detail)  # 实时插入
+                            self.insert_callback(quick_data)
                         except Exception as e:
                             logging.error(f"数据库插入失败: {str(e)}")
+                logging.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
 
+            # 清理采集缓存
+            self.all_links.clear()
+            self.collected_quick_data.clear()
             return True
         except Exception as e:
             logging.error(f"作者采集失败 {brand['rednote_url']}: {str(e)}")
             return False
+
+    def process_quick_data(self, new_links):
+        """快速采集模式数据处理"""
+        current_items = self.driver.find_elements(By.CSS_SELECTOR, '.note-item')
+        for item in current_items:
+            try:
+                link = item.find_element(By.CSS_SELECTOR, 'a.cover.mask.ld').get_attribute('href')
+                clean_url = convert_xhs_url(link).split('?')[0]
+
+                # 新增数据库去重检查
+                if self.url_checker and self.url_checker(clean_url):
+                    logging.info(f"已存在，跳过快速采集: {clean_url}")
+                    continue
+
+                if clean_url not in new_links:
+                    continue
+
+                # 提取首图
+                try:
+                    img = item.find_element(By.CSS_SELECTOR, 'img[src*="xhscdn.com"]')
+                    cover_url = img.get_attribute('src').split('?')[0]
+                except Exception as e:
+                    logging.warning(f"首图提取失败: {str(e)}")
+                    cover_url = ""
+
+                # 提取标题
+                try:
+                    title = item.find_element(By.CSS_SELECTOR, '.title > span').text[:600]
+                except Exception as e:
+                    title = "无标题"
+                    logging.warning(f"标题提取失败: {str(e)}")
+
+                self.collected_quick_data.append({
+                    'url': clean_url,
+                    'images': [cover_url] if cover_url else [],
+                    'title': title,
+                    'content': ''
+                })
+            except Exception as e:
+                logging.error(f"快速采集异常: {str(e)}")
 
 
 class DatabaseManager:
@@ -396,14 +454,21 @@ class DatabaseManager:
 
     def fetch_brand_urls(self) -> list:
         with self.connection.cursor() as cursor:
+            # and id not in (SELECT DISTINCT brand_id from spider_log )
             sql = """
-                SELECT id, brand_name, rednote_url 
+                SELECT id, brand_name, rednote_url, rednote_spd_setting 
                 FROM brand 
                 WHERE rednote_url != '' AND is_delete = 0
-                ORDER BY spider_index DESC
+                ORDER BY spider_index DESC, last_gather_time ASC
             """
             cursor.execute(sql)
             return cursor.fetchall()
+
+    def update_last_gather_time(self, brand_id: int):
+        with self.connection.cursor() as cursor:
+            sql = "UPDATE brand SET last_gather_time = NOW() WHERE id = %s"
+            cursor.execute(sql, (brand_id,))
+            self.connection.commit()
 
     def is_url_exists(self, title: str) -> bool:
         with self.connection.cursor() as cursor:
@@ -483,7 +548,7 @@ def main():
     print("初始化DB")
     db = DatabaseManager()
     print()
-    crawler = XHSCrawler(url_checker=db.is_url_exists,  insert_callback=db.insert_one)
+    crawler = XHSCrawler(url_checker=db.is_url_exists, insert_callback=db.insert_one)
 
     try:
         print("准备登录")
@@ -496,13 +561,17 @@ def main():
                 # if crawler.url_checker(brand['rednote_url']):
                 #     logging.info(f"已处理过，跳过: {brand['brand_name']}")
                 #     continue
-                crawler.crawl_author(brand)
+                if crawler.crawl_author(brand):
+                    # 采集成功时更新采集时间
+                    db.update_last_gather_time(brand['id'])
+                    logging.info(f"已更新采集时间: {brand['brand_name']}")
 
                 # 批量写入数据库
                 # db.batch_insert(crawler.notes_data)
                 # logging.info(f"成功入库 {len(crawler.notes_data)} 条笔记")
                 crawler.notes_data.clear()
                 crawler.all_links.clear()
+
 
 
             except Exception as e:
