@@ -302,13 +302,16 @@ class XHSCrawler:
             logging.warning(f"提取链接时遇到异常: {str(e)}")
         return current_links
 
-    def smart_scroll(self, spd_setting=1):
+    def smart_scroll(self, spd_setting=1, max_scroll=20):
         """智能滚动采集（动态保存链接）"""
         total_scroll = 0
-        max_scroll = 20
         no_new_count = 0
         max_no_new = 6
         last_height = 0
+
+        # 新增：记录最大滚动次数
+        logging.info(f"智能滚动设置: 最大滚动次数={max_scroll}")
+
 
         while no_new_count < max_no_new and total_scroll < max_scroll:
             # 获取当前屏幕可见链接
@@ -352,8 +355,15 @@ class XHSCrawler:
                 logging.info(f"品牌[{brand['brand_name']}]配置不采集，跳过")
                 return True
 
+            # 新增：检查已采集数量
+            collected_count = self.get_collected_count(brand['id'])
+            logging.info(f"品牌[{brand['brand_name']}]已采集数量: {collected_count}")
+
+            # 新增：如果全量采集且已采集>20，则不滚动
+            max_scroll = 1 if (spd_setting == 1 and collected_count > 20) else 20
+
             self.driver.get(brand['rednote_url'])
-            self.smart_scroll(spd_setting)  # 传入采集模式参数
+            self.smart_scroll(spd_setting, max_scroll)  # 传入采集模式参数
 
             # 全量采集模式处理
             if spd_setting == 1:
@@ -398,6 +408,22 @@ class XHSCrawler:
         except Exception as e:
             logging.error(f"作者采集失败 {brand['rednote_url']}: {str(e)}")
             return False
+
+    def get_collected_count(self, brand_id: int) -> int:
+        """查询该品牌已采集数量"""
+        # 使用url_checker函数（即db.is_url_exists）的底层连接执行查询
+        if self.url_checker and hasattr(self.url_checker, '__self__'):
+            db = self.url_checker.__self__
+            try:
+                with db.connection.cursor() as cursor:
+                    sql = "SELECT COUNT(*) AS count FROM spider_log WHERE brand_id = %s"
+                    cursor.execute(sql, (brand_id,))
+                    result = cursor.fetchone()
+                    return result['count'] if result else 0
+            except Exception as e:
+                logging.error(f"查询已采集数量失败: {str(e)}")
+                return 0
+        return 0
 
     def process_quick_data(self, new_links):
         """快速采集模式数据处理"""
