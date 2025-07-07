@@ -197,7 +197,7 @@ class XHSCrawler:
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
             )
             print("网页已加载")
-            # time.sleep(5)
+            time.sleep(2)
 
             try:
                 # 时间提取
@@ -208,6 +208,33 @@ class XHSCrawler:
             except Exception as te:
                 logging.warning(f"时间提取失败: {str(te)}")
                 auth_time = 0
+
+            # 新增：点赞数提取
+
+            try:
+                like_count = 0
+                # 尝试定位点赞数元素
+                like_element = self.driver.find_element(
+                    By.CSS_SELECTOR,
+                    '.interact-container .like-active .count'
+                )
+                like_text = like_element.text.strip()
+                print("like = " + like_text)
+                # 处理点赞数的不同表示形式
+                if '万' in like_text:
+                    # 处理"万"单位的点赞数
+                    like_count = int(float(like_text.replace('万', '')) * 10000)
+                elif 'k' in like_text.lower():
+                    # 处理"k"单位的点赞数
+                    like_count = int(float(like_text.lower().replace('k', '')) * 1000)
+                else:
+                    # 直接转换为整数
+                    like_count = int(like_text) if like_text.isdigit() else 0
+
+                print(f"提取到点赞数: {like_count}")
+            except Exception as le:
+                logging.warning(f"点赞数提取失败: {str(le)}")
+                like_count = 0
 
             # 视频封面提取逻辑
             try:
@@ -266,6 +293,7 @@ class XHSCrawler:
                 'url': baseUrl,
                 'title': title,
                 'auth_time': auth_time,
+                'like_count': like_count,
             }
 
         except Exception as e:
@@ -509,11 +537,11 @@ class DatabaseManager:
                 INSERT INTO spider_log (
                     msg_type, status, origin_type, title, 
                     content, url, images, brand_id, 
-                    brand_name, auth_time, created_at, updated_at
+                    brand_name, auth_time, created_at, updated_at, likes
                 ) VALUES (
                     %s, %s, %s, %s, 
                     %s, %s, %s, %s, 
-                    %s, %s, %s, %s
+                    %s, %s, %s, %s, %s
                 )
             """
             cursor.execute(sql, (
@@ -526,7 +554,8 @@ class DatabaseManager:
                 data['brand_name'],
                 data.get('auth_time', 0),
                 int(time.time()),
-                int(time.time())
+                int(time.time()),
+                data.get('like', 0)
             ))
             self.connection.commit()
 
