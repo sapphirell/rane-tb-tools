@@ -118,6 +118,7 @@ class XHSCrawler:
         self.main_window = None
         self.all_links = set()
         self.collected_quick_data = []  # 快速模式数据缓存
+        self.wait_rate = 5
 
     def login(self):
         """优化登录流程"""
@@ -197,7 +198,7 @@ class XHSCrawler:
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
             )
             print("网页已加载")
-            time.sleep(2)
+            time.sleep(2 * self.wait_rate)
 
             try:
                 # 时间提取
@@ -361,7 +362,7 @@ class XHSCrawler:
 
             # 执行滚动
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1.5)  # 等待新内容加载
+            time.sleep(1.5 * self.wait_rate)  # 等待新内容加载
 
             # 检查滚动是否生效
             new_height = self.driver.execute_script("return document.body.scrollHeight")
