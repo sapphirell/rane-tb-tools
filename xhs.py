@@ -1,5 +1,6 @@
 import os
 import pickle
+import sys
 import time
 import urllib
 import urllib.parse
@@ -597,8 +598,14 @@ def main():
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('xhs_crawler.log'),
-            logging.StreamHandler()
+            # 文件处理器使用UTF-8编码
+            logging.FileHandler('xhs_crawler.log', encoding='utf-8'),
+
+            # 控制台处理器使用带错误处理的UTF-8
+            logging.StreamHandler(stream=open(sys.stdout.fileno(),
+                                              'w',
+                                              encoding='utf-8',
+                                              errors='replace'))
         ]
     )
     print("初始化DB")
