@@ -197,7 +197,7 @@ class XHSCrawler:
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
             )
             print("网页已加载")
-            time.sleep(2)
+            time.sleep(3)
 
             try:
                 # 时间提取
@@ -361,7 +361,7 @@ class XHSCrawler:
 
             # 执行滚动
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1.5)  # 等待新内容加载
+            time.sleep(10.5)  # 等待新内容加载
 
             # 检查滚动是否生效
             new_height = self.driver.execute_script("return document.body.scrollHeight")
@@ -402,6 +402,8 @@ class XHSCrawler:
                         continue
 
                     detail = self.process_single_note(note_url)
+                    # 等待5s
+                    time.sleep(5)
                     if detail:
                         detail.update({
                             'brand_id': brand['id'],
