@@ -319,7 +319,7 @@ class ArtistXHSCrawler:
 
             # 滚动页面
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(3.5)
+            time.sleep(23.5)
 
             # 检查是否滚动到底部
             new_height = self.driver.execute_script("return document.body.scrollHeight")

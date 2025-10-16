@@ -363,7 +363,7 @@ class XHSCrawler:
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(10.5)  # 等待新内容加载
 
-            # 检查滚动是否生效
+            # 检查q滚动是否生效
             new_height = self.driver.execute_script("return document.body.scrollHeight")
             if new_height == last_height:
                 no_new_count += 1
