@@ -5,6 +5,7 @@
 - 显示采集用时（HH:MM:SS）
 - 显示品牌处理进度百分比
 - 显示 sleep 等待读条（滚动等待 & 详情等待）
+- 新增：检测到验证码 #red-captcha 后，自动把“滚动等待(秒)”与“详情等待(秒)”改为 999（直到你手工改回）
 """
 
 import os
@@ -212,6 +213,8 @@ class XHSCrawler:
         get_detail_sleep: Optional[Callable[[], float]] = None,
         # sleep 进度回调(phase, elapsed, total)
         on_sleep: Optional[Callable[[str, float, float], None]] = None,
+        # 验证码回调（触发后由 GUI 把等待改成 999）
+        on_captcha_detected: Optional[Callable[[], None]] = None,
         max_scroll_default: int = 20,
         headless: bool = False,
         logger: Optional[logging.Logger] = None
@@ -221,6 +224,7 @@ class XHSCrawler:
         self.get_scroll_sleep = get_scroll_sleep or (lambda: 10.5)
         self.get_detail_sleep = get_detail_sleep or (lambda: 5.0)
         self.on_sleep = on_sleep
+        self.on_captcha_detected = on_captcha_detected
         self.max_scroll_default = int(max_scroll_default)
         self.logger = logger or logging.getLogger(__name__)
 
@@ -267,10 +271,32 @@ class XHSCrawler:
         if self.stop_requested:
             raise KeyboardInterrupt("收到停止信号")
 
+    # ---------- 验证码检测 ----------
+    def detect_and_handle_captcha(self, where: str = "") -> bool:
+        """检测页面上是否出现红薯验证码容器 #red-captcha；如出现，触发回调将等待改为 999"""
+        try:
+            # 直接找 id 更快更稳
+            hits = self.driver.find_elements(By.ID, "red-captcha")
+            if hits and len(hits) > 0 and hits[0].is_displayed():
+                self.logger.warning(f"检测到验证码 #red-captcha（{where}），已将等待修改为 999 秒，直到你手动改回。")
+                if self.on_captcha_detected:
+                    try:
+                        self.on_captcha_detected()
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            # 有些页面可能在 shadow 或 iframe，这里简单容错：不抛异常就行
+            pass
+        return False
+
     # ---------- 登录 ----------
     def login(self):
         self.driver.get('https://www.xiaohongshu.com/explore')
         self.main_window = self.driver.current_window_handle
+
+        # 首页也检测一次验证码
+        self.detect_and_handle_captcha("登录/进入 explore 首页")
 
         if os.path.exists("xhs_cookie.pkl"):
             try:
@@ -278,6 +304,8 @@ class XHSCrawler:
                 for cookie in cookies:
                     self.driver.add_cookie(cookie)
                 self.driver.refresh()
+                # 刷新后再检测一次
+                self.detect_and_handle_captcha("Cookie 登录刷新")
                 WebDriverWait(self.driver, 15).until(
                     EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
                 )
@@ -290,6 +318,8 @@ class XHSCrawler:
         WebDriverWait(self.driver, 120).until(
             EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
         )
+        # 登录完成后也检测一次
+        self.detect_and_handle_captcha("手动登录完成")
         pickle.dump(self.driver.get_cookies(), open("xhs_cookie.pkl", "wb"))
         self.logger.info('登录成功并已保存 Cookie')
 
@@ -324,6 +354,9 @@ class XHSCrawler:
 
         while no_new_count < max_no_new and total_scroll < max_scroll:
             self.check_stop()
+
+            # 每轮开始先检测一次验证码
+            self.detect_and_handle_captcha("滚动列表")
 
             current_links = self.extract_current_links()
             converted_new_links = {
@@ -364,6 +397,9 @@ class XHSCrawler:
             self.driver.execute_script(f"window.open('{note_url}');")
             new_window = [w for w in self.driver.window_handles if w != self.main_window][0]
             self.driver.switch_to.window(new_window)
+
+            # 打开后先检测验证码
+            self.detect_and_handle_captcha("笔记详情页打开")
 
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
@@ -526,7 +562,9 @@ class XHSCrawler:
 
             max_scroll = 1 if (spd_setting == 1 and collected_count > 20) else self.max_scroll_default
 
+            # 打开品牌页也检测验证码
             self.driver.get(brand['rednote_url'])
+            self.detect_and_handle_captcha("品牌主页")
             self.smart_scroll(spd_setting, max_scroll)
 
             # 全量
@@ -594,7 +632,6 @@ class XHSCrawler:
                 pass
 
         if total == 0:
-            # 0 秒等待也推满格，方便 UI 刷新
             if self.on_sleep:
                 try:
                     self.on_sleep(phase, total, total)
@@ -608,13 +645,15 @@ class XHSCrawler:
             self.check_stop()
             time.sleep(min(step, total - elapsed))
             elapsed = min(total, elapsed + step)
+            # 读条过程中也可以偶尔探测一次（避免太频繁）
+            if int(elapsed * 10) % 25 == 0:  # 约每0.25秒判断一次
+                self.detect_and_handle_captcha(f"等待阶段({phase})")
             if self.on_sleep:
                 try:
                     self.on_sleep(phase, elapsed, total)
                 except Exception:
                     pass
 
-        # 结束时再回调一次满格
         if self.on_sleep:
             try:
                 self.on_sleep(phase, total, total)
@@ -648,7 +687,7 @@ class App:
     def __init__(self, master: tk.Tk):
         self.master = master
         self.master.title("小红书爬虫 · 采集控制台")
-        self.master.geometry("920x780")
+        self.master.geometry("920x800")
 
         # ===== 参数区 =====
         frm = ttk.LabelFrame(master, text="采集参数（可运行中随时修改）")
@@ -771,6 +810,20 @@ class App:
         except Exception:
             pass
 
+    # ====== 验证码检测时，由爬虫调用（线程安全地把等待改为 999） ======
+    def on_captcha_detected(self):
+        def _apply():
+            self.var_scroll_sleep.set("999")
+            self.var_detail_sleep.set("999")
+            try:
+                messagebox.showwarning("验证码提示", "检测到小红书验证码，已将等待改为 999 秒，请手动解决验证码后再把等待时间改回。")
+            except Exception:
+                pass
+        try:
+            self.master.after(0, _apply)
+        except Exception:
+            pass
+
     def _clear_sleep_bar(self):
         self.var_sleep_text.set("当前无等待")
         self.sleep_bar['value'] = 0
@@ -828,6 +881,7 @@ class App:
                     get_scroll_sleep=self.get_scroll_sleep,   # 运行中实时读取
                     get_detail_sleep=self.get_detail_sleep,   # 运行中实时读取
                     on_sleep=self.on_sleep,                   # 读条回调
+                    on_captcha_detected=self.on_captcha_detected,  # 验证码回调
                     max_scroll_default=max_scroll,
                     headless=self.var_headless.get(),
                     logger=self.logger
