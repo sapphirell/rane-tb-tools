@@ -1,11 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-小红书采集 GUI 版
-- 运行中实时修改采集速度（滚动/详情等待）
-- 显示采集用时（HH:MM:SS）
-- 显示品牌处理进度百分比
-- 显示 sleep 等待读条（滚动等待 & 详情等待）
-- 新增：检测到验证码 #red-captcha 后，自动把“滚动等待(秒)”与“详情等待(秒)”改为 999（直到你手工改回）
+小红书采集 GUI 版（含：验证码触发把等待改为999秒 + 跳过当前等待按钮 + DB自动重连）
 """
 
 import os
@@ -13,12 +8,12 @@ import pickle
 import time
 import urllib
 import urllib.parse
-import pymysql
 import logging
 import threading
 from typing import Dict, Optional, Callable
 
-# ====== Selenium ======
+# ====== 第三方 ======
+import pymysql
 from selenium.webdriver import Chrome
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -102,102 +97,150 @@ def parse_xhs_time(time_str: str) -> int:
         return 0
 
 
-# ===================== 数据库管理 =====================
+# ===================== 数据库（自动重连 + 重试 + likes列自适应） =====================
 
 class DatabaseManager:
     def __init__(self):
-        # 按你的原配置初始化（如需可改为从 GUI 配）
-        self.connection = pymysql.connect(
+        self._conn_args = dict(
             host='111.229.182.88',
             port=3306,
             user='root',
             password='s*xNvd%v@',
             database='sukitime',
             charset='utf8mb4',
-            cursorclass=pymysql.cursors.DictCursor
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=True,
+            connect_timeout=10,
+            read_timeout=30,
+            write_timeout=30,
         )
+        self.connection = pymysql.connect(**self._conn_args)
+        self._has_likes_col = None  # 运行时探测
 
+    def _ensure_conn(self):
+        try:
+            self.connection.ping(reconnect=True)
+        except Exception:
+            self.connection = pymysql.connect(**self._conn_args)
+
+    def _exec(self, sql, params=None, many=False):
+        self._ensure_conn()
+        try:
+            with self.connection.cursor() as cursor:
+                if many:
+                    cursor.executemany(sql, params or [])
+                else:
+                    cursor.execute(sql, params or ())
+                return cursor, cursor.rowcount
+        except Exception:
+            # 断线重建后重试一次
+            self._ensure_conn()
+            with self.connection.cursor() as cursor:
+                if many:
+                    cursor.executemany(sql, params or [])
+                else:
+                    cursor.execute(sql, params or ())
+                return cursor, cursor.rowcount
+
+    def _check_likes_col(self) -> bool:
+        if self._has_likes_col is not None:
+            return self._has_likes_col
+        try:
+            cur, _ = self._exec("SHOW COLUMNS FROM spider_log LIKE 'likes'")
+            self._has_likes_col = bool(cur.fetchone())
+        except Exception:
+            self._has_likes_col = False
+        return self._has_likes_col
+
+    # 业务方法
     def fetch_brand_urls(self) -> list:
-        with self.connection.cursor() as cursor:
-            sql = """
-                SELECT id, brand_name, rednote_url, rednote_spd_setting 
-                FROM brand 
-                WHERE rednote_url != '' AND is_delete = 0 AND is_brand = 1
-                ORDER BY spider_index DESC, last_gather_time ASC
-            """
-            cursor.execute(sql)
-            return cursor.fetchall()
+        sql = """
+            SELECT id, brand_name, rednote_url, rednote_spd_setting 
+            FROM brand 
+            WHERE rednote_url != '' AND is_delete = 0 AND is_brand = 1
+            ORDER BY spider_index DESC, last_gather_time ASC
+        """
+        cur, _ = self._exec(sql)
+        return cur.fetchall()
 
     def update_last_gather_time(self, brand_id: int):
-        with self.connection.cursor() as cursor:
-            sql = "UPDATE brand SET last_gather_time = NOW() WHERE id = %s"
-            cursor.execute(sql, (brand_id,))
-            self.connection.commit()
+        self._exec("UPDATE brand SET last_gather_time = NOW() WHERE id = %s", (brand_id,))
 
     def is_url_exists(self, url: str) -> bool:
-        with self.connection.cursor() as cursor:
-            sql = "SELECT 1 FROM spider_log WHERE url = %s LIMIT 1"
-            cursor.execute(sql, (url,))
-            return bool(cursor.fetchone())
+        cur, _ = self._exec("SELECT 1 FROM spider_log WHERE url = %s LIMIT 1", (url,))
+        return bool(cur.fetchone())
+
+    def get_collected_count_by_brand(self, brand_id: int) -> int:
+        cur, _ = self._exec("SELECT COUNT(*) AS cnt FROM spider_log WHERE brand_id = %s", (brand_id,))
+        row = cur.fetchone()
+        return int(row['cnt'] if row and row['cnt'] is not None else 0)
 
     def insert_one(self, data: Dict):
-        """单条插入优化"""
-        with self.connection.cursor() as cursor:
+        title = (data.get('title') or '')[:255]
+        content = (data.get('content') or '')[:2000]
+        images = ','.join(data.get('images') or [])[:2000]
+        like_count = int(data.get('like_count') or 0)
+        has_likes = self._check_likes_col()
+
+        if has_likes:
             sql = """
                 INSERT INTO spider_log (
                     msg_type, status, origin_type, title, 
                     content, url, images, brand_id, 
                     brand_name, auth_time, created_at, updated_at, likes
-                ) VALUES (
-                    %s, %s, %s, %s, 
-                    %s, %s, %s, %s, 
-                    %s, %s, %s, %s, %s
-                )
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """
-            cursor.execute(sql, (
-                0, 0, 'xhs',
-                data['title'],
-                data['content'],
-                data['url'],
-                ','.join(data['images']),
-                data['brand_id'],
-                data['brand_name'],
-                data.get('auth_time', 0),
-                int(time.time()),
-                int(time.time()),
-                data.get('like_count', 0)  # 使用 like_count
-            ))
-            self.connection.commit()
-
-    def batch_insert(self, data: list):
-        """批量插入优化"""
-        with self.connection.cursor() as cursor:
+            params = (
+                0, 0, 'xhs', title, content,
+                data['url'], images, data['brand_id'], data['brand_name'],
+                int(data.get('auth_time', 0)), int(time.time()), int(time.time()), like_count
+            )
+        else:
             sql = """
                 INSERT INTO spider_log (
                     msg_type, status, origin_type, title, 
                     content, url, images, brand_id, 
-                    brand_name, created_at, updated_at
-                ) VALUES (
-                    %s, %s, %s, %s, 
-                    %s, %s, %s, %s, 
-                    %s, %s, %s
-                )
+                    brand_name, auth_time, created_at, updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """
-            batch = []
-            for item in data:
-                batch.append((
-                    0, 0, 'xhs',
-                    item['title'],
-                    item['content'],
-                    item['url'],
-                    ','.join(item['images']),
-                    item['brand_id'],
-                    item['brand_name'],
-                    int(time.time()),
-                    int(time.time())
-                ))
-            cursor.executemany(sql, batch)
-            self.connection.commit()
+            params = (
+                0, 0, 'xhs', title, content,
+                data['url'], images, data['brand_id'], data['brand_name'],
+                int(data.get('auth_time', 0)), int(time.time()), int(time.time())
+            )
+        self._exec(sql, params)
+
+    def batch_insert(self, data: list):
+        has_likes = self._check_likes_col()
+        rows = []
+        now = int(time.time())
+        for item in data:
+            title = (item.get('title') or '')[:255]
+            content = (item.get('content') or '')[:2000]
+            images = ','.join(item.get('images') or [])[:2000]
+            base = [0, 0, 'xhs', title, content, item['url'], images,
+                    item['brand_id'], item['brand_name'], int(item.get('auth_time', 0)), now, now]
+            if has_likes:
+                base.append(int(item.get('like_count', 0)))
+            rows.append(tuple(base))
+
+        if has_likes:
+            sql = """
+                INSERT INTO spider_log (
+                    msg_type, status, origin_type, title, 
+                    content, url, images, brand_id, 
+                    brand_name, auth_time, created_at, updated_at, likes
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """
+        else:
+            sql = """
+                INSERT INTO spider_log (
+                    msg_type, status, origin_type, title, 
+                    content, url, images, brand_id, 
+                    brand_name, auth_time, created_at, updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """
+        self._exec(sql, rows, many=True)
 
 
 # ===================== 爬虫核心 =====================
@@ -208,13 +251,11 @@ class XHSCrawler:
         url_checker: Optional[Callable] = None,
         insert_callback: Optional[Callable] = None,
         *,
-        # 运行中“动态读取”sleep 的函数
         get_scroll_sleep: Optional[Callable[[], float]] = None,
         get_detail_sleep: Optional[Callable[[], float]] = None,
-        # sleep 进度回调(phase, elapsed, total)
         on_sleep: Optional[Callable[[str, float, float], None]] = None,
-        # 验证码回调（触发后由 GUI 把等待改成 999）
-        on_captcha_detected: Optional[Callable[[], None]] = None,
+        on_captcha_detected: Optional[Callable[[str], None]] = None,  # 新增：发现验证码时回调
+        skip_event: Optional[threading.Event] = None,                 # 新增：跳过等待事件
         max_scroll_default: int = 20,
         headless: bool = False,
         logger: Optional[logging.Logger] = None
@@ -225,6 +266,7 @@ class XHSCrawler:
         self.get_detail_sleep = get_detail_sleep or (lambda: 5.0)
         self.on_sleep = on_sleep
         self.on_captcha_detected = on_captcha_detected
+        self.skip_event = skip_event or threading.Event()
         self.max_scroll_default = int(max_scroll_default)
         self.logger = logger or logging.getLogger(__name__)
 
@@ -241,10 +283,9 @@ class XHSCrawler:
         self.logger.info("准备初始化浏览器")
         self.driver: Chrome = webdriver.Chrome(options=options)
 
-        # 尝试注入 stealth
+        # 注入 stealth（如有）
         stealth_path = './stealth.min.js'
         if os.path.exists(stealth_path):
-            self.logger.info("加载 stealth.min.js")
             try:
                 with open(stealth_path, 'r', encoding='utf-8') as f:
                     stealth_script = f.read()
@@ -272,21 +313,20 @@ class XHSCrawler:
             raise KeyboardInterrupt("收到停止信号")
 
     # ---------- 验证码检测 ----------
-    def detect_and_handle_captcha(self, where: str = "") -> bool:
-        """检测页面上是否出现红薯验证码容器 #red-captcha；如出现，触发回调将等待改为 999"""
+    def _detect_and_handle_captcha(self, where: str):
+        """where: 'explore' / 'scroll' / 'detail'"""
         try:
-            # 直接找 id 更快更稳
-            hits = self.driver.find_elements(By.ID, "red-captcha")
-            if hits and len(hits) > 0 and hits[0].is_displayed():
+            els = self.driver.find_elements(By.CSS_SELECTOR, "#red-captcha, div#red-captcha")
+            visible = any(e.is_displayed() for e in els) if els else False
+            if visible:
                 self.logger.warning(f"检测到验证码 #red-captcha（{where}），已将等待修改为 999 秒，直到你手动改回。")
                 if self.on_captcha_detected:
                     try:
-                        self.on_captcha_detected()
+                        self.on_captcha_detected(where)
                     except Exception:
                         pass
                 return True
         except Exception:
-            # 有些页面可能在 shadow 或 iframe，这里简单容错：不抛异常就行
             pass
         return False
 
@@ -295,8 +335,8 @@ class XHSCrawler:
         self.driver.get('https://www.xiaohongshu.com/explore')
         self.main_window = self.driver.current_window_handle
 
-        # 首页也检测一次验证码
-        self.detect_and_handle_captcha("登录/进入 explore 首页")
+        # 主页验证码也检测一次
+        self._detect_and_handle_captcha("explore")
 
         if os.path.exists("xhs_cookie.pkl"):
             try:
@@ -304,8 +344,6 @@ class XHSCrawler:
                 for cookie in cookies:
                     self.driver.add_cookie(cookie)
                 self.driver.refresh()
-                # 刷新后再检测一次
-                self.detect_and_handle_captcha("Cookie 登录刷新")
                 WebDriverWait(self.driver, 15).until(
                     EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
                 )
@@ -318,8 +356,6 @@ class XHSCrawler:
         WebDriverWait(self.driver, 120).until(
             EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
         )
-        # 登录完成后也检测一次
-        self.detect_and_handle_captcha("手动登录完成")
         pickle.dump(self.driver.get_cookies(), open("xhs_cookie.pkl", "wb"))
         self.logger.info('登录成功并已保存 Cookie')
 
@@ -355,8 +391,8 @@ class XHSCrawler:
         while no_new_count < max_no_new and total_scroll < max_scroll:
             self.check_stop()
 
-            # 每轮开始先检测一次验证码
-            self.detect_and_handle_captcha("滚动列表")
+            # 滚动前也检测一次验证码
+            self._detect_and_handle_captcha("scroll")
 
             current_links = self.extract_current_links()
             converted_new_links = {
@@ -373,7 +409,7 @@ class XHSCrawler:
 
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
 
-            # —— 滚动等待（读条）——
+            # —— 滚动等待（可被“跳过本次等待”打断）——
             scroll_sleep = max(0.0, float(self.get_scroll_sleep()))
             self._sleep_with_progress("scroll", scroll_sleep)
 
@@ -398,14 +434,14 @@ class XHSCrawler:
             new_window = [w for w in self.driver.window_handles if w != self.main_window][0]
             self.driver.switch_to.window(new_window)
 
-            # 打开后先检测验证码
-            self.detect_and_handle_captcha("笔记详情页打开")
-
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
             )
 
-            # —— 详情等待（读条）——
+            # 详情页也检查验证码
+            self._detect_and_handle_captcha("detail")
+
+            # —— 详情等待（可被“跳过本次等待”打断）——
             detail_sleep = max(0.0, float(self.get_detail_sleep()))
             self._sleep_with_progress("detail", detail_sleep)
 
@@ -447,7 +483,6 @@ class XHSCrawler:
                     except Exception as ve2:
                         self.logger.warning(f"视频封面提取失败: {ve2}")
             except Exception:
-                # 图文
                 try:
                     swiper = self.driver.find_element(By.CLASS_NAME, 'swiper-wrapper')
                     for img in swiper.find_elements(By.TAG_NAME, 'img'):
@@ -534,17 +569,13 @@ class XHSCrawler:
 
     # ---------- 采集作者 ----------
     def get_collected_count(self, brand_id: int) -> int:
-        if self.url_checker and hasattr(self.url_checker, '__self__'):
-            db = self.url_checker.__self__
-            try:
-                with db.connection.cursor() as cursor:
-                    sql = "SELECT COUNT(*) AS count FROM spider_log WHERE brand_id = %s"
-                    cursor.execute(sql, (brand_id,))
-                    result = cursor.fetchone()
-                    return result['count'] if result else 0
-            except Exception as e:
-                self.logger.error(f"查询已采集数量失败: {e}")
-                return 0
+        try:
+            if self.url_checker and hasattr(self.url_checker, '__self__'):
+                db = self.url_checker.__self__
+                if hasattr(db, 'get_collected_count_by_brand'):
+                    return db.get_collected_count_by_brand(brand_id)
+        except Exception:
+            self.logger.exception("查询已采集数量失败")
         return 0
 
     def crawl_author(self, brand: Dict):
@@ -562,14 +593,15 @@ class XHSCrawler:
 
             max_scroll = 1 if (spd_setting == 1 and collected_count > 20) else self.max_scroll_default
 
-            # 打开品牌页也检测验证码
             self.driver.get(brand['rednote_url'])
-            self.detect_and_handle_captcha("品牌主页")
+            # 进入主页后先看下验证码
+            self._detect_and_handle_captcha("scroll")
+
             self.smart_scroll(spd_setting, max_scroll)
 
             # 全量
             if spd_setting == 1:
-                for note_url in self.all_links.copy():
+                for note_url in list(self.all_links):
                     self.check_stop()
                     base_url = convert_xhs_url(note_url).split('?')[0]
                     if self.url_checker and self.url_checker(base_url):
@@ -578,7 +610,7 @@ class XHSCrawler:
 
                     detail = self.process_single_note(note_url)
 
-                    # 详情页之间的等待（读条）
+                    # 详情页之间的等待（可被“跳过本次等待”打断）
                     detail_sleep = max(0.0, float(self.get_detail_sleep()))
                     self._sleep_with_progress("detail", detail_sleep)
 
@@ -590,8 +622,8 @@ class XHSCrawler:
                         if self.insert_callback:
                             try:
                                 self.insert_callback(detail)
-                            except Exception as e:
-                                self.logger.error(f"数据库插入失败: {e}")
+                            except Exception:
+                                self.logger.exception("数据库插入失败")
 
             # 快速
             elif spd_setting == 2:
@@ -606,8 +638,8 @@ class XHSCrawler:
                     if self.insert_callback:
                         try:
                             self.insert_callback(quick_data)
-                        except Exception as e:
-                            self.logger.error(f"数据库插入失败: {e}")
+                        except Exception:
+                            self.logger.exception("数据库插入失败")
                 self.logger.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
 
             self.all_links.clear()
@@ -620,17 +652,16 @@ class XHSCrawler:
             self.logger.error(f"作者采集失败 {brand.get('rednote_url')}: {e}")
             return False
 
-    # ---------- 内部：带进度的 sleep ----------
+    # ---------- 内部：带进度、可被“跳过本次等待”打断的 sleep ----------
     def _sleep_with_progress(self, phase: str, total: float):
         """phase: 'scroll' / 'detail'"""
         total = max(0.0, float(total))
-        # 先推一次 0%（立即可见）
+        # 初始化进度
         if self.on_sleep:
             try:
                 self.on_sleep(phase, 0.0, total)
             except Exception:
                 pass
-
         if total == 0:
             if self.on_sleep:
                 try:
@@ -640,14 +671,20 @@ class XHSCrawler:
             return
 
         elapsed = 0.0
-        step = 0.2  # UI 更新粒度
+        step = 0.2  # 刷新粒度
+        # 清除旧的 skip 状态，避免误触发
+        self.skip_event.clear()
+
         while elapsed < total:
             self.check_stop()
+            # 跳过当前等待
+            if self.skip_event.is_set():
+                self.logger.info("收到“跳过本次等待”指令，立即继续")
+                self.skip_event.clear()  # 用一次清一次
+                break
+
             time.sleep(min(step, total - elapsed))
             elapsed = min(total, elapsed + step)
-            # 读条过程中也可以偶尔探测一次（避免太频繁）
-            if int(elapsed * 10) % 25 == 0:  # 约每0.25秒判断一次
-                self.detect_and_handle_captcha(f"等待阶段({phase})")
             if self.on_sleep:
                 try:
                     self.on_sleep(phase, elapsed, total)
@@ -687,28 +724,24 @@ class App:
     def __init__(self, master: tk.Tk):
         self.master = master
         self.master.title("小红书爬虫 · 采集控制台")
-        self.master.geometry("920x800")
+        self.master.geometry("980x820")
 
         # ===== 参数区 =====
         frm = ttk.LabelFrame(master, text="采集参数（可运行中随时修改）")
         frm.pack(fill="x", padx=10, pady=10)
 
-        # 滚动等待
         ttk.Label(frm, text="滚动等待(秒)：").grid(row=0, column=0, padx=6, pady=6, sticky='e')
         self.var_scroll_sleep = tk.StringVar(value="10.5")
         ttk.Entry(frm, textvariable=self.var_scroll_sleep, width=10).grid(row=0, column=1, padx=6, pady=6, sticky='w')
 
-        # 详情等待
         ttk.Label(frm, text="详情等待(秒)：").grid(row=0, column=2, padx=6, pady=6, sticky='e')
         self.var_detail_sleep = tk.StringVar(value="5.0")
         ttk.Entry(frm, textvariable=self.var_detail_sleep, width=10).grid(row=0, column=3, padx=6, pady=6, sticky='w')
 
-        # 最大滚动（运行中改会在下一位作者生效）
         ttk.Label(frm, text="最大滚动次数：").grid(row=0, column=4, padx=6, pady=6, sticky='e')
         self.var_max_scroll = tk.StringVar(value="20")
         ttk.Entry(frm, textvariable=self.var_max_scroll, width=10).grid(row=0, column=5, padx=6, pady=6, sticky='w')
 
-        # 无头
         self.var_headless = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm, text="无头模式(Headless)", variable=self.var_headless).grid(row=0, column=6, padx=6, pady=6)
 
@@ -718,33 +751,31 @@ class App:
 
         self.btn_start = ttk.Button(ctrl, text="开始采集", command=self.start)
         self.btn_stop = ttk.Button(ctrl, text="停止采集", command=self.stop, state='disabled')
+        self.btn_skip = ttk.Button(ctrl, text="跳过当前等待", command=self.skip_current_wait, state='disabled')  # 新增按钮
         self.btn_start.pack(side='left', padx=6, pady=4)
         self.btn_stop.pack(side='left', padx=6, pady=4)
+        self.btn_skip.pack(side='left', padx=6, pady=4)
 
-        # 状态文本
         self.var_status = tk.StringVar(value="就绪")
         ttk.Label(ctrl, textvariable=self.var_status).pack(side='left', padx=12)
 
         # 用时 + 进度
         info = ttk.Frame(master)
         info.pack(fill='x', padx=10, pady=(6, 8))
-
         self.var_duration = tk.StringVar(value="已用时：00:00:00")
         self.var_progress_text = tk.StringVar(value="进度：0 / 0 (0.0%)")
         ttk.Label(info, textvariable=self.var_duration).pack(side='left', padx=6)
         ttk.Label(info, textvariable=self.var_progress_text).pack(side='left', padx=18)
 
-        self.progress = ttk.Progressbar(master, length=860, mode='determinate', maximum=100)
+        self.progress = ttk.Progressbar(master, length=920, mode='determinate', maximum=100)
         self.progress.pack(fill='x', padx=10, pady=(0, 8))
 
-        # ===== Sleep 读条区 =====
+        # ===== Wait 读条区 =====
         sleep_frame = ttk.LabelFrame(master, text="等待进度（Sleep 读条）")
         sleep_frame.pack(fill='x', padx=10, pady=(0, 10))
-
         self.var_sleep_text = tk.StringVar(value="当前无等待")
         ttk.Label(sleep_frame, textvariable=self.var_sleep_text).pack(anchor='w', padx=8, pady=(6, 2))
-
-        self.sleep_bar = ttk.Progressbar(sleep_frame, length=860, mode='determinate', maximum=100)
+        self.sleep_bar = ttk.Progressbar(sleep_frame, length=920, mode='determinate', maximum=100)
         self.sleep_bar.pack(fill='x', padx=8, pady=(0, 8))
 
         # ===== 日志区 =====
@@ -772,15 +803,18 @@ class App:
         self.crawler: Optional[XHSCrawler] = None
         self.db: Optional[DatabaseManager] = None
 
-        # 计时/进度
-        self.start_ts = None             # 开始时间戳
-        self._tick_after_id = None       # after 回调句柄
+        # 控制定时
+        self.start_ts = None
+        self._tick_after_id = None
         self.total_brands = 0
         self.done_brands = 0
 
+        # 跳过等待事件（传给 crawler）
+        self.skip_event = threading.Event()
+
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ====== 提供给爬虫的“动态读取”函数 ======
+    # ====== 给爬虫的“动态读取”函数 ======
     def get_scroll_sleep(self) -> float:
         try:
             return max(0.0, float(self.var_scroll_sleep.get()))
@@ -810,23 +844,20 @@ class App:
         except Exception:
             pass
 
-    # ====== 验证码检测时，由爬虫调用（线程安全地把等待改为 999） ======
-    def on_captcha_detected(self):
+    def _clear_sleep_bar(self):
+        self.var_sleep_text.set("当前无等待")
+        self.sleep_bar['value'] = 0
+
+    # ====== 验证码回调（把等待改为999） ======
+    def on_captcha_detected(self, where: str):
         def _apply():
+            # 这里把两个等待都改成 999，更稳妥；你也可以只改滚动等待
             self.var_scroll_sleep.set("999")
             self.var_detail_sleep.set("999")
-            try:
-                messagebox.showwarning("验证码提示", "检测到小红书验证码，已将等待改为 999 秒，请手动解决验证码后再把等待时间改回。")
-            except Exception:
-                pass
         try:
             self.master.after(0, _apply)
         except Exception:
             pass
-
-    def _clear_sleep_bar(self):
-        self.var_sleep_text.set("当前无等待")
-        self.sleep_bar['value'] = 0
 
     # ====== 计时器 ======
     def _tick(self):
@@ -850,7 +881,6 @@ class App:
             messagebox.showinfo("提示", "采集已在进行中")
             return
 
-        # 最大滚动校验（运行中修改也能生效，但这里先取一个默认给构造器）
         try:
             max_scroll = int(self.var_max_scroll.get())
         except ValueError:
@@ -859,9 +889,9 @@ class App:
 
         self.btn_start.config(state='disabled')
         self.btn_stop.config(state='normal')
+        self.btn_skip.config(state='normal')
         self.var_status.set("启动中…")
 
-        # 清零进度与计时
         self.done_brands = 0
         self.total_brands = 0
         self._update_progress()
@@ -878,10 +908,11 @@ class App:
                 self.crawler = XHSCrawler(
                     url_checker=self.db.is_url_exists,
                     insert_callback=self.db.insert_one,
-                    get_scroll_sleep=self.get_scroll_sleep,   # 运行中实时读取
-                    get_detail_sleep=self.get_detail_sleep,   # 运行中实时读取
-                    on_sleep=self.on_sleep,                   # 读条回调
-                    on_captcha_detected=self.on_captcha_detected,  # 验证码回调
+                    get_scroll_sleep=self.get_scroll_sleep,
+                    get_detail_sleep=self.get_detail_sleep,
+                    on_sleep=self.on_sleep,
+                    on_captcha_detected=self.on_captcha_detected,
+                    skip_event=self.skip_event,  # 传入跳过等待事件
                     max_scroll_default=max_scroll,
                     headless=self.var_headless.get(),
                     logger=self.logger
@@ -902,13 +933,14 @@ class App:
                         self.var_status.set(f"运行中：{brand['brand_name']} ({idx}/{self.total_brands})")
                         self.logger.info(f"处理品牌: {brand['brand_name']}")
 
-                        # 更新 crawler 的最大滚动（允许用户中途调整，下一品牌生效）
+                        # 允许运行中修改最大滚动：下一品牌生效
                         try:
                             self.crawler.max_scroll_default = int(self.var_max_scroll.get())
                         except Exception:
                             pass
 
-                        if self.crawler.crawl_author(brand):
+                        ok = self.crawler.crawl_author(brand)
+                        if ok:
                             self.db.update_last_gather_time(brand['id'])
                             self.logger.info(f"已更新采集时间: {brand['brand_name']}")
 
@@ -917,7 +949,6 @@ class App:
                     except Exception as e:
                         self.logger.error(f"品牌处理异常 {brand.get('brand_name')}: {e}")
                     finally:
-                        # 刷新进度
                         self.done_brands = idx
                         self.master.after(0, self._update_progress)
 
@@ -947,7 +978,7 @@ class App:
 
                 self.btn_start.config(state='normal')
                 self.btn_stop.config(state='disabled')
-                # 清理 sleep 读条
+                self.btn_skip.config(state='disabled')
                 try:
                     self.master.after(0, self._clear_sleep_bar)
                 except Exception:
@@ -964,6 +995,11 @@ class App:
             self.logger.info("已请求停止，请等待当前步骤完成")
         else:
             self.var_status.set("就绪")
+
+    def skip_current_wait(self):
+        """一键跳过当前 sleep（本轮立刻结束）"""
+        self.skip_event.set()
+        self.logger.info("已触发“跳过本次等待”，即将继续下一步")
 
     def on_close(self):
         try:
@@ -982,7 +1018,6 @@ class App:
 
 def main_gui():
     root = tk.Tk()
-    # 统一 ttk 主题更友好
     try:
         style = ttk.Style()
         if 'clam' in style.theme_names():
@@ -994,4 +1029,6 @@ def main_gui():
 
 
 if __name__ == "__main__":
+    # 日志基础级别
+    logging.basicConfig(level=logging.INFO)
     main_gui()
