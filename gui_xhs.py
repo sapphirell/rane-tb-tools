@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-小红书采集 GUI 版（含：验证码触发把等待改为999秒 + 跳过当前等待按钮 + DB自动重连）
+小红书采集 GUI 版（集成：品牌采集 + 妆师/毛娘采集）
+功能点：
+- 验证码触发把等待改为999秒
+- “跳过当前等待”按钮（立即打断本轮sleep）
+- 采集对象切换：品牌(娃店)->spider_log / 艺术家(妆师/毛娘)->artist_spider_log
+- DB 自动重连、likes列自适应（品牌端）
 """
 
 import os
@@ -10,7 +15,7 @@ import urllib
 import urllib.parse
 import logging
 import threading
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, List
 
 # ====== 第三方 ======
 import pymysql
@@ -23,7 +28,6 @@ from selenium.webdriver.support import expected_conditions as EC
 # ====== Tkinter GUI ======
 import tkinter as tk
 from tkinter import ttk, messagebox
-
 
 # ===================== 工具函数 =====================
 
@@ -97,6 +101,12 @@ def parse_xhs_time(time_str: str) -> int:
         return 0
 
 
+# ===================== 常量与枚举 =====================
+
+class TargetType:
+    BRAND = 'brand'     # 写 spider_log
+    ARTIST = 'artist'   # 写 artist_spider_log
+
 # ===================== 数据库（自动重连 + 重试 + likes列自适应） =====================
 
 class DatabaseManager:
@@ -115,7 +125,8 @@ class DatabaseManager:
             write_timeout=30,
         )
         self.connection = pymysql.connect(**self._conn_args)
-        self._has_likes_col = None  # 运行时探测
+        self._has_likes_col_spider = None  # spider_log.likes
+        self._has_likes_col_artist = None  # artist_spider_log.likes
 
     def _ensure_conn(self):
         try:
@@ -133,7 +144,6 @@ class DatabaseManager:
                     cursor.execute(sql, params or ())
                 return cursor, cursor.rowcount
         except Exception:
-            # 断线重建后重试一次
             self._ensure_conn()
             with self.connection.cursor() as cursor:
                 if many:
@@ -142,17 +152,28 @@ class DatabaseManager:
                     cursor.execute(sql, params or ())
                 return cursor, cursor.rowcount
 
-    def _check_likes_col(self) -> bool:
-        if self._has_likes_col is not None:
-            return self._has_likes_col
+    # ---- likes 列探测 ----
+    def _check_likes_col_spider(self) -> bool:
+        if self._has_likes_col_spider is not None:
+            return self._has_likes_col_spider
         try:
             cur, _ = self._exec("SHOW COLUMNS FROM spider_log LIKE 'likes'")
-            self._has_likes_col = bool(cur.fetchone())
+            self._has_likes_col_spider = bool(cur.fetchone())
         except Exception:
-            self._has_likes_col = False
-        return self._has_likes_col
+            self._has_likes_col_spider = False
+        return self._has_likes_col_spider
 
-    # 业务方法
+    def _check_likes_col_artist(self) -> bool:
+        if self._has_likes_col_artist is not None:
+            return self._has_likes_col_artist
+        try:
+            cur, _ = self._exec("SHOW COLUMNS FROM artist_spider_log LIKE 'likes'")
+            self._has_likes_col_artist = bool(cur.fetchone())
+        except Exception:
+            self._has_likes_col_artist = False
+        return self._has_likes_col_artist
+
+    # ---- 品牌（娃店）数据集 ----
     def fetch_brand_urls(self) -> list:
         sql = """
             SELECT id, brand_name, rednote_url, rednote_spd_setting 
@@ -163,10 +184,7 @@ class DatabaseManager:
         cur, _ = self._exec(sql)
         return cur.fetchall()
 
-    def update_last_gather_time(self, brand_id: int):
-        self._exec("UPDATE brand SET last_gather_time = NOW() WHERE id = %s", (brand_id,))
-
-    def is_url_exists(self, url: str) -> bool:
+    def is_url_exists_brand(self, url: str) -> bool:
         cur, _ = self._exec("SELECT 1 FROM spider_log WHERE url = %s LIMIT 1", (url,))
         return bool(cur.fetchone())
 
@@ -175,13 +193,13 @@ class DatabaseManager:
         row = cur.fetchone()
         return int(row['cnt'] if row and row['cnt'] is not None else 0)
 
-    def insert_one(self, data: Dict):
+    def insert_brand_log(self, data: Dict):
         title = (data.get('title') or '')[:255]
         content = (data.get('content') or '')[:2000]
         images = ','.join(data.get('images') or [])[:2000]
         like_count = int(data.get('like_count') or 0)
-        has_likes = self._check_likes_col()
-
+        has_likes = self._check_likes_col_spider()
+        now = int(time.time())
         if has_likes:
             sql = """
                 INSERT INTO spider_log (
@@ -190,11 +208,9 @@ class DatabaseManager:
                     brand_name, auth_time, created_at, updated_at, likes
                 ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """
-            params = (
-                0, 0, 'xhs', title, content,
-                data['url'], images, data['brand_id'], data['brand_name'],
-                int(data.get('auth_time', 0)), int(time.time()), int(time.time()), like_count
-            )
+            params = (0, 0, 'xhs', title, content, data['url'], images,
+                      data['brand_id'], data['brand_name'], int(data.get('auth_time', 0)),
+                      now, now, like_count)
         else:
             sql = """
                 INSERT INTO spider_log (
@@ -203,44 +219,62 @@ class DatabaseManager:
                     brand_name, auth_time, created_at, updated_at
                 ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """
-            params = (
-                0, 0, 'xhs', title, content,
-                data['url'], images, data['brand_id'], data['brand_name'],
-                int(data.get('auth_time', 0)), int(time.time()), int(time.time())
-            )
+            params = (0, 0, 'xhs', title, content, data['url'], images,
+                      data['brand_id'], data['brand_name'], int(data.get('auth_time', 0)),
+                      now, now)
         self._exec(sql, params)
 
-    def batch_insert(self, data: list):
-        has_likes = self._check_likes_col()
-        rows = []
-        now = int(time.time())
-        for item in data:
-            title = (item.get('title') or '')[:255]
-            content = (item.get('content') or '')[:2000]
-            images = ','.join(item.get('images') or [])[:2000]
-            base = [0, 0, 'xhs', title, content, item['url'], images,
-                    item['brand_id'], item['brand_name'], int(item.get('auth_time', 0)), now, now]
-            if has_likes:
-                base.append(int(item.get('like_count', 0)))
-            rows.append(tuple(base))
+    # ---- 艺术家（妆师/毛娘）数据集 ----
+    def fetch_artists(self) -> list:
+        sql = """
+            SELECT id, brand_name, rednote_url, rednote_spd_setting_for_artist 
+            FROM brand 
+            WHERE is_delete = 0 
+              AND is_bjd_artist = 1 
+              AND rednote_url != '' 
+              AND rednote_spd_setting_for_artist != 3
+            ORDER BY spider_index DESC, last_gather_time ASC
+        """
+        cur, _ = self._exec(sql)
+        return cur.fetchall()
 
-        if has_likes:
-            sql = """
-                INSERT INTO spider_log (
-                    msg_type, status, origin_type, title, 
-                    content, url, images, brand_id, 
-                    brand_name, auth_time, created_at, updated_at, likes
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """
-        else:
-            sql = """
-                INSERT INTO spider_log (
-                    msg_type, status, origin_type, title, 
-                    content, url, images, brand_id, 
-                    brand_name, auth_time, created_at, updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """
-        self._exec(sql, rows, many=True)
+    def is_url_exists_artist(self, url: str) -> bool:
+        cur, _ = self._exec("SELECT 1 FROM artist_spider_log WHERE url = %s LIMIT 1", (url,))
+        return bool(cur.fetchone())
+
+    def insert_artist_log(self, data: Dict):
+        """插入艺术家作品数据（artist_spider_log）"""
+        title = (data.get('title') or '')[:600]
+        content = (data.get('content') or '')[:2000]
+        images = ','.join(data.get('images') or [])[:2000]
+        now = int(time.time())
+        has_likes = self._check_likes_col_artist()
+        likes = int(data.get('like_count') or 0)
+        sql = """
+            INSERT INTO artist_spider_log (
+                msg_type, status, origin_type, title, 
+                content, url, images, brand_id, 
+                brand_name, created_at, updated_at, 
+                full_get, auth_time, likes
+            ) VALUES (
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            )
+        """
+        params = (
+            0, 0, 'xhs', title, content, data.get('url', ''),
+            images,
+            data.get('artist_id', data.get('brand_id', 0)),
+            data.get('artist_name', data.get('brand_name', '')),
+            now, now,
+            int(data.get('full_get', 0)),
+            int(data.get('auth_time', 0)),
+            likes if has_likes else 0
+        )
+        self._exec(sql, params)
+
+    # ---- 公共：更新时间 ----
+    def update_last_gather_time(self, brand_id: int):
+        self._exec("UPDATE brand SET last_gather_time = NOW() WHERE id = %s", (brand_id,))
 
 
 # ===================== 爬虫核心 =====================
@@ -248,18 +282,20 @@ class DatabaseManager:
 class XHSCrawler:
     def __init__(
         self,
+        target_type: str,
         url_checker: Optional[Callable] = None,
         insert_callback: Optional[Callable] = None,
         *,
         get_scroll_sleep: Optional[Callable[[], float]] = None,
         get_detail_sleep: Optional[Callable[[], float]] = None,
         on_sleep: Optional[Callable[[str, float, float], None]] = None,
-        on_captcha_detected: Optional[Callable[[str], None]] = None,  # 新增：发现验证码时回调
-        skip_event: Optional[threading.Event] = None,                 # 新增：跳过等待事件
+        on_captcha_detected: Optional[Callable[[str], None]] = None,
+        skip_event: Optional[threading.Event] = None,
         max_scroll_default: int = 20,
         headless: bool = False,
         logger: Optional[logging.Logger] = None
     ):
+        self.target_type = target_type  # BRAND / ARTIST
         self.url_checker = url_checker
         self.insert_callback = insert_callback
         self.get_scroll_sleep = get_scroll_sleep or (lambda: 10.5)
@@ -338,9 +374,11 @@ class XHSCrawler:
         # 主页验证码也检测一次
         self._detect_and_handle_captcha("explore")
 
-        if os.path.exists("xhs_cookie.pkl"):
+        cookie_file = "xhs_cookie.pkl" if self.target_type == TargetType.BRAND else "xhs_artist_cookie.pkl"
+
+        if os.path.exists(cookie_file):
             try:
-                cookies = pickle.load(open("xhs_cookie.pkl", "rb"))
+                cookies = pickle.load(open(cookie_file, "rb"))
                 for cookie in cookies:
                     self.driver.add_cookie(cookie)
                 self.driver.refresh()
@@ -356,7 +394,7 @@ class XHSCrawler:
         WebDriverWait(self.driver, 120).until(
             EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
         )
-        pickle.dump(self.driver.get_cookies(), open("xhs_cookie.pkl", "wb"))
+        pickle.dump(self.driver.get_cookies(), open(cookie_file, "wb"))
         self.logger.info('登录成功并已保存 Cookie')
 
     # ---------- 列表页提取 ----------
@@ -423,7 +461,7 @@ class XHSCrawler:
             total_scroll += 1
 
     # ---------- 处理单个笔记 ----------
-    def process_single_note(self, origin_note_url: str):
+    def process_single_note(self, origin_note_url: str) -> Optional[Dict]:
         note_url = convert_xhs_url(origin_note_url)
         self.logger.info(f"打开URL: {origin_note_url} -> {note_url}")
         img_urls = []
@@ -445,6 +483,7 @@ class XHSCrawler:
             detail_sleep = max(0.0, float(self.get_detail_sleep()))
             self._sleep_with_progress("detail", detail_sleep)
 
+            # 发布时间
             try:
                 time_element = self.driver.find_element(By.CSS_SELECTOR, '.bottom-container .date')
                 raw_time = time_element.text.strip()
@@ -528,8 +567,8 @@ class XHSCrawler:
             except Exception as close_e:
                 self.logger.warning(f"窗口关闭异常: {close_e}")
 
-    # ---------- 快速模式 ----------
-    def process_quick_data(self, new_links):
+    # ---------- 快速模式（列表页） ----------
+    def process_quick_data(self, new_links: set):
         current_items = self.driver.find_elements(By.CSS_SELECTOR, '.note-item')
         for item in current_items:
             try:
@@ -567,8 +606,8 @@ class XHSCrawler:
             except Exception as e:
                 self.logger.error(f"快速采集异常: {e}")
 
-    # ---------- 采集作者 ----------
-    def get_collected_count(self, brand_id: int) -> int:
+    # ---------- 已采集数 ----------
+    def get_collected_count_for_brand(self, brand_id: int) -> int:
         try:
             if self.url_checker and hasattr(self.url_checker, '__self__'):
                 db = self.url_checker.__self__
@@ -578,29 +617,48 @@ class XHSCrawler:
             self.logger.exception("查询已采集数量失败")
         return 0
 
-    def crawl_author(self, brand: Dict):
+    # ---------- 总调度：采集一个“对象”（品牌或艺术家） ----------
+    def crawl_target(self, row: Dict):
+        """
+        row: 来自 brand 表的一行
+        品牌：使用 rednote_spd_setting
+        艺术家：使用 rednote_spd_setting_for_artist
+        """
         try:
             self.check_stop()
-            spd_setting = brand.get('rednote_spd_setting', 1)
-            self.logger.info(f"品牌[{brand['brand_name']}] 采集配置: {spd_setting}")
 
-            if spd_setting == 3:
-                self.logger.info(f"品牌[{brand['brand_name']}] 配置不采集，跳过")
+            if self.target_type == TargetType.BRAND:
+                spd_setting = row.get('rednote_spd_setting', 1)
+                name_key = 'brand_name'
+                id_key = 'id'
+                self.logger.info(f"品牌[{row[name_key]}] 采集配置: {spd_setting}")
+                if spd_setting == 3:
+                    self.logger.info(f"品牌[{row[name_key]}] 配置不采集，跳过")
+                    return True
+                collected_count = self.get_collected_count_for_brand(row[id_key])
+                self.logger.info(f"品牌[{row[name_key]}] 已采集数量: {collected_count}")
+                max_scroll = 1 if (spd_setting == 1 and collected_count > 20) else self.max_scroll_default
+
+            else:
+                spd_setting = row.get('rednote_spd_setting_for_artist', 3)
+                name_key = 'brand_name'
+                id_key = 'id'
+                self.logger.info(f"艺术家[{row[name_key]}] 采集配置: {spd_setting}")
+                if spd_setting == 3:
+                    self.logger.info(f"艺术家[{row[name_key]}] 配置不采集，跳过")
+                    return True
+                max_scroll = 1 if spd_setting == 2 else self.max_scroll_default  # 艺术家快速模式时可适当减少滚动
+
+            if not row.get('rednote_url'):
+                self.logger.info(f"{'品牌' if self.target_type==TargetType.BRAND else '艺术家'}[{row[name_key]}] 未设置小红书地址，跳过")
                 return True
 
-            collected_count = self.get_collected_count(brand['id'])
-            self.logger.info(f"品牌[{brand['brand_name']}] 已采集数量: {collected_count}")
-
-            max_scroll = 1 if (spd_setting == 1 and collected_count > 20) else self.max_scroll_default
-
-            self.driver.get(brand['rednote_url'])
-            # 进入主页后先看下验证码
+            self.driver.get(row['rednote_url'])
             self._detect_and_handle_captcha("scroll")
-
             self.smart_scroll(spd_setting, max_scroll)
 
-            # 全量
             if spd_setting == 1:
+                # 全量详情逐条
                 for note_url in list(self.all_links):
                     self.check_stop()
                     base_url = convert_xhs_url(note_url).split('?')[0]
@@ -615,26 +673,40 @@ class XHSCrawler:
                     self._sleep_with_progress("detail", detail_sleep)
 
                     if detail:
-                        detail.update({
-                            'brand_id': brand['id'],
-                            'brand_name': brand['brand_name']
-                        })
+                        if self.target_type == TargetType.BRAND:
+                            detail.update({
+                                'brand_id': row[id_key],
+                                'brand_name': row[name_key]
+                            })
+                        else:
+                            detail.update({
+                                'artist_id': row[id_key],
+                                'artist_name': row[name_key],
+                                'full_get': 0
+                            })
                         if self.insert_callback:
                             try:
                                 self.insert_callback(detail)
                             except Exception:
                                 self.logger.exception("数据库插入失败")
 
-            # 快速
             elif spd_setting == 2:
+                # 快速模式：只写链接+首图+标题
                 for quick_data in self.collected_quick_data:
                     self.check_stop()
-                    self.logger.info(f"写入快速采集数据: {quick_data.get('url')}")
-                    quick_data.update({
-                        'brand_id': brand['id'],
-                        'brand_name': brand['brand_name'],
-                        'auth_time': 0
-                    })
+                    if self.target_type == TargetType.BRAND:
+                        quick_data.update({
+                            'brand_id': row[id_key],
+                            'brand_name': row[name_key],
+                            'auth_time': 0
+                        })
+                    else:
+                        quick_data.update({
+                            'artist_id': row[id_key],
+                            'artist_name': row[name_key],
+                            'auth_time': 0,
+                            'full_get': 0
+                        })
                     if self.insert_callback:
                         try:
                             self.insert_callback(quick_data)
@@ -646,17 +718,16 @@ class XHSCrawler:
             self.collected_quick_data.clear()
             return True
         except KeyboardInterrupt:
-            self.logger.info("收到停止信号，已终止当前作者采集")
+            self.logger.info("收到停止信号，已终止当前对象采集")
             return False
         except Exception as e:
-            self.logger.error(f"作者采集失败 {brand.get('rednote_url')}: {e}")
+            self.logger.error(f"对象采集失败 {row.get('rednote_url')}: {e}")
             return False
 
     # ---------- 内部：带进度、可被“跳过本次等待”打断的 sleep ----------
     def _sleep_with_progress(self, phase: str, total: float):
         """phase: 'scroll' / 'detail'"""
         total = max(0.0, float(total))
-        # 初始化进度
         if self.on_sleep:
             try:
                 self.on_sleep(phase, 0.0, total)
@@ -671,16 +742,14 @@ class XHSCrawler:
             return
 
         elapsed = 0.0
-        step = 0.2  # 刷新粒度
-        # 清除旧的 skip 状态，避免误触发
+        step = 0.2
         self.skip_event.clear()
 
         while elapsed < total:
             self.check_stop()
-            # 跳过当前等待
             if self.skip_event.is_set():
                 self.logger.info("收到“跳过本次等待”指令，立即继续")
-                self.skip_event.clear()  # 用一次清一次
+                self.skip_event.clear()
                 break
 
             time.sleep(min(step, total - elapsed))
@@ -723,8 +792,8 @@ class TextHandler(logging.Handler):
 class App:
     def __init__(self, master: tk.Tk):
         self.master = master
-        self.master.title("小红书爬虫 · 采集控制台")
-        self.master.geometry("980x820")
+        self.master.title("小红书爬虫 · 采集控制台（品牌 / 妆师）")
+        self.master.geometry("1000x860")
 
         # ===== 参数区 =====
         frm = ttk.LabelFrame(master, text="采集参数（可运行中随时修改）")
@@ -745,13 +814,20 @@ class App:
         self.var_headless = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm, text="无头模式(Headless)", variable=self.var_headless).grid(row=0, column=6, padx=6, pady=6)
 
+        # ===== 采集对象切换（新增） =====
+        type_frame = ttk.LabelFrame(master, text="采集对象")
+        type_frame.pack(fill='x', padx=10, pady=(0,10))
+        self.var_target_type = tk.StringVar(value=TargetType.BRAND)
+        ttk.Radiobutton(type_frame, text="品牌（娃店 → spider_log）", value=TargetType.BRAND, variable=self.var_target_type).pack(side='left', padx=10, pady=6)
+        ttk.Radiobutton(type_frame, text="艺术家（妆师/毛娘 → artist_spider_log）", value=TargetType.ARTIST, variable=self.var_target_type).pack(side='left', padx=10, pady=6)
+
         # ===== 控制/状态区 =====
         ctrl = ttk.Frame(master)
         ctrl.pack(fill='x', padx=10)
 
         self.btn_start = ttk.Button(ctrl, text="开始采集", command=self.start)
         self.btn_stop = ttk.Button(ctrl, text="停止采集", command=self.stop, state='disabled')
-        self.btn_skip = ttk.Button(ctrl, text="跳过当前等待", command=self.skip_current_wait, state='disabled')  # 新增按钮
+        self.btn_skip = ttk.Button(ctrl, text="跳过当前等待", command=self.skip_current_wait, state='disabled')
         self.btn_start.pack(side='left', padx=6, pady=4)
         self.btn_stop.pack(side='left', padx=6, pady=4)
         self.btn_skip.pack(side='left', padx=6, pady=4)
@@ -767,7 +843,7 @@ class App:
         ttk.Label(info, textvariable=self.var_duration).pack(side='left', padx=6)
         ttk.Label(info, textvariable=self.var_progress_text).pack(side='left', padx=18)
 
-        self.progress = ttk.Progressbar(master, length=920, mode='determinate', maximum=100)
+        self.progress = ttk.Progressbar(master, length=940, mode='determinate', maximum=100)
         self.progress.pack(fill='x', padx=10, pady=(0, 8))
 
         # ===== Wait 读条区 =====
@@ -775,7 +851,7 @@ class App:
         sleep_frame.pack(fill='x', padx=10, pady=(0, 10))
         self.var_sleep_text = tk.StringVar(value="当前无等待")
         ttk.Label(sleep_frame, textvariable=self.var_sleep_text).pack(anchor='w', padx=8, pady=(6, 2))
-        self.sleep_bar = ttk.Progressbar(sleep_frame, length=920, mode='determinate', maximum=100)
+        self.sleep_bar = ttk.Progressbar(sleep_frame, length=940, mode='determinate', maximum=100)
         self.sleep_bar.pack(fill='x', padx=8, pady=(0, 8))
 
         # ===== 日志区 =====
@@ -806,8 +882,8 @@ class App:
         # 控制定时
         self.start_ts = None
         self._tick_after_id = None
-        self.total_brands = 0
-        self.done_brands = 0
+        self.total_rows = 0
+        self.done_rows = 0
 
         # 跳过等待事件（传给 crawler）
         self.skip_event = threading.Event()
@@ -836,7 +912,6 @@ class App:
             phase_cn = "滚动等待" if phase == "scroll" else "详情等待"
             self.var_sleep_text.set(f"{phase_cn}：{elapsed_:.1f}s / {total_:.1f}s")
             self.sleep_bar['value'] = percent
-            # 完成后 1 秒自动清空
             if total_ > 0 and abs(elapsed_ - total_) < 1e-6:
                 self.master.after(1000, self._clear_sleep_bar)
         try:
@@ -851,7 +926,6 @@ class App:
     # ====== 验证码回调（把等待改为999） ======
     def on_captcha_detected(self, where: str):
         def _apply():
-            # 这里把两个等待都改成 999，更稳妥；你也可以只改滚动等待
             self.var_scroll_sleep.set("999")
             self.var_detail_sleep.set("999")
         try:
@@ -871,8 +945,8 @@ class App:
 
     # ====== 进度刷新 ======
     def _update_progress(self):
-        percent = (self.done_brands / self.total_brands * 100.0) if self.total_brands else 0.0
-        self.var_progress_text.set(f"进度：{self.done_brands} / {self.total_brands} ({percent:.1f}%)")
+        percent = (self.done_rows / self.total_rows * 100.0) if self.total_rows else 0.0
+        self.var_progress_text.set(f"进度：{self.done_rows} / {self.total_rows} ({percent:.1f}%)")
         self.progress['value'] = percent
 
     # ====== 控制逻辑 ======
@@ -892,12 +966,14 @@ class App:
         self.btn_skip.config(state='normal')
         self.var_status.set("启动中…")
 
-        self.done_brands = 0
-        self.total_brands = 0
+        self.done_rows = 0
+        self.total_rows = 0
         self._update_progress()
         self.start_ts = time.time()
         if self._tick_after_id is None:
             self._tick()
+
+        target_type = self.var_target_type.get()
 
         def run():
             try:
@@ -905,14 +981,23 @@ class App:
                 self.db = DatabaseManager()
 
                 self.logger.info("初始化爬虫（速度参数将实时读取 GUI 输入框）")
+                # 根据采集对象设置不同的回调
+                if target_type == TargetType.BRAND:
+                    url_checker = self.db.is_url_exists_brand
+                    insert_cb = self.db.insert_brand_log
+                else:
+                    url_checker = self.db.is_url_exists_artist
+                    insert_cb = self.db.insert_artist_log
+
                 self.crawler = XHSCrawler(
-                    url_checker=self.db.is_url_exists,
-                    insert_callback=self.db.insert_one,
+                    target_type=target_type,
+                    url_checker=url_checker,
+                    insert_callback=insert_cb,
                     get_scroll_sleep=self.get_scroll_sleep,
                     get_detail_sleep=self.get_detail_sleep,
                     on_sleep=self.on_sleep,
                     on_captcha_detected=self.on_captcha_detected,
-                    skip_event=self.skip_event,  # 传入跳过等待事件
+                    skip_event=self.skip_event,
                     max_scroll_default=max_scroll,
                     headless=self.var_headless.get(),
                     logger=self.logger
@@ -921,35 +1006,36 @@ class App:
                 self.logger.info("准备登录")
                 self.crawler.login()
 
-                brands = self.db.fetch_brand_urls()
-                self.total_brands = len(brands)
+                rows = self.db.fetch_brand_urls() if target_type == TargetType.BRAND else self.db.fetch_artists()
+                self.total_rows = len(rows)
                 self._update_progress()
-                self.logger.info(f"待处理品牌数量：{self.total_brands}")
+                self.logger.info(f"待处理数量：{self.total_rows}")
 
-                for idx, brand in enumerate(brands, start=1):
+                for idx, row in enumerate(rows, start=1):
                     if self.crawler.stop_requested:
                         break
                     try:
-                        self.var_status.set(f"运行中：{brand['brand_name']} ({idx}/{self.total_brands})")
-                        self.logger.info(f"处理品牌: {brand['brand_name']}")
+                        name = row.get('brand_name', f"id={row.get('id')}")
+                        self.var_status.set(f"运行中：{name} ({idx}/{self.total_rows})")
+                        self.logger.info(f"处理：{name}")
 
-                        # 允许运行中修改最大滚动：下一品牌生效
+                        # 允许运行中修改最大滚动：下一对象生效
                         try:
                             self.crawler.max_scroll_default = int(self.var_max_scroll.get())
                         except Exception:
                             pass
 
-                        ok = self.crawler.crawl_author(brand)
+                        ok = self.crawler.crawl_target(row)
                         if ok:
-                            self.db.update_last_gather_time(brand['id'])
-                            self.logger.info(f"已更新采集时间: {brand['brand_name']}")
+                            self.db.update_last_gather_time(row['id'])
+                            self.logger.info(f"已更新采集时间: {name}")
 
                         self.crawler.notes_data.clear()
                         self.crawler.all_links.clear()
                     except Exception as e:
-                        self.logger.error(f"品牌处理异常 {brand.get('brand_name')}: {e}")
+                        self.logger.error(f"处理异常 {row.get('brand_name')}: {e}")
                     finally:
-                        self.done_brands = idx
+                        self.done_rows = idx
                         self.master.after(0, self._update_progress)
 
                 if self.crawler and self.crawler.stop_requested:
@@ -1029,6 +1115,5 @@ def main_gui():
 
 
 if __name__ == "__main__":
-    # 日志基础级别
     logging.basicConfig(level=logging.INFO)
     main_gui()
