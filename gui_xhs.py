@@ -6,6 +6,11 @@
 - “跳过当前等待”按钮（立即打断本轮sleep）
 - 采集对象切换：品牌(娃店)->spider_log / 艺术家(妆师/毛娘)->artist_spider_log
 - DB 自动重连、likes列自适应（品牌端）
+
+【修改摘要】
+- [GUI] 切换到“艺术家”时将“最大滚动次数”默认设置为 0（只抓首屏）。
+- [采集] smart_scroll 增加“首屏提取”步骤，即使 max_scroll=0 也能收集当前列表 URL，并在快速模式下即时采样。
+- [采集] 艺术家分支的快速模式不再强制滚动 1 次，改为尊重 GUI 设置（允许为 0）。
 """
 
 import os
@@ -426,6 +431,28 @@ class XHSCrawler:
 
         self.logger.info(f"智能滚动设置: 最大滚动次数={max_scroll}（滚动等待将实时读取 GUI 配置）")
 
+        # 【新增】—— 不滚动也先做一次“首屏提取”（确保 max_scroll=0 也能拿到 URL）
+        self.check_stop()
+        self._detect_and_handle_captcha("scroll")
+        current_links = self.extract_current_links()
+        converted_new_links = {
+            convert_xhs_url(link).split('?')[0]
+            for link in (current_links - self.all_links)
+        }
+        new_links = converted_new_links - {convert_xhs_url(x).split('?')[0] for x in self.all_links}
+
+        if spd_setting == 2 and new_links:
+            # 快速模式：当场采样首屏
+            self.process_quick_data(new_links)
+
+        self.all_links.update(current_links)
+        self.logger.info(f"[首屏] 当前总链接数：{len(self.all_links)} 新增：{len(new_links)}")
+
+        # max_scroll == 0 时只抓首屏，直接返回
+        if max_scroll <= 0:
+            return
+
+        # ========== 以下为原有滚动循环逻辑 ==========
         while no_new_count < max_no_new and total_scroll < max_scroll:
             self.check_stop()
 
@@ -437,7 +464,7 @@ class XHSCrawler:
                 convert_xhs_url(link).split('?')[0]
                 for link in (current_links - self.all_links)
             }
-            new_links = converted_new_links - self.all_links
+            new_links = converted_new_links - {convert_xhs_url(x).split('?')[0] for x in self.all_links}
 
             if spd_setting == 2 and new_links:
                 self.process_quick_data(new_links)
@@ -647,7 +674,8 @@ class XHSCrawler:
                 if spd_setting == 3:
                     self.logger.info(f"艺术家[{row[name_key]}] 配置不采集，跳过")
                     return True
-                max_scroll = 1 if spd_setting == 2 else self.max_scroll_default  # 艺术家快速模式时可适当减少滚动
+                # 【修改】艺术家快速模式：遵循 GUI 设置（允许 0，仅首屏）
+                max_scroll = self.max_scroll_default
 
             if not row.get('rednote_url'):
                 self.logger.info(f"{'品牌' if self.target_type==TargetType.BRAND else '艺术家'}[{row[name_key]}] 未设置小红书地址，跳过")
@@ -818,8 +846,17 @@ class App:
         type_frame = ttk.LabelFrame(master, text="采集对象")
         type_frame.pack(fill='x', padx=10, pady=(0,10))
         self.var_target_type = tk.StringVar(value=TargetType.BRAND)
-        ttk.Radiobutton(type_frame, text="品牌（娃店 → spider_log）", value=TargetType.BRAND, variable=self.var_target_type).pack(side='left', padx=10, pady=6)
-        ttk.Radiobutton(type_frame, text="艺术家（妆师/毛娘 → artist_spider_log）", value=TargetType.ARTIST, variable=self.var_target_type).pack(side='left', padx=10, pady=6)
+        # 【修改】增加 command，在切换到“艺术家”时默认把滚动次数设为 0
+        ttk.Radiobutton(
+            type_frame, text="品牌（娃店 → spider_log）",
+            value=TargetType.BRAND, variable=self.var_target_type,
+            command=lambda: self.on_target_type_change(TargetType.BRAND)
+        ).pack(side='left', padx=10, pady=6)
+        ttk.Radiobutton(
+            type_frame, text="艺术家（妆师/毛娘 → artist_spider_log）",
+            value=TargetType.ARTIST, variable=self.var_target_type,
+            command=lambda: self.on_target_type_change(TargetType.ARTIST)
+        ).pack(side='left', padx=10, pady=6)
 
         # ===== 控制/状态区 =====
         ctrl = ttk.Frame(master)
@@ -889,6 +926,21 @@ class App:
         self.skip_event = threading.Event()
 
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # 【新增】采集对象切换时的默认滚动次数自动化
+    def on_target_type_change(self, target: str):
+        try:
+            if target == TargetType.ARTIST:
+                # 艺术家默认滚动次数为 0（只抓首屏）
+                self.var_max_scroll.set("0")
+                self.logger.info("切换到【艺术家】采集：默认最大滚动次数已设置为 0（仅采集首屏）")
+            else:
+                # 品牌保持常用默认 20（可自行修改）
+                if self.var_max_scroll.get().strip() == "0":
+                    self.var_max_scroll.set("20")
+                self.logger.info("切换到【品牌】采集：最大滚动次数保持/恢复为常用默认（20）")
+        except Exception:
+            pass
 
     # ====== 给爬虫的“动态读取”函数 ======
     def get_scroll_sleep(self) -> float:
