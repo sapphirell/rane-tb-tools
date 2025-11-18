@@ -2,7 +2,8 @@
 """
 小红书采集 GUI 版（集成：品牌采集 + 妆师/毛娘采集）
 功能点：
-- 验证码触发把等待改为999秒
+- 验证码触发把等待改为极大值（99999999 秒）
+- 部分验证码页（id="captcha-div"）直接终止本轮采集流程
 - “跳过当前等待”按钮（立即打断本轮sleep）
 - 采集对象切换：品牌(娃店)->spider_log / 艺术家(妆师/毛娘)->artist_spider_log
 - DB 自动重连、likes列自适应（品牌端）
@@ -11,6 +12,7 @@
 - [GUI] 切换到“艺术家”时将“最大滚动次数”默认设置为 0（只抓首屏）。
 - [采集] smart_scroll 增加“首屏提取”步骤，即使 max_scroll=0 也能收集当前列表 URL，并在快速模式下即时采样。
 - [采集] 艺术家分支的快速模式不再强制滚动 1 次，改为尊重 GUI 设置（允许为 0）。
+- [验证码] 新增检测 id="captcha-div" 的扫码/风控验证页：一旦出现，停止本轮采集，并把等待时间改为 99999999。
 """
 
 import os
@@ -353,14 +355,34 @@ class XHSCrawler:
         if self.stop_requested:
             raise KeyboardInterrupt("收到停止信号")
 
-    # ---------- 验证码检测 ----------
+    # ---------- 验证码检测（包含 captcha-div） ----------
     def _detect_and_handle_captcha(self, where: str):
         """where: 'explore' / 'scroll' / 'detail'"""
         try:
+            # 1）扫码/风控验证页：id="captcha-div"（当前页面不能刷新）
+            strict_els = self.driver.find_elements(By.CSS_SELECTOR, "#captcha-div")
+            strict_visible = any(e.is_displayed() for e in strict_els) if strict_els else False
+            if strict_visible:
+                # 这种页面一般需要你手工扫码/处理，不能继续采集
+                self.logger.warning(
+                    f"检测到扫码/风控验证码页 #captcha-div（{where}），将停止本次采集，并把等待时间改为极大值。"
+                )
+                if self.on_captcha_detected:
+                    try:
+                        self.on_captcha_detected(where)
+                    except Exception:
+                        pass
+                # 直接停止后续所有流程（后面 check_stop 会抛出 KeyboardInterrupt）
+                self.request_stop()
+                return True
+
+            # 2）普通验证码 red-captcha（保留原逻辑，只扩大等待）
             els = self.driver.find_elements(By.CSS_SELECTOR, "#red-captcha, div#red-captcha")
             visible = any(e.is_displayed() for e in els) if els else False
             if visible:
-                self.logger.warning(f"检测到验证码 #red-captcha（{where}），已将等待修改为 999 秒，直到你手动改回。")
+                self.logger.warning(
+                    f"检测到验证码 #red-captcha（{where}），已将等待修改为极大值，直到你手动改回。"
+                )
                 if self.on_captcha_detected:
                     try:
                         self.on_captcha_detected(where)
@@ -975,11 +997,16 @@ class App:
         self.var_sleep_text.set("当前无等待")
         self.sleep_bar['value'] = 0
 
-    # ====== 验证码回调（把等待改为999） ======
+    # ====== 验证码回调（把等待改为极大值） ======
     def on_captcha_detected(self, where: str):
         def _apply():
-            self.var_scroll_sleep.set("999")
-            self.var_detail_sleep.set("999")
+            # 设置极大的等待时间，相当于“挂起”直到你手动改回
+            self.var_scroll_sleep.set("99999999")
+            self.var_detail_sleep.set("99999999")
+            self.logger.info(
+                f"检测到验证码页面({where})，已将滚动等待和详情等待都改为 99999999 秒。"
+                f"本次采集会停止或暂停，处理完验证码后请手动调整等待时间并重新开始采集。"
+            )
         try:
             self.master.after(0, _apply)
         except Exception:
@@ -1091,13 +1118,13 @@ class App:
                         self.master.after(0, self._update_progress)
 
                 if self.crawler and self.crawler.stop_requested:
-                    self.logger.info("任务被用户停止")
+                    self.logger.info("任务被用户停止或被验证码拦截")
                     self.var_status.set("已停止")
                 else:
                     self.logger.info("任务结束")
                     self.var_status.set("已完成")
             except KeyboardInterrupt:
-                self.logger.info("用户停止")
+                self.logger.info("用户停止或被验证码拦截")
                 self.var_status.set("已停止")
             except Exception as e:
                 self.logger.exception(f"运行异常：{e}")
