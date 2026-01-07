@@ -1,24 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-小红书采集 GUI 版（集成：品牌采集 + 妆师/毛娘采集）
+小红书采集 GUI 版（集成：品牌采集 + 妆师/毛娘采集 + 多账号数据库管理）
 
-本版本修复：验证码触发暂停后，GUI 在部分环境下“无法点击/无响应”的问题。
-核心原因：Tkinter 不是线程安全的，之前在采集线程中直接调用了 var_status.set / button.config / progressbar 等 UI 更新。
-修复方式：所有 UI 更新统一通过 master.after(0, ...) 投递到主线程执行。
-
-功能点：
-- 检测到 #captcha-div 或 #red-captcha 时：暂停采集（不结束线程），并将等待时间设置为 99999999
-- 你在浏览器完成扫码/风控验证后：点击 GUI 的“恢复运行”继续采集
-- “跳过当前等待”按钮可中断本轮 sleep
+功能更新：
+- Cookie 存储于数据库表 `xhs_cookies`。
+- GUI 支持选择账号登录，支持新增/录入新账号。
 """
 
 import os
-import pickle
 import time
+import json  # 新增：用于序列化Cookie
 import urllib.parse
 import logging
 import threading
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, List
 
 import pymysql
 from selenium.webdriver import Chrome
@@ -28,7 +23,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog  # 新增 simpledialog
 
 
 def convert_xhs_url(original_url: str) -> str:
@@ -47,7 +42,7 @@ def convert_xhs_url(original_url: str) -> str:
 
 
 def parse_xhs_time(time_str: str) -> int:
-    """解析小红书时间格式（含 天前/小时前/分钟前/昨天/今天 及常见日期格式）"""
+    """解析小红书时间格式"""
     from datetime import datetime, timedelta
     import re
 
@@ -99,8 +94,8 @@ def parse_xhs_time(time_str: str) -> int:
 
 
 class TargetType:
-    BRAND = 'brand'     # 写 spider_log
-    ARTIST = 'artist'   # 写 artist_spider_log
+    BRAND = 'brand'  # 写 spider_log
+    ARTIST = 'artist'  # 写 artist_spider_log
 
 
 class DatabaseManager:
@@ -146,6 +141,32 @@ class DatabaseManager:
                     cursor.execute(sql, params or ())
                 return cursor, cursor.rowcount
 
+    # --- Cookie 管理 ---
+    def fetch_cookies(self) -> List[Dict]:
+        """获取所有可用账号"""
+        sql = "SELECT id, account_name, cookie_data, last_used_at FROM xhs_cookies ORDER BY last_used_at DESC, id DESC"
+        cur, _ = self._exec(sql)
+        return cur.fetchall()
+
+    def upsert_xhs_cookie(self, name: str, cookie_data: list):
+        """插入或更新账号Cookie"""
+        json_str = json.dumps(cookie_data)
+        now = int(time.time())
+        sql = """
+            INSERT INTO xhs_cookies (account_name, cookie_data, last_used_at, created_at)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                cookie_data = VALUES(cookie_data),
+                last_used_at = VALUES(last_used_at)
+        """
+        self._exec(sql, (name, json_str, now, now))
+
+    def update_cookie_usage(self, account_name: str):
+        """更新最后使用时间"""
+        now = int(time.time())
+        self._exec("UPDATE xhs_cookies SET last_used_at = %s WHERE account_name = %s", (now, account_name))
+
+    # --- 字段检测 ---
     def _check_likes_col_spider(self) -> bool:
         if self._has_likes_col_spider is not None:
             return self._has_likes_col_spider
@@ -166,7 +187,7 @@ class DatabaseManager:
             self._has_likes_col_artist = False
         return self._has_likes_col_artist
 
-    # 品牌
+    # --- 品牌 ---
     def fetch_brand_urls(self) -> list:
         sql = """
             SELECT id, brand_name, rednote_url, rednote_spd_setting 
@@ -181,11 +202,6 @@ class DatabaseManager:
         cur, _ = self._exec("SELECT 1 FROM spider_log WHERE url = %s LIMIT 1", (url,))
         return bool(cur.fetchone())
 
-    def get_collected_count_by_brand(self, brand_id: int) -> int:
-        cur, _ = self._exec("SELECT COUNT(*) AS cnt FROM spider_log WHERE brand_id = %s", (brand_id,))
-        row = cur.fetchone()
-        return int(row['cnt'] if row and row['cnt'] is not None else 0)
-
     def insert_brand_log(self, data: Dict):
         title = (data.get('title') or '')[:255]
         content = (data.get('content') or '')[:2000]
@@ -193,31 +209,21 @@ class DatabaseManager:
         like_count = int(data.get('like_count') or 0)
         has_likes = self._check_likes_col_spider()
         now = int(time.time())
-        if has_likes:
-            sql = """
-                INSERT INTO spider_log (
-                    msg_type, status, origin_type, title, 
-                    content, url, images, brand_id, 
-                    brand_name, auth_time, created_at, updated_at, likes
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """
-            params = (0, 0, 'xhs', title, content, data['url'], images,
-                      data['brand_id'], data['brand_name'], int(data.get('auth_time', 0)),
-                      now, now, like_count)
-        else:
-            sql = """
-                INSERT INTO spider_log (
-                    msg_type, status, origin_type, title, 
-                    content, url, images, brand_id, 
-                    brand_name, auth_time, created_at, updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """
-            params = (0, 0, 'xhs', title, content, data['url'], images,
-                      data['brand_id'], data['brand_name'], int(data.get('auth_time', 0)),
-                      now, now)
-        self._exec(sql, params)
 
-    # 艺术家
+        # 构建 SQL
+        cols = ["msg_type", "status", "origin_type", "title", "content", "url", "images", "brand_id", "brand_name",
+                "auth_time", "created_at", "updated_at"]
+        vals = [0, 0, 'xhs', title, content, data['url'], images, data['brand_id'], data['brand_name'],
+                int(data.get('auth_time', 0)), now, now]
+
+        if has_likes:
+            cols.append("likes")
+            vals.append(like_count)
+
+        sql = f"INSERT INTO spider_log ({','.join(cols)}) VALUES ({','.join(['%s'] * len(cols))})"
+        self._exec(sql, tuple(vals))
+
+    # --- 艺术家 ---
     def fetch_artists(self) -> list:
         sql = """
             SELECT id, brand_name, rednote_url, rednote_spd_setting_for_artist 
@@ -242,17 +248,10 @@ class DatabaseManager:
         now = int(time.time())
         has_likes = self._check_likes_col_artist()
         likes = int(data.get('like_count') or 0)
-        sql = """
-            INSERT INTO artist_spider_log (
-                msg_type, status, origin_type, title, 
-                content, url, images, brand_id, 
-                brand_name, created_at, updated_at, 
-                full_get, auth_time, likes
-            ) VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-            )
-        """
-        params = (
+
+        cols = ["msg_type", "status", "origin_type", "title", "content", "url", "images", "brand_id", "brand_name",
+                "created_at", "updated_at", "full_get", "auth_time", "likes"]
+        vals = [
             0, 0, 'xhs', title, content, data.get('url', ''),
             images,
             data.get('artist_id', data.get('brand_id', 0)),
@@ -261,8 +260,10 @@ class DatabaseManager:
             int(data.get('full_get', 0)),
             int(data.get('auth_time', 0)),
             likes if has_likes else 0
-        )
-        self._exec(sql, params)
+        ]
+
+        sql = f"INSERT INTO artist_spider_log ({','.join(cols)}) VALUES ({','.join(['%s'] * len(cols))})"
+        self._exec(sql, tuple(vals))
 
     def update_last_gather_time(self, brand_id: int):
         self._exec("UPDATE brand SET last_gather_time = NOW() WHERE id = %s", (brand_id,))
@@ -270,20 +271,20 @@ class DatabaseManager:
 
 class XHSCrawler:
     def __init__(
-        self,
-        target_type: str,
-        url_checker: Optional[Callable] = None,
-        insert_callback: Optional[Callable] = None,
-        *,
-        get_scroll_sleep: Optional[Callable[[], float]] = None,
-        get_detail_sleep: Optional[Callable[[], float]] = None,
-        on_sleep: Optional[Callable[[str, float, float], None]] = None,
-        on_captcha_detected: Optional[Callable[..., None]] = None,
-        skip_event: Optional[threading.Event] = None,
-        pause_event: Optional[threading.Event] = None,
-        max_scroll_default: int = 20,
-        headless: bool = False,
-        logger: Optional[logging.Logger] = None
+            self,
+            target_type: str,
+            url_checker: Optional[Callable] = None,
+            insert_callback: Optional[Callable] = None,
+            *,
+            get_scroll_sleep: Optional[Callable[[], float]] = None,
+            get_detail_sleep: Optional[Callable[[], float]] = None,
+            on_sleep: Optional[Callable[[str, float, float], None]] = None,
+            on_captcha_detected: Optional[Callable[..., None]] = None,
+            skip_event: Optional[threading.Event] = None,
+            pause_event: Optional[threading.Event] = None,
+            max_scroll_default: int = 20,
+            headless: bool = False,
+            logger: Optional[logging.Logger] = None
     ):
         self.target_type = target_type
         self.url_checker = url_checker
@@ -322,8 +323,6 @@ class XHSCrawler:
                 self.logger.warning(f"stealth 注入失败：{e}")
         else:
             self.logger.warning("未找到 stealth.min.js，跳过注入")
-
-        self.logger.info("浏览器运行成功")
 
         self.all_links = set()
         self.collected_quick_data = []
@@ -399,32 +398,40 @@ class XHSCrawler:
             pass
         return False
 
-    def login(self):
+    def login(self, cookie_list: Optional[List[Dict]] = None) -> Optional[List[Dict]]:
+        """
+        登录逻辑
+        :param cookie_list: 如果提供了 cookie_list，则注入 Cookie；否则等待扫码
+        :return: 如果是扫码登录，返回新的 Cookie 列表；否则返回 None
+        """
         self.driver.get('https://www.xiaohongshu.com/explore')
         self._detect_and_handle_captcha("explore")
 
-        cookie_file = "xhs_cookie.pkl" if self.target_type == TargetType.BRAND else "xhs_artist_cookie.pkl"
-
-        if os.path.exists(cookie_file):
+        if cookie_list:
+            self.logger.info("正在注入选定的 Cookie...")
             try:
-                cookies = pickle.load(open(cookie_file, "rb"))
-                for cookie in cookies:
-                    self.driver.add_cookie(cookie)
+                for cookie in cookie_list:
+                    # Selenium 对 cookie 字段有些要求，过滤掉不必要的
+                    c = {k: v for k, v in cookie.items() if
+                         k in ['name', 'value', 'domain', 'path', 'expiry', 'secure', 'httpOnly']}
+                    self.driver.add_cookie(c)
+
                 self.driver.refresh()
                 WebDriverWait(self.driver, 15).until(
                     EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
                 )
                 self.logger.info("Cookie 登录成功")
-                return
+                return None
             except Exception as e:
-                self.logger.warning(f"Cookie加载失败: {e}")
+                self.logger.warning(f"Cookie 登录失败或失效: {e}，将转为手动登录")
 
-        self.logger.info("等待手动登录（120s 超时）")
+        # 手动登录流程
+        self.logger.info("等待手动扫码登录（120s 超时）...")
         WebDriverWait(self.driver, 120).until(
             EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
         )
-        pickle.dump(self.driver.get_cookies(), open(cookie_file, "wb"))
-        self.logger.info('登录成功并已保存 Cookie')
+        self.logger.info('扫码登录成功')
+        return self.driver.get_cookies()
 
     def extract_current_links(self):
         current_links = set()
@@ -451,7 +458,6 @@ class XHSCrawler:
 
         self.logger.info(f"智能滚动设置: 最大滚动次数={max_scroll}（滚动等待将实时读取 GUI 配置）")
 
-        # 首屏提取
         self.check_stop()
         self._detect_and_handle_captcha("scroll")
         current_links = self.extract_current_links()
@@ -662,13 +668,13 @@ class XHSCrawler:
             if self.target_type == TargetType.BRAND:
                 spd_setting = row.get('rednote_spd_setting', 1)
                 if spd_setting == 3:
-                    self.logger.info(f"品牌[{row.get('brand_name','')}] 配置不采集，跳过")
+                    self.logger.info(f"品牌[{row.get('brand_name', '')}] 配置不采集，跳过")
                     return True
                 max_scroll = self.max_scroll_default
             else:
                 spd_setting = row.get('rednote_spd_setting_for_artist', 3)
                 if spd_setting == 3:
-                    self.logger.info(f"艺术家[{row.get('brand_name','')}] 配置不采集，跳过")
+                    self.logger.info(f"艺术家[{row.get('brand_name', '')}] 配置不采集，跳过")
                     return True
                 max_scroll = self.max_scroll_default
 
@@ -693,7 +699,8 @@ class XHSCrawler:
                         if self.target_type == TargetType.BRAND:
                             detail.update({'brand_id': row['id'], 'brand_name': row.get('brand_name', '')})
                         else:
-                            detail.update({'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'full_get': 0})
+                            detail.update(
+                                {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'full_get': 0})
                         if self.insert_callback:
                             self.insert_callback(detail)
 
@@ -701,9 +708,12 @@ class XHSCrawler:
                 for quick_data in self.collected_quick_data:
                     self.check_stop()
                     if self.target_type == TargetType.BRAND:
-                        quick_data.update({'brand_id': row['id'], 'brand_name': row.get('brand_name', ''), 'auth_time': 0})
+                        quick_data.update(
+                            {'brand_id': row['id'], 'brand_name': row.get('brand_name', ''), 'auth_time': 0})
                     else:
-                        quick_data.update({'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'auth_time': 0, 'full_get': 0})
+                        quick_data.update(
+                            {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'auth_time': 0,
+                             'full_get': 0})
                     if self.insert_callback:
                         self.insert_callback(quick_data)
                 self.logger.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
@@ -741,9 +751,23 @@ class TextHandler(logging.Handler):
 class App:
     def __init__(self, master: tk.Tk):
         self.master = master
-        self.master.title("小红书爬虫 · 采集控制台（品牌 / 妆师）")
-        self.master.geometry("1000x860")
+        self.master.title("小红书爬虫 · 采集控制台（数据库Cookie管理版）")
+        self.master.geometry("1000x900")
 
+        # --- 账号管理区域 ---
+        acc_frame = ttk.LabelFrame(master, text="账号管理")
+        acc_frame.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(acc_frame, text="选择登录账号：").pack(side='left', padx=5, pady=5)
+        self.cb_account = ttk.Combobox(acc_frame, state='readonly', width=30)
+        self.cb_account.pack(side='left', padx=5, pady=5)
+
+        self.btn_add_acc = ttk.Button(acc_frame, text="+ 新增/更新账号", command=self.add_new_account)
+        self.btn_add_acc.pack(side='left', padx=10, pady=5)
+
+        ttk.Button(acc_frame, text="刷新列表", command=self.load_accounts).pack(side='left', padx=5)
+
+        # --- 采集参数 ---
         frm = ttk.LabelFrame(master, text="采集参数（可运行中随时修改）")
         frm.pack(fill="x", padx=10, pady=10)
 
@@ -760,7 +784,8 @@ class App:
         ttk.Entry(frm, textvariable=self.var_max_scroll, width=10).grid(row=0, column=5, padx=6, pady=6, sticky='w')
 
         self.var_headless = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="无头模式(Headless)", variable=self.var_headless).grid(row=0, column=6, padx=6, pady=6)
+        ttk.Checkbutton(frm, text="无头模式(Headless)", variable=self.var_headless).grid(row=0, column=6, padx=6,
+                                                                                         pady=6)
 
         type_frame = ttk.LabelFrame(master, text="采集对象")
         type_frame.pack(fill='x', padx=10, pady=(0, 10))
@@ -810,7 +835,7 @@ class App:
 
         log_frame = ttk.LabelFrame(master, text="运行日志")
         log_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        self.txt_log = tk.Text(log_frame, height=18, state='disabled')
+        self.txt_log = tk.Text(log_frame, height=15, state='disabled')
         self.txt_log.pack(fill='both', expand=True, side='left')
         scroll = ttk.Scrollbar(log_frame, command=self.txt_log.yview)
         scroll.pack(side='right', fill='y')
@@ -830,6 +855,9 @@ class App:
         self.crawler: Optional[XHSCrawler] = None
         self.db: Optional[DatabaseManager] = None
 
+        # 缓存账号列表 {name: cookie_json_list}
+        self.account_map = {}
+
         self.start_ts = None
         self._tick_after_id = None
         self.total_rows = 0
@@ -842,9 +870,11 @@ class App:
 
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ---------- UI 线程安全：统一入口 ----------
+        # 初始化加载账号
+        self.load_accounts()
+
+    # ---------- UI 线程安全 ----------
     def ui(self, fn):
-        """把 UI 更新投递到 Tk 主线程执行"""
         try:
             self.master.after(0, fn)
         except Exception:
@@ -853,19 +883,17 @@ class App:
     def ui_set_status(self, text: str):
         self.ui(lambda: self.var_status.set(text))
 
-    def ui_set_buttons(self, *, start=None, stop=None, resume=None, skip=None):
+    def ui_set_buttons(self, *, start=None, stop=None, resume=None, skip=None, add_acc=None):
         def _apply():
             try:
-                if start is not None:
-                    self.btn_start.config(state=start)
-                if stop is not None:
-                    self.btn_stop.config(state=stop)
-                if resume is not None:
-                    self.btn_resume.config(state=resume)
-                if skip is not None:
-                    self.btn_skip.config(state=skip)
+                if start is not None: self.btn_start.config(state=start)
+                if stop is not None: self.btn_stop.config(state=stop)
+                if resume is not None: self.btn_resume.config(state=resume)
+                if skip is not None: self.btn_skip.config(state=skip)
+                if add_acc is not None: self.btn_add_acc.config(state=add_acc)
             except Exception:
                 pass
+
         self.ui(_apply)
 
     def ui_update_progress(self):
@@ -873,7 +901,106 @@ class App:
             percent = (self.done_rows / self.total_rows * 100.0) if self.total_rows else 0.0
             self.var_progress_text.set(f"进度：{self.done_rows} / {self.total_rows} ({percent:.1f}%)")
             self.progress['value'] = percent
+
         self.ui(_apply)
+
+    # ---------- 账号管理 ----------
+    def load_accounts(self):
+        """加载数据库中的账号列表"""
+
+        def _load():
+            try:
+                db = DatabaseManager()
+                rows = db.fetch_cookies()
+                db.connection.close()
+
+                self.account_map.clear()
+                cb_values = []
+                for row in rows:
+                    name = row['account_name']
+                    try:
+                        data = json.loads(row['cookie_data'])
+                        self.account_map[name] = data
+                        cb_values.append(name)
+                    except Exception:
+                        pass
+
+                def _ui_update():
+                    self.cb_account['values'] = cb_values
+                    if cb_values:
+                        self.cb_account.current(0)
+                    else:
+                        self.cb_account.set('暂无账号，请新增')
+
+                self.ui(_ui_update)
+            except Exception as e:
+                self.logger.error(f"加载账号列表失败: {e}")
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def add_new_account(self):
+        """新增账号流程：打开浏览器 -> 扫码 -> 输入名称 -> 保存"""
+        if self.running_thread and self.running_thread.is_alive():
+            messagebox.showinfo("提示", "采集进行中，请先停止")
+            return
+
+        self.ui_set_buttons(start='disabled', add_acc='disabled')
+        self.var_status.set("正在启动浏览器录入账号...")
+
+        def _run_add():
+            temp_crawler = None
+            try:
+                temp_crawler = XHSCrawler(target_type="temp", logger=self.logger, headless=False)
+                self.logger.info("浏览器已启动，请在弹出的浏览器中扫码登录...")
+
+                # 调用 login 不传 cookie，触发扫码逻辑
+                new_cookies = temp_crawler.login(cookie_list=None)
+
+                if new_cookies:
+                    # 获取用户输入需要在主线程
+                    user_input_name = [None]
+
+                    def _ask_name():
+                        name = simpledialog.askstring("保存账号", "登录成功！请输入该账号的备注名称：")
+                        user_input_name[0] = name
+
+                    # 阻塞等待用户输入，或者使用 event，这里简单用 after+delay 模拟同步是不行的
+                    # 所以我们在 thread 里调用 ui 方法，但需要等待结果
+                    # 实际上 simpledialog 会阻塞主循环，如果在 callback 里调用会卡住
+                    # 这里直接通过 sync 方式调用有点麻烦。
+                    # 简化处理：不阻塞，只是在保存前确认。
+
+                    # 由于 Tkinter 非线程安全，askstring 最好在主线程调用
+                    # 我们这里先暂存 cookie，然后在主线程弹窗保存
+
+                    def _save_step():
+                        name = simpledialog.askstring("保存账号", "登录成功！请输入该账号的备注名称：")
+                        if name:
+                            try:
+                                db = DatabaseManager()
+                                db.upsert_xhs_cookie(name, new_cookies)
+                                db.connection.close()
+                                messagebox.showinfo("成功", f"账号 [{name}] 已保存！")
+                                self.load_accounts()
+                            except Exception as db_e:
+                                messagebox.showerror("错误", f"数据库保存失败: {db_e}")
+                        else:
+                            self.logger.info("用户取消保存账号")
+
+                        self.ui_set_buttons(start='normal', add_acc='normal')
+                        self.var_status.set("就绪")
+
+                    self.ui(_save_step)
+
+            except Exception as e:
+                self.logger.error(f"录入账号异常: {e}")
+                self.ui_set_buttons(start='normal', add_acc='normal')
+                self.var_status.set("录入失败")
+            finally:
+                if temp_crawler and temp_crawler.driver:
+                    temp_crawler.driver.quit()
+
+        threading.Thread(target=_run_add, daemon=True).start()
 
     # ---------- 采集对象切换 ----------
     def on_target_type_change(self, target: str):
@@ -885,6 +1012,7 @@ class App:
                 if self.var_max_scroll.get().strip() == "0":
                     self.var_max_scroll.set("20")
                 self.logger.info("切换到【品牌】采集：最大滚动次数保持/恢复为常用默认（20）")
+
         self.ui(_apply)
 
     # ---------- 动态读取 ----------
@@ -911,6 +1039,7 @@ class App:
             self.sleep_bar['value'] = percent
             if total_ > 0 and abs(elapsed_ - total_) < 1e-6:
                 self.master.after(1000, self._clear_sleep_bar)
+
         self.ui(_update)
 
     def _clear_sleep_bar(self):
@@ -937,6 +1066,7 @@ class App:
                 f"检测到验证码页面({captcha_type}, {where})，采集已暂停。"
                 f"请在浏览器中完成扫码/风控验证后，点击“恢复运行”。"
             )
+
         self.ui(_apply)
 
     # ---------- 计时 ----------
@@ -955,6 +1085,13 @@ class App:
             messagebox.showinfo("提示", "采集已在进行中")
             return
 
+        selected_acc_name = self.cb_account.get()
+        if not selected_acc_name or selected_acc_name not in self.account_map:
+            messagebox.showwarning("提示", "请先选择一个有效的登录账号（或点击新增录入）")
+            return
+
+        selected_cookies = self.account_map[selected_acc_name]
+
         try:
             max_scroll = int(self.var_max_scroll.get())
         except ValueError:
@@ -962,6 +1099,7 @@ class App:
             return
 
         self.btn_start.config(state='disabled')
+        self.btn_add_acc.config(state='disabled')  # 运行时不可新增
         self.btn_stop.config(state='normal')
         self.btn_resume.config(state='disabled')
         self.btn_skip.config(state='normal')
@@ -981,6 +1119,9 @@ class App:
             try:
                 self.logger.info("初始化DB")
                 self.db = DatabaseManager()
+
+                # 更新账号使用时间
+                self.db.update_cookie_usage(selected_acc_name)
 
                 self.logger.info("初始化爬虫（速度参数将实时读取 GUI 输入框）")
                 if target_type == TargetType.BRAND:
@@ -1004,8 +1145,9 @@ class App:
                     logger=self.logger
                 )
 
-                self.logger.info("准备登录")
-                self.crawler.login()
+                self.logger.info(f"使用账号 [{selected_acc_name}] 登录...")
+                # 注入 Cookie 登录
+                self.crawler.login(cookie_list=selected_cookies)
 
                 rows = self.db.fetch_brand_urls() if target_type == TargetType.BRAND else self.db.fetch_artists()
                 self.total_rows = len(rows)
@@ -1061,7 +1203,8 @@ class App:
                 except Exception:
                     pass
 
-                self.ui_set_buttons(start='normal', stop='disabled', resume='disabled', skip='disabled')
+                self.ui_set_buttons(start='normal', stop='disabled', resume='disabled', skip='disabled',
+                                    add_acc='normal')
                 self.ui(lambda: self._clear_sleep_bar())
 
         self.running_thread = threading.Thread(target=run, daemon=True)
@@ -1098,7 +1241,6 @@ class App:
             self.var_status.set("运行中…")
             self.logger.info("已点击“恢复运行”，采集将继续执行")
 
-        # UI 先恢复，再解除 crawler 暂停（避免 UI 卡住时看不到变化）
         self.ui(_apply_restore)
 
         try:
