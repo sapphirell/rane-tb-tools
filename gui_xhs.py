@@ -5,6 +5,7 @@
 功能更新：
 - Cookie 存储于数据库表 `xhs_cookies`。
 - GUI 支持选择账号登录，支持新增/录入新账号。
+- 新增：数据维护功能（批量更新品牌状态与日志状态）。
 """
 
 import os
@@ -808,10 +809,14 @@ class App:
         self.btn_stop = ttk.Button(ctrl, text="停止采集", command=self.stop, state='disabled')
         self.btn_resume = ttk.Button(ctrl, text="恢复运行", command=self.resume, state='disabled')
         self.btn_skip = ttk.Button(ctrl, text="跳过当前等待", command=self.skip_current_wait, state='disabled')
+        # 新增的维护按钮
+        self.btn_maintenance = ttk.Button(ctrl, text="数据维护(重置/清理)", command=self.run_data_maintenance)
+
         self.btn_start.pack(side='left', padx=6, pady=4)
         self.btn_stop.pack(side='left', padx=6, pady=4)
         self.btn_resume.pack(side='left', padx=6, pady=4)
         self.btn_skip.pack(side='left', padx=6, pady=4)
+        self.btn_maintenance.pack(side='left', padx=6, pady=4)
 
         self.var_status = tk.StringVar(value="就绪")
         ttk.Label(ctrl, textvariable=self.var_status).pack(side='left', padx=12)
@@ -970,9 +975,6 @@ class App:
                     # 这里直接通过 sync 方式调用有点麻烦。
                     # 简化处理：不阻塞，只是在保存前确认。
 
-                    # 由于 Tkinter 非线程安全，askstring 最好在主线程调用
-                    # 我们这里先暂存 cookie，然后在主线程弹窗保存
-
                     def _save_step():
                         name = simpledialog.askstring("保存账号", "登录成功！请输入该账号的备注名称：")
                         if name:
@@ -1001,6 +1003,65 @@ class App:
                     temp_crawler.driver.quit()
 
         threading.Thread(target=_run_add, daemon=True).start()
+
+    # ---------- 新增：数据维护功能 ----------
+    def run_data_maintenance(self):
+        """执行 SQL 数据维护（更新品牌状态和处理旧日志）"""
+        if self.running_thread and self.running_thread.is_alive():
+            messagebox.showwarning("提示", "请先停止采集任务后再执行维护操作")
+            return
+
+        if not messagebox.askyesno("确认",
+                                   "确定要执行数据维护吗？\n1. 重置满足条件的品牌采集状态(>10条日志)\n2. 标记旧的采集日志为已处理"):
+            return
+
+        def _run():
+            self.var_status.set("正在执行数据维护...")
+            self.ui(lambda: self.btn_maintenance.config(state='disabled'))
+            try:
+                db = DatabaseManager()
+                self.logger.info("开始执行数据维护 SQL...")
+
+                # 1. 更新品牌配置
+                sql_update_brand = """
+                    UPDATE brand 
+                    SET rednote_spd_setting = 1 
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT b.id
+                            FROM brand b
+                            WHERE b.is_delete = 0
+                              AND (SELECT COUNT(*) FROM spider_log WHERE brand_id = b.id) >= 10
+                        ) AS temp
+                    );
+                """
+                _, count_brand = db._exec(sql_update_brand)
+                self.logger.info(f"已重置品牌 rednote_spd_setting=1，影响行数：{count_brand}")
+
+                # 2. 更新旧日志状态
+                sql_update_log = """
+                    UPDATE spider_log 
+                    SET msg_type = 4, `status` = 2 
+                    WHERE msg_type = 0 
+                      AND `status` = 0 
+                      AND (auth_time = 0 OR auth_time <= UNIX_TIMESTAMP(NOW() - INTERVAL 3 DAY));
+                """
+                _, count_log = db._exec(sql_update_log)
+                self.logger.info(f"已清理旧 spider_log (msg_type=4, status=2)，影响行数：{count_log}")
+
+                db.connection.close()
+
+                result_msg = f"维护完成！\n\n重置品牌数: {count_brand}\n清理日志数: {count_log}"
+                self.ui(lambda: messagebox.showinfo("成功", result_msg))
+
+            except Exception as e:
+                self.logger.error(f"维护执行失败: {e}")
+                self.ui(lambda: messagebox.showerror("错误", f"维护失败: {e}"))
+            finally:
+                self.ui(lambda: self.btn_maintenance.config(state='normal'))
+                self.ui_set_status("就绪")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ---------- 采集对象切换 ----------
     def on_target_type_change(self, target: str):
