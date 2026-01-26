@@ -5,7 +5,8 @@
 功能更新：
 - Cookie 存储于数据库表 `xhs_cookies`。
 - GUI 支持选择账号登录，支持新增/录入新账号。
-- 新增：数据维护功能（批量更新品牌状态与日志状态）。
+- 新增：数据维护功能（批量更新品牌状态与日志状态，移除二次确认）。
+- 新增：检测 captcha-modal-content 验证码弹窗。
 """
 
 import os
@@ -362,6 +363,25 @@ class XHSCrawler:
     # ---- captcha detect ----
     def _detect_and_handle_captcha(self, where: str):
         try:
+            # 1. 检查 .captcha-modal-content (新增)
+            modal_els = self.driver.find_elements(By.CLASS_NAME, "captcha-modal-content")
+            modal_visible = any(e.is_displayed() for e in modal_els) if modal_els else False
+            if modal_visible:
+                self.logger.warning(f"检测到弹窗验证码 .captcha-modal-content（{where}），将暂停采集并等待你处理验证码。")
+                if self.on_captcha_detected:
+                    try:
+                        self.on_captcha_detected(where, "captcha-modal-content")
+                    except TypeError:
+                        self.on_captcha_detected(where)
+                self.request_pause(f"captcha-modal-content@{where}")
+                self._wait_until_resumed()
+                try:
+                    self.driver.refresh()
+                except Exception:
+                    pass
+                return True
+
+            # 2. 检查 #captcha-div (严格风控)
             strict_els = self.driver.find_elements(By.CSS_SELECTOR, "#captcha-div")
             strict_visible = any(e.is_displayed() for e in strict_els) if strict_els else False
             if strict_visible:
@@ -379,6 +399,7 @@ class XHSCrawler:
                     pass
                 return True
 
+            # 3. 检查 #red-captcha
             els = self.driver.find_elements(By.CSS_SELECTOR, "#red-captcha, div#red-captcha")
             visible = any(e.is_displayed() for e in els) if els else False
             if visible:
@@ -1006,14 +1027,13 @@ class App:
 
     # ---------- 新增：数据维护功能 ----------
     def run_data_maintenance(self):
-        """执行 SQL 数据维护（更新品牌状态和处理旧日志）"""
+        """执行 SQL 数据维护（更新品牌状态和处理旧日志） - 已移除二次确认"""
         if self.running_thread and self.running_thread.is_alive():
             messagebox.showwarning("提示", "请先停止采集任务后再执行维护操作")
             return
 
-        if not messagebox.askyesno("确认",
-                                   "确定要执行数据维护吗？\n1. 重置满足条件的品牌采集状态(>10条日志)\n2. 标记旧的采集日志为已处理"):
-            return
+        # 修改：已移除 messagebox.askyesno 确认弹窗
+        # if not messagebox.askyesno("确认", "确定要执行数据维护吗？..."): return
 
         def _run():
             self.var_status.set("正在执行数据维护...")
