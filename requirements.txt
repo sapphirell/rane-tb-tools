@@ -1,0 +1,5 @@
+customtkinter
+urllib3
+requests
+pymysql
+selenium

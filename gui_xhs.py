@@ -5,8 +5,8 @@
 功能更新：
 - Cookie 存储于数据库表 `xhs_cookies`。
 - GUI 支持选择账号登录，支持新增/录入新账号。
-- 新增：数据维护功能（批量更新品牌状态与日志状态，移除二次确认）。
-- 新增：检测 captcha-modal-content 验证码弹窗。
+- 新增：数据维护功能（批量更新品牌状态与日志状态，移除二次确认，移除运行状态限制）。
+- 新增：检测 captcha-modal-content 验证码弹窗并弹出系统提示框。
 """
 
 import os
@@ -25,7 +25,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog  # 新增 simpledialog
+from tkinter import ttk, messagebox, simpledialog
 
 
 def convert_xhs_url(original_url: str) -> str:
@@ -1027,10 +1027,11 @@ class App:
 
     # ---------- 新增：数据维护功能 ----------
     def run_data_maintenance(self):
-        """执行 SQL 数据维护（更新品牌状态和处理旧日志） - 已移除二次确认"""
-        if self.running_thread and self.running_thread.is_alive():
-            messagebox.showwarning("提示", "请先停止采集任务后再执行维护操作")
-            return
+        """执行 SQL 数据维护（更新品牌状态和处理旧日志） - 已移除二次确认和运行限制"""
+        # 修改：已移除运行状态检查，允许随时运行
+        # if self.running_thread and self.running_thread.is_alive():
+        #     messagebox.showwarning("提示", "请先停止采集任务后再执行维护操作")
+        #     return
 
         # 修改：已移除 messagebox.askyesno 确认弹窗
         # if not messagebox.askyesno("确认", "确定要执行数据维护吗？..."): return
@@ -1079,7 +1080,11 @@ class App:
                 self.ui(lambda: messagebox.showerror("错误", f"维护失败: {e}"))
             finally:
                 self.ui(lambda: self.btn_maintenance.config(state='normal'))
-                self.ui_set_status("就绪")
+                # 恢复之前的状态显示（如果是采集运行中被临时覆盖）
+                if self.running_thread and self.running_thread.is_alive():
+                     self.ui_set_status("运行中...")
+                else:
+                     self.ui_set_status("就绪")
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1129,7 +1134,9 @@ class App:
 
     # ---------- 验证码回调 ----------
     def on_captcha_detected(self, where: str, captcha_type: str = "unknown"):
+        """当爬虫线程检测到验证码时调用此方法"""
         def _apply():
+            # 保存当前设置的速度
             cur_scroll = (self.var_scroll_sleep.get() or "").strip()
             cur_detail = (self.var_detail_sleep.get() or "").strip()
             if self._backup_scroll_sleep is None and cur_scroll and cur_scroll != "99999999":
@@ -1137,15 +1144,24 @@ class App:
             if self._backup_detail_sleep is None and cur_detail and cur_detail != "99999999":
                 self._backup_detail_sleep = cur_detail
 
+            # 暂停计时器（设为极长时间）
             self.var_scroll_sleep.set("99999999")
             self.var_detail_sleep.set("99999999")
 
+            # 更新 UI 状态
             self.btn_resume.config(state='normal')
             self.var_status.set("已暂停：等待验证码处理后恢复运行")
 
-            self.logger.warning(
-                f"检测到验证码页面({captcha_type}, {where})，采集已暂停。"
+            log_msg = (
+                f"检测到验证码页面({captcha_type}, {where})，采集已暂停。\n"
                 f"请在浏览器中完成扫码/风控验证后，点击“恢复运行”。"
+            )
+            self.logger.warning(log_msg)
+
+            # 新增：弹出模态对话框提醒用户 (兼容 Mac/Windows)
+            messagebox.showwarning(
+                "验证码提醒",
+                f"检测到小红书验证码拦截！\n\n位置: {where}\n类型: {captcha_type}\n\n请前往浏览器手动完成验证，\n完成后点击 GUI 上的【恢复运行】按钮。"
             )
 
         self.ui(_apply)
