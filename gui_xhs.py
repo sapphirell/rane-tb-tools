@@ -15,6 +15,7 @@ import json  # 新增：用于序列化Cookie
 import urllib.parse
 import logging
 import threading
+from time import sleep
 from typing import Dict, Optional, Callable, List
 
 import pymysql
@@ -443,6 +444,7 @@ class XHSCrawler:
                     EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
                 )
                 self.logger.info("Cookie 登录成功")
+                sleep(3)
                 return None
             except Exception as e:
                 self.logger.warning(f"Cookie 登录失败或失效: {e}，将转为手动登录")
