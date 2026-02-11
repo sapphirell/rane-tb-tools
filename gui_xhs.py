@@ -12,13 +12,18 @@
 import os
 import time
 import json  # 新增：用于序列化Cookie
+import base64
+import hashlib
+import hmac
+import random
 import urllib.parse
 import logging
 import threading
 from time import sleep
-from typing import Dict, Optional, Callable, List
+from typing import Dict, Optional, Callable, List, Tuple
 
 import pymysql
+import requests
 from selenium.webdriver import Chrome
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -270,6 +275,259 @@ class DatabaseManager:
 
     def update_last_gather_time(self, brand_id: int):
         self._exec("UPDATE brand SET last_gather_time = NOW() WHERE id = %s", (brand_id,))
+
+
+class SpiderImageUploader:
+    """Python 版 spider_image.go：下载原图 -> 上传七牛 -> 写 images_log -> 回写 full_get"""
+
+    QINIU_AK = "HTTyjWkdHISJbKTD0n3OZ_2UPt-AvBKdPRZs2wxQ"
+    QINIU_SK = "9Xp6-AlBO9mqP9iyPKsYgxVadj93sIEcfdGxxnG9"
+    QINIU_BUCKET = "hobby-box"
+    # 对齐 Go 的 ZoneHuadongZheJiang2（七牛会返回 up-cn-east-2.qiniup.com）
+    QINIU_UPLOAD_HOST = "https://up-cn-east-2.qiniup.com"
+    QINIU_DOMAIN = "https://images1.fantuanpu.com/"
+
+    def __init__(self, db: DatabaseManager, logger: logging.Logger, stop_event: Optional[threading.Event] = None):
+        self.db = db
+        self.logger = logger
+        self.stop_event = stop_event or threading.Event()
+        self.tmp_dir = os.path.abspath("./tmp/red_book")
+        os.makedirs(self.tmp_dir, exist_ok=True)
+
+    def _is_stopped(self) -> bool:
+        return self.stop_event.is_set()
+
+    def run(self) -> Dict[str, int]:
+        spider_logs = self._fetch_logs("spider_log")
+        artist_logs = self._fetch_logs("artist_spider_log")
+        summary = {
+            "spider_total": len(spider_logs),
+            "spider_updated": 0,
+            "artist_total": len(artist_logs),
+            "artist_updated": 0,
+            "errors": 0,
+            "stopped": 0,
+        }
+
+        self.logger.info("开始执行图片上传：spider_log=%d, artist_spider_log=%d", len(spider_logs), len(artist_logs))
+
+        for row in spider_logs:
+            if self._is_stopped():
+                summary["stopped"] = 1
+                self.logger.warning("收到停止请求，终止 spider_log 上传流程")
+                break
+            try:
+                updated = self._process_spider_log(row)
+                if updated:
+                    summary["spider_updated"] += 1
+            except Exception as exc:
+                summary["errors"] += 1
+                self.logger.error("处理 spider_log 失败 (id=%s): %s", row.get("id"), exc)
+
+        if not self._is_stopped():
+            for row in artist_logs:
+                if self._is_stopped():
+                    summary["stopped"] = 1
+                    self.logger.warning("收到停止请求，终止 artist_spider_log 上传流程")
+                    break
+                try:
+                    updated = self._process_artist_log(row)
+                    if updated:
+                        summary["artist_updated"] += 1
+                except Exception as exc:
+                    summary["errors"] += 1
+                    self.logger.error("处理 artist_spider_log 失败 (id=%s): %s", row.get("id"), exc)
+        else:
+            summary["stopped"] = 1
+
+        self.logger.info(
+            "图片上传完成：spider=%d/%d, artist=%d/%d, errors=%d, stopped=%d",
+            summary["spider_updated"], summary["spider_total"],
+            summary["artist_updated"], summary["artist_total"],
+            summary["errors"], summary["stopped"],
+        )
+        return summary
+
+    def _fetch_logs(self, table_name: str) -> List[Dict]:
+        sql = f"SELECT id, images FROM {table_name} WHERE full_get = 0 AND status = 0"
+        cur, _ = self.db._exec(sql)
+        return cur.fetchall()
+
+    @staticmethod
+    def _split_images(images_text: str) -> List[str]:
+        return [item.strip() for item in (images_text or "").split(",") if item and item.strip()]
+
+    @staticmethod
+    def _urlsafe_b64(data: bytes) -> str:
+        # 与 Go SDK 的 base64.URLEncoding.EncodeToString 保持一致（保留 '=' padding）
+        return base64.urlsafe_b64encode(data).decode("utf-8")
+
+    def _make_qiniu_upload_token(self) -> str:
+        # 对齐 Go SDK PutPolicy：默认 1 小时过期，字段名为 deadline（unix 秒）
+        put_policy = {
+            "scope": self.QINIU_BUCKET,
+            "deadline": int(time.time()) + 3600,
+        }
+        encoded_policy = self._urlsafe_b64(
+            json.dumps(put_policy, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        sign = hmac.new(self.QINIU_SK.encode("utf-8"), encoded_policy.encode("utf-8"), hashlib.sha1).digest()
+        encoded_sign = self._urlsafe_b64(sign)
+        return f"{self.QINIU_AK}:{encoded_sign}:{encoded_policy}"
+
+    def _download_image(self, download_url: str) -> Tuple[str, str]:
+        save_name = f"{hashlib.md5(f'{download_url}{random.randint(0, 10**9)}'.encode('utf-8')).hexdigest()}.jpg"
+        store_path = os.path.join(self.tmp_dir, save_name)
+
+        resp = requests.get(download_url, timeout=5)
+        resp.raise_for_status()
+        with open(store_path, "wb") as f:
+            f.write(resp.content)
+        return store_path, save_name
+
+    @staticmethod
+    def _extract_region_host(error_body: str) -> str:
+        """从七牛报错里提取建议上传域名：please use xxx.qiniup.com"""
+        message = error_body or ""
+        try:
+            payload = json.loads(error_body)
+            if isinstance(payload, dict):
+                message = str(payload.get("error") or message)
+        except Exception:
+            pass
+
+        marker = "please use "
+        idx = message.find(marker)
+        if idx < 0:
+            return ""
+
+        host = message[idx + len(marker):].split(",")[0].strip()
+        if not host:
+            return ""
+        if host.startswith("http://") or host.startswith("https://"):
+            return host
+        return f"https://{host}"
+
+    def _upload_to_qiniu(self, local_path: str, save_key: str) -> str:
+        token = self._make_qiniu_upload_token()
+        data = {"token": token, "key": save_key}
+        upload_hosts = [self.QINIU_UPLOAD_HOST]
+        tried_hosts = set()
+        last_error = ""
+
+        while upload_hosts:
+            upload_host = upload_hosts.pop(0)
+            if upload_host in tried_hosts:
+                continue
+            tried_hosts.add(upload_host)
+
+            with open(local_path, "rb") as f:
+                files = {"file": (os.path.basename(local_path), f)}
+                resp = requests.post(upload_host, data=data, files=files, timeout=20)
+
+            if resp.status_code < 400:
+                body = resp.json()
+                if "key" not in body:
+                    raise RuntimeError(f"七牛返回异常: {body}")
+                return body["key"]
+
+            last_error = f"status={resp.status_code}, body={resp.text}"
+            suggested_host = self._extract_region_host(resp.text)
+            if suggested_host and suggested_host not in tried_hosts:
+                self.logger.warning("七牛提示区域不匹配，自动切换上传域名: %s", suggested_host)
+                upload_hosts.append(suggested_host)
+
+        raise RuntimeError(f"七牛上传失败: {last_error}")
+
+    def _add_images_log(self, full_url: str, relation_id: int, where_type: str):
+        now = int(time.time())
+        sql = "INSERT INTO images_log (url, create_time, uid, relation_id, `where`) VALUES (%s, %s, %s, %s, %s)"
+        self.db._exec(sql, (full_url, now, 0, relation_id, where_type))
+
+    def _process_spider_log(self, row: Dict) -> bool:
+        log_id = int(row.get("id") or 0)
+        images = self._split_images(row.get("images") or "")
+        if not images:
+            self.logger.info("[spider_log:%d] 没有可处理图片，跳过", log_id)
+            return False
+
+        new_images = []
+
+        for download_url in images:
+            if self._is_stopped():
+                self.logger.warning("[spider_log:%d] 收到停止请求，当前记录不回写数据库", log_id)
+                return False
+            local_path = ""
+            try:
+                self.logger.info("[spider_log:%d] 下载图片: %s", log_id, download_url)
+                local_path, save_name = self._download_image(download_url)
+                save_key = f"spd/log/{time.strftime('%Y_%m_%d')}/{save_name}"
+                key = self._upload_to_qiniu(local_path, save_key)
+                full_url = self.QINIU_DOMAIN + key
+                self._add_images_log(full_url, log_id, "spider-log")
+                new_images.append(full_url)
+            except Exception as exc:
+                self.logger.warning("[spider_log:%d] 处理图片失败: %s", log_id, exc)
+            finally:
+                if local_path and os.path.exists(local_path):
+                    try:
+                        os.remove(local_path)
+                    except Exception:
+                        self.logger.warning("[spider_log:%d] 删除临时文件失败: %s", log_id, local_path)
+
+        if self._is_stopped():
+            self.logger.warning("[spider_log:%d] 收到停止请求，当前记录不回写数据库", log_id)
+            return False
+        if not new_images:
+            self.logger.warning("[spider_log:%d] 无上传成功图片，不回写数据库", log_id)
+            return False
+
+        update_sql = "UPDATE spider_log SET images = %s, full_get = 1, updated_at = %s WHERE id = %s"
+        self.db._exec(update_sql, (",".join(new_images), int(time.time()), log_id))
+        self.logger.info("[spider_log:%d] 更新完成, 图片数: %d", log_id, len(new_images))
+        return True
+
+    def _process_artist_log(self, row: Dict) -> bool:
+        log_id = int(row.get("id") or 0)
+        images = self._split_images(row.get("images") or "")
+        if not images:
+            self.logger.warning("[artist_spider_log:%d] 没有可处理图片，跳过", log_id)
+            return False
+
+        new_images = []
+        for download_url in images:
+            if self._is_stopped():
+                self.logger.warning("[artist_spider_log:%d] 收到停止请求，当前记录不回写数据库", log_id)
+                return False
+            local_path = ""
+            try:
+                self.logger.info("[artist_spider_log:%d] 下载图片: %s", log_id, download_url)
+                local_path, save_name = self._download_image(download_url)
+                save_key = f"artist/log/{time.strftime('%Y_%m_%d')}/{save_name}"
+                key = self._upload_to_qiniu(local_path, save_key)
+                full_url = self.QINIU_DOMAIN + key
+                self._add_images_log(full_url, log_id, "artist-spider-log")
+                new_images.append(full_url)
+            except Exception as exc:
+                self.logger.warning("[artist_spider_log:%d] 处理图片失败: %s", log_id, exc)
+            finally:
+                if local_path and os.path.exists(local_path):
+                    try:
+                        os.remove(local_path)
+                    except Exception:
+                        self.logger.warning("[artist_spider_log:%d] 删除临时文件失败: %s", log_id, local_path)
+
+        if self._is_stopped():
+            self.logger.warning("[artist_spider_log:%d] 收到停止请求，当前记录不回写数据库", log_id)
+            return False
+        if new_images:
+            update_sql = "UPDATE artist_spider_log SET images = %s, full_get = 1 WHERE id = %s"
+            self.db._exec(update_sql, (",".join(new_images), log_id))
+            self.logger.info("[artist_spider_log:%d] 更新完成, 图片数: %d", log_id, len(new_images))
+            return True
+
+        self.logger.warning("[artist_spider_log:%d] 无上传成功图片，不回写数据库", log_id)
+        return False
 
 
 class XHSCrawler:
@@ -776,7 +1034,7 @@ class App:
     def __init__(self, master: tk.Tk):
         self.master = master
         self.master.title("小红书爬虫 · 采集控制台（数据库Cookie管理版）")
-        self.master.geometry("1000x900")
+        self.master.geometry("1000x980")
 
         # --- 账号管理区域 ---
         acc_frame = ttk.LabelFrame(master, text="账号管理")
@@ -833,13 +1091,17 @@ class App:
         self.btn_resume = ttk.Button(ctrl, text="恢复运行", command=self.resume, state='disabled')
         self.btn_skip = ttk.Button(ctrl, text="跳过当前等待", command=self.skip_current_wait, state='disabled')
         # 新增的维护按钮
-        self.btn_maintenance = ttk.Button(ctrl, text="数据维护(重置/清理)", command=self.run_data_maintenance)
+        self.btn_maintenance = ttk.Button(ctrl, text="数据维护", command=self.run_data_maintenance)
+        self.btn_upload_images = ttk.Button(ctrl, text="上传图片", command=self.run_spider_image_upload)
+        self.btn_stop_upload = ttk.Button(ctrl, text="停止上传", command=self.stop_spider_image_upload, state='disabled')
 
         self.btn_start.pack(side='left', padx=6, pady=4)
         self.btn_stop.pack(side='left', padx=6, pady=4)
         self.btn_resume.pack(side='left', padx=6, pady=4)
         self.btn_skip.pack(side='left', padx=6, pady=4)
         self.btn_maintenance.pack(side='left', padx=6, pady=4)
+        self.btn_upload_images.pack(side='left', padx=6, pady=4)
+        self.btn_stop_upload.pack(side='left', padx=6, pady=4)
 
         self.var_status = tk.StringVar(value="就绪")
         ttk.Label(ctrl, textvariable=self.var_status).pack(side='left', padx=12)
@@ -861,7 +1123,7 @@ class App:
         self.sleep_bar = ttk.Progressbar(sleep_frame, length=940, mode='determinate', maximum=100)
         self.sleep_bar.pack(fill='x', padx=8, pady=(0, 8))
 
-        log_frame = ttk.LabelFrame(master, text="运行日志")
+        log_frame = ttk.LabelFrame(master, text="采集日志")
         log_frame.pack(fill='both', expand=True, padx=10, pady=10)
         self.txt_log = tk.Text(log_frame, height=15, state='disabled')
         self.txt_log.pack(fill='both', expand=True, side='left')
@@ -869,8 +1131,19 @@ class App:
         scroll.pack(side='right', fill='y')
         self.txt_log['yscrollcommand'] = scroll.set
 
+        upload_log_frame = ttk.LabelFrame(master, text="图片上传日志")
+        upload_log_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+        self.txt_upload_log = tk.Text(upload_log_frame, height=10, state='disabled')
+        self.txt_upload_log.pack(fill='both', expand=True, side='left')
+        upload_scroll = ttk.Scrollbar(upload_log_frame, command=self.txt_upload_log.yview)
+        upload_scroll.pack(side='right', fill='y')
+        self.txt_upload_log['yscrollcommand'] = upload_scroll.set
+
         self.logger = logging.getLogger("XHS")
         self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+        if self.logger.handlers:
+            self.logger.handlers.clear()
         fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         self.gui_handler = TextHandler(self.txt_log)
         self.gui_handler.setFormatter(fmt)
@@ -879,7 +1152,20 @@ class App:
         file_handler.setFormatter(fmt)
         self.logger.addHandler(file_handler)
 
+        self.upload_logger = logging.getLogger("XHS_UPLOAD")
+        self.upload_logger.setLevel(logging.INFO)
+        self.upload_logger.propagate = False
+        if self.upload_logger.handlers:
+            self.upload_logger.handlers.clear()
+        self.upload_gui_handler = TextHandler(self.txt_upload_log)
+        self.upload_gui_handler.setFormatter(fmt)
+        self.upload_logger.addHandler(self.upload_gui_handler)
+        upload_file_handler = logging.FileHandler('xhs_upload.log', encoding='utf-8')
+        upload_file_handler.setFormatter(fmt)
+        self.upload_logger.addHandler(upload_file_handler)
+
         self.running_thread: Optional[threading.Thread] = None
+        self.upload_thread: Optional[threading.Thread] = None
         self.crawler: Optional[XHSCrawler] = None
         self.db: Optional[DatabaseManager] = None
 
@@ -892,6 +1178,7 @@ class App:
         self.done_rows = 0
 
         self.skip_event = threading.Event()
+        self.upload_stop_event = threading.Event()
 
         self._backup_scroll_sleep: Optional[str] = None
         self._backup_detail_sleep: Optional[str] = None
@@ -919,6 +1206,16 @@ class App:
                 if resume is not None: self.btn_resume.config(state=resume)
                 if skip is not None: self.btn_skip.config(state=skip)
                 if add_acc is not None: self.btn_add_acc.config(state=add_acc)
+            except Exception:
+                pass
+
+        self.ui(_apply)
+
+    def ui_set_upload_buttons(self, *, start_upload=None, stop_upload=None):
+        def _apply():
+            try:
+                if start_upload is not None: self.btn_upload_images.config(state=start_upload)
+                if stop_upload is not None: self.btn_stop_upload.config(state=stop_upload)
             except Exception:
                 pass
 
@@ -1089,6 +1386,58 @@ class App:
                      self.ui_set_status("就绪")
 
         threading.Thread(target=_run, daemon=True).start()
+
+    # ---------- 新增：上传图片功能（Python 版 spider_image.go） ----------
+    def run_spider_image_upload(self):
+        if self.upload_thread and self.upload_thread.is_alive():
+            messagebox.showinfo("提示", "图片上传任务已在运行中")
+            return
+
+        self.upload_stop_event.clear()
+
+        def _run():
+            self.ui_set_status("正在执行图片上传...")
+            self.ui_set_upload_buttons(start_upload='disabled', stop_upload='normal')
+            db = None
+            try:
+                db = DatabaseManager()
+                uploader = SpiderImageUploader(db=db, logger=self.upload_logger, stop_event=self.upload_stop_event)
+                summary = uploader.run()
+
+                stopped_text = "（任务已手动停止）\n\n" if summary.get("stopped") else ""
+                result_msg = (
+                    f"图片上传执行完成！\n\n{stopped_text}"
+                    f"spider_log: {summary['spider_updated']} / {summary['spider_total']}\n"
+                    f"artist_spider_log: {summary['artist_updated']} / {summary['artist_total']}\n"
+                    f"失败数: {summary['errors']}"
+                )
+                self.ui(lambda: messagebox.showinfo("完成", result_msg))
+            except Exception as e:
+                self.upload_logger.exception(f"图片上传执行失败: {e}")
+                self.ui(lambda: messagebox.showerror("错误", f"图片上传失败: {e}"))
+            finally:
+                try:
+                    if db:
+                        db.connection.close()
+                except Exception:
+                    pass
+                self.ui_set_upload_buttons(start_upload='normal', stop_upload='disabled')
+                if self.running_thread and self.running_thread.is_alive():
+                    self.ui_set_status("运行中...")
+                else:
+                    self.ui_set_status("就绪")
+
+        self.upload_thread = threading.Thread(target=_run, daemon=True)
+        self.upload_thread.start()
+
+    def stop_spider_image_upload(self):
+        if self.upload_thread and self.upload_thread.is_alive():
+            self.upload_stop_event.set()
+            self.upload_logger.warning("已请求停止图片上传任务，当前处理中的图片完成后会终止。")
+            self.ui_set_status("上传停止中...")
+            self.ui_set_upload_buttons(stop_upload='disabled')
+        else:
+            messagebox.showinfo("提示", "当前没有运行中的图片上传任务")
 
     # ---------- 采集对象切换 ----------
     def on_target_type_change(self, target: str):
@@ -1355,6 +1704,10 @@ class App:
         try:
             if self.crawler:
                 self.crawler.request_stop()
+        except Exception:
+            pass
+        try:
+            self.upload_stop_event.set()
         except Exception:
             pass
         if self._tick_after_id is not None:
