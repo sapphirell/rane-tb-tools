@@ -276,6 +276,29 @@ class DatabaseManager:
     def update_last_gather_time(self, brand_id: int):
         self._exec("UPDATE brand SET last_gather_time = NOW() WHERE id = %s", (brand_id,))
 
+    # --- 传图失败记录处理 ---
+    def mark_spider_logs_deleted(self, ids: List[int]) -> int:
+        """按 spider_log 现有删除语义处理：status=2, msg_type=4"""
+        clean_ids = [int(i) for i in ids if int(i) > 0]
+        if not clean_ids:
+            return 0
+        now = int(time.time())
+        placeholders = ",".join(["%s"] * len(clean_ids))
+        sql = f"UPDATE spider_log SET msg_type = 4, `status` = 2, updated_at = %s WHERE id IN ({placeholders})"
+        _, count = self._exec(sql, tuple([now] + clean_ids))
+        return count
+
+    def soft_delete_artist_logs(self, ids: List[int]) -> int:
+        """按 artist_spider_log 现有删除语义处理：is_delete=1"""
+        clean_ids = [int(i) for i in ids if int(i) > 0]
+        if not clean_ids:
+            return 0
+        now = int(time.time())
+        placeholders = ",".join(["%s"] * len(clean_ids))
+        sql = f"UPDATE artist_spider_log SET is_delete = 1, updated_at = %s WHERE id IN ({placeholders})"
+        _, count = self._exec(sql, tuple([now] + clean_ids))
+        return count
+
 
 class SpiderImageUploader:
     """Python 版 spider_image.go：下载原图 -> 上传七牛 -> 写 images_log -> 回写 full_get"""
@@ -297,14 +320,22 @@ class SpiderImageUploader:
     def _is_stopped(self) -> bool:
         return self.stop_event.is_set()
 
-    def run(self) -> Dict[str, int]:
+    def run(self) -> Dict[str, object]:
         spider_logs = self._fetch_logs("spider_log")
         artist_logs = self._fetch_logs("artist_spider_log")
         summary = {
             "spider_total": len(spider_logs),
             "spider_updated": 0,
+            "spider_image_success": 0,
+            "spider_image_failed": 0,
+            "spider_failed_log_count": 0,
+            "spider_failed_log_ids": [],
             "artist_total": len(artist_logs),
             "artist_updated": 0,
+            "artist_image_success": 0,
+            "artist_image_failed": 0,
+            "artist_failed_log_count": 0,
+            "artist_failed_log_ids": [],
             "errors": 0,
             "stopped": 0,
         }
@@ -317,8 +348,13 @@ class SpiderImageUploader:
                 self.logger.warning("收到停止请求，终止 spider_log 上传流程")
                 break
             try:
-                updated = self._process_spider_log(row)
-                if updated:
+                result = self._process_spider_log(row)
+                summary["spider_image_success"] += result["image_success"]
+                summary["spider_image_failed"] += result["image_failed"]
+                if result["failed"]:
+                    summary["spider_failed_log_count"] += 1
+                    summary["spider_failed_log_ids"].append(int(row.get("id") or 0))
+                if result["updated"]:
                     summary["spider_updated"] += 1
             except Exception as exc:
                 summary["errors"] += 1
@@ -331,8 +367,13 @@ class SpiderImageUploader:
                     self.logger.warning("收到停止请求，终止 artist_spider_log 上传流程")
                     break
                 try:
-                    updated = self._process_artist_log(row)
-                    if updated:
+                    result = self._process_artist_log(row)
+                    summary["artist_image_success"] += result["image_success"]
+                    summary["artist_image_failed"] += result["image_failed"]
+                    if result["failed"]:
+                        summary["artist_failed_log_count"] += 1
+                        summary["artist_failed_log_ids"].append(int(row.get("id") or 0))
+                    if result["updated"]:
                         summary["artist_updated"] += 1
                 except Exception as exc:
                     summary["errors"] += 1
@@ -341,15 +382,20 @@ class SpiderImageUploader:
             summary["stopped"] = 1
 
         self.logger.info(
-            "图片上传完成：spider=%d/%d, artist=%d/%d, errors=%d, stopped=%d",
+            "图片上传完成：spider=%d/%d(成功图=%d, 失败图=%d, 失败记录=%d), artist=%d/%d(成功图=%d, 失败图=%d, 失败记录=%d), errors=%d, stopped=%d",
             summary["spider_updated"], summary["spider_total"],
+            summary["spider_image_success"], summary["spider_image_failed"], summary["spider_failed_log_count"],
             summary["artist_updated"], summary["artist_total"],
+            summary["artist_image_success"], summary["artist_image_failed"], summary["artist_failed_log_count"],
             summary["errors"], summary["stopped"],
         )
         return summary
 
     def _fetch_logs(self, table_name: str) -> List[Dict]:
-        sql = f"SELECT id, images FROM {table_name} WHERE full_get = 0 AND status = 0"
+        if table_name == "artist_spider_log":
+            sql = "SELECT id, images FROM artist_spider_log WHERE full_get = 0 AND status = 0 AND is_delete = 0"
+        else:
+            sql = "SELECT id, images FROM spider_log WHERE full_get = 0 AND status = 0"
         cur, _ = self.db._exec(sql)
         return cur.fetchall()
 
@@ -444,19 +490,20 @@ class SpiderImageUploader:
         sql = "INSERT INTO images_log (url, create_time, uid, relation_id, `where`) VALUES (%s, %s, %s, %s, %s)"
         self.db._exec(sql, (full_url, now, 0, relation_id, where_type))
 
-    def _process_spider_log(self, row: Dict) -> bool:
+    def _process_spider_log(self, row: Dict) -> Dict[str, int]:
         log_id = int(row.get("id") or 0)
         images = self._split_images(row.get("images") or "")
+        result = {"updated": 0, "image_success": 0, "image_failed": 0, "failed": 0}
         if not images:
             self.logger.info("[spider_log:%d] 没有可处理图片，跳过", log_id)
-            return False
+            return result
 
         new_images = []
 
         for download_url in images:
             if self._is_stopped():
                 self.logger.warning("[spider_log:%d] 收到停止请求，当前记录不回写数据库", log_id)
-                return False
+                return result
             local_path = ""
             try:
                 self.logger.info("[spider_log:%d] 下载图片: %s", log_id, download_url)
@@ -466,7 +513,9 @@ class SpiderImageUploader:
                 full_url = self.QINIU_DOMAIN + key
                 self._add_images_log(full_url, log_id, "spider-log")
                 new_images.append(full_url)
+                result["image_success"] += 1
             except Exception as exc:
+                result["image_failed"] += 1
                 self.logger.warning("[spider_log:%d] 处理图片失败: %s", log_id, exc)
             finally:
                 if local_path and os.path.exists(local_path):
@@ -477,28 +526,32 @@ class SpiderImageUploader:
 
         if self._is_stopped():
             self.logger.warning("[spider_log:%d] 收到停止请求，当前记录不回写数据库", log_id)
-            return False
+            return result
         if not new_images:
             self.logger.warning("[spider_log:%d] 无上传成功图片，不回写数据库", log_id)
-            return False
+            if result["image_failed"] > 0:
+                result["failed"] = 1
+            return result
 
         update_sql = "UPDATE spider_log SET images = %s, full_get = 1, updated_at = %s WHERE id = %s"
         self.db._exec(update_sql, (",".join(new_images), int(time.time()), log_id))
         self.logger.info("[spider_log:%d] 更新完成, 图片数: %d", log_id, len(new_images))
-        return True
+        result["updated"] = 1
+        return result
 
-    def _process_artist_log(self, row: Dict) -> bool:
+    def _process_artist_log(self, row: Dict) -> Dict[str, int]:
         log_id = int(row.get("id") or 0)
         images = self._split_images(row.get("images") or "")
+        result = {"updated": 0, "image_success": 0, "image_failed": 0, "failed": 0}
         if not images:
             self.logger.warning("[artist_spider_log:%d] 没有可处理图片，跳过", log_id)
-            return False
+            return result
 
         new_images = []
         for download_url in images:
             if self._is_stopped():
                 self.logger.warning("[artist_spider_log:%d] 收到停止请求，当前记录不回写数据库", log_id)
-                return False
+                return result
             local_path = ""
             try:
                 self.logger.info("[artist_spider_log:%d] 下载图片: %s", log_id, download_url)
@@ -508,7 +561,9 @@ class SpiderImageUploader:
                 full_url = self.QINIU_DOMAIN + key
                 self._add_images_log(full_url, log_id, "artist-spider-log")
                 new_images.append(full_url)
+                result["image_success"] += 1
             except Exception as exc:
+                result["image_failed"] += 1
                 self.logger.warning("[artist_spider_log:%d] 处理图片失败: %s", log_id, exc)
             finally:
                 if local_path and os.path.exists(local_path):
@@ -519,15 +574,18 @@ class SpiderImageUploader:
 
         if self._is_stopped():
             self.logger.warning("[artist_spider_log:%d] 收到停止请求，当前记录不回写数据库", log_id)
-            return False
+            return result
         if new_images:
             update_sql = "UPDATE artist_spider_log SET images = %s, full_get = 1 WHERE id = %s"
             self.db._exec(update_sql, (",".join(new_images), log_id))
             self.logger.info("[artist_spider_log:%d] 更新完成, 图片数: %d", log_id, len(new_images))
-            return True
+            result["updated"] = 1
+            return result
 
         self.logger.warning("[artist_spider_log:%d] 无上传成功图片，不回写数据库", log_id)
-        return False
+        if result["image_failed"] > 0:
+            result["failed"] = 1
+        return result
 
 
 class XHSCrawler:
@@ -1094,6 +1152,12 @@ class App:
         self.btn_maintenance = ttk.Button(ctrl, text="数据维护", command=self.run_data_maintenance)
         self.btn_upload_images = ttk.Button(ctrl, text="上传图片", command=self.run_spider_image_upload)
         self.btn_stop_upload = ttk.Button(ctrl, text="停止上传", command=self.stop_spider_image_upload, state='disabled')
+        self.btn_delete_failed_upload = ttk.Button(
+            ctrl,
+            text="删除传图失败记录",
+            command=self.delete_failed_upload_records
+        )
+        self.btn_auto_process = ttk.Button(ctrl, text="自动处理(每1分钟): 关", command=self.toggle_auto_process)
 
         self.btn_start.pack(side='left', padx=6, pady=4)
         self.btn_stop.pack(side='left', padx=6, pady=4)
@@ -1102,6 +1166,8 @@ class App:
         self.btn_maintenance.pack(side='left', padx=6, pady=4)
         self.btn_upload_images.pack(side='left', padx=6, pady=4)
         self.btn_stop_upload.pack(side='left', padx=6, pady=4)
+        self.btn_delete_failed_upload.pack(side='left', padx=6, pady=4)
+        self.btn_auto_process.pack(side='left', padx=6, pady=4)
 
         self.var_status = tk.StringVar(value="就绪")
         ttk.Label(ctrl, textvariable=self.var_status).pack(side='left', padx=12)
@@ -1165,9 +1231,12 @@ class App:
         self.upload_logger.addHandler(upload_file_handler)
 
         self.running_thread: Optional[threading.Thread] = None
+        self.maintenance_thread: Optional[threading.Thread] = None
         self.upload_thread: Optional[threading.Thread] = None
         self.crawler: Optional[XHSCrawler] = None
         self.db: Optional[DatabaseManager] = None
+        self.failed_upload_spider_ids: List[int] = []
+        self.failed_upload_artist_ids: List[int] = []
 
         # 缓存账号列表 {name: cookie_json_list}
         self.account_map = {}
@@ -1179,6 +1248,8 @@ class App:
 
         self.skip_event = threading.Event()
         self.upload_stop_event = threading.Event()
+        self.auto_process_enabled = False
+        self.auto_process_after_id = None
 
         self._backup_scroll_sleep: Optional[str] = None
         self._backup_detail_sleep: Optional[str] = None
@@ -1220,6 +1291,62 @@ class App:
                 pass
 
         self.ui(_apply)
+
+    def _set_auto_process_button_text(self):
+        text = "自动处理(每1分钟): 开" if self.auto_process_enabled else "自动处理(每1分钟): 关"
+        self.ui(lambda: self.btn_auto_process.config(text=text))
+
+    def _schedule_auto_process(self, delay_ms: int = 60_000):
+        if not self.auto_process_enabled:
+            return
+        if self.auto_process_after_id is not None:
+            try:
+                self.master.after_cancel(self.auto_process_after_id)
+            except Exception:
+                pass
+            self.auto_process_after_id = None
+        self.auto_process_after_id = self.master.after(delay_ms, self._auto_process_tick)
+
+    def toggle_auto_process(self):
+        self.auto_process_enabled = not self.auto_process_enabled
+        self._set_auto_process_button_text()
+        if self.auto_process_enabled:
+            self.upload_logger.info("自动处理已开启：每60秒执行一次数据维护 + 上传图片")
+            self._schedule_auto_process(1000)
+        else:
+            if self.auto_process_after_id is not None:
+                try:
+                    self.master.after_cancel(self.auto_process_after_id)
+                except Exception:
+                    pass
+                self.auto_process_after_id = None
+            self.upload_logger.info("自动处理已关闭")
+
+    def _auto_process_tick(self):
+        self.auto_process_after_id = None
+        if not self.auto_process_enabled:
+            return
+
+        if (self.upload_thread and self.upload_thread.is_alive()) or (
+                self.maintenance_thread and self.maintenance_thread.is_alive()):
+            self.upload_logger.info("自动处理跳过：已有任务运行中（上传或维护）")
+            self._schedule_auto_process(60_000)
+            return
+
+        self.upload_logger.info("自动处理触发：执行数据维护，完成后执行上传图片")
+        self.run_data_maintenance(show_dialog=False, source="auto", on_complete=self._auto_after_maintenance)
+        self._schedule_auto_process(60_000)
+
+    def _auto_after_maintenance(self, success: bool):
+        if not self.auto_process_enabled:
+            return
+        if not success:
+            self.upload_logger.warning("自动处理：数据维护失败，本轮不执行上传")
+            return
+        if self.upload_thread and self.upload_thread.is_alive():
+            self.upload_logger.info("自动处理：上传任务仍在进行，跳过本轮上传")
+            return
+        self.run_spider_image_upload(show_dialog=False, source="auto")
 
     def ui_update_progress(self):
         def _apply():
@@ -1325,24 +1452,26 @@ class App:
         threading.Thread(target=_run_add, daemon=True).start()
 
     # ---------- 新增：数据维护功能 ----------
-    def run_data_maintenance(self):
-        """执行 SQL 数据维护（更新品牌状态和处理旧日志） - 已移除二次确认和运行限制"""
-        # 修改：已移除运行状态检查，允许随时运行
-        # if self.running_thread and self.running_thread.is_alive():
-        #     messagebox.showwarning("提示", "请先停止采集任务后再执行维护操作")
-        #     return
-
-        # 修改：已移除 messagebox.askyesno 确认弹窗
-        # if not messagebox.askyesno("确认", "确定要执行数据维护吗？..."): return
+    def run_data_maintenance(self, *, show_dialog: bool = True, source: str = "manual",
+                             on_complete: Optional[Callable[[bool], None]] = None):
+        """执行 SQL 数据维护（更新品牌状态和处理旧日志）"""
+        if self.maintenance_thread and self.maintenance_thread.is_alive():
+            if show_dialog:
+                messagebox.showinfo("提示", "数据维护任务已在运行中")
+            self.logger.info("数据维护跳过：已有任务运行中（source=%s）", source)
+            if on_complete:
+                on_complete(False)
+            return
 
         def _run():
+            success = False
             self.var_status.set("正在执行数据维护...")
             self.ui(lambda: self.btn_maintenance.config(state='disabled'))
+            db = None
             try:
                 db = DatabaseManager()
-                self.logger.info("开始执行数据维护 SQL...")
+                self.logger.info("开始执行数据维护 SQL... (source=%s)", source)
 
-                # 1. 更新品牌配置
                 sql_update_brand = """
                     UPDATE brand 
                     SET rednote_spd_setting = 1 
@@ -1358,7 +1487,6 @@ class App:
                 _, count_brand = db._exec(sql_update_brand)
                 self.logger.info(f"已重置品牌 rednote_spd_setting=1，影响行数：{count_brand}")
 
-                # 2. 更新旧日志状态
                 sql_update_log = """
                     UPDATE spider_log 
                     SET msg_type = 4, `status` = 2 
@@ -1369,28 +1497,46 @@ class App:
                 _, count_log = db._exec(sql_update_log)
                 self.logger.info(f"已清理旧 spider_log (msg_type=4, status=2)，影响行数：{count_log}")
 
-                db.connection.close()
-
+                success = True
                 result_msg = f"维护完成！\n\n重置品牌数: {count_brand}\n清理日志数: {count_log}"
-                self.ui(lambda: messagebox.showinfo("成功", result_msg))
+                if show_dialog:
+                    self.ui(lambda: messagebox.showinfo("成功", result_msg))
+                else:
+                    self.upload_logger.info("自动维护完成：重置品牌=%d, 清理日志=%d", count_brand, count_log)
 
             except Exception as e:
                 self.logger.error(f"维护执行失败: {e}")
-                self.ui(lambda: messagebox.showerror("错误", f"维护失败: {e}"))
-            finally:
-                self.ui(lambda: self.btn_maintenance.config(state='normal'))
-                # 恢复之前的状态显示（如果是采集运行中被临时覆盖）
-                if self.running_thread and self.running_thread.is_alive():
-                     self.ui_set_status("运行中...")
+                if show_dialog:
+                    self.ui(lambda: messagebox.showerror("错误", f"维护失败: {e}"))
                 else:
-                     self.ui_set_status("就绪")
+                    self.upload_logger.error("自动维护失败: %s", e)
+            finally:
+                try:
+                    if db:
+                        db.connection.close()
+                except Exception:
+                    pass
+                self.ui(lambda: self.btn_maintenance.config(state='normal'))
+                if self.running_thread and self.running_thread.is_alive():
+                    self.ui_set_status("运行中...")
+                else:
+                    self.ui_set_status("就绪")
+                if on_complete:
+                    try:
+                        on_complete(success)
+                    except Exception:
+                        pass
 
-        threading.Thread(target=_run, daemon=True).start()
+        self.maintenance_thread = threading.Thread(target=_run, daemon=True)
+        self.maintenance_thread.start()
 
     # ---------- 新增：上传图片功能（Python 版 spider_image.go） ----------
-    def run_spider_image_upload(self):
+    def run_spider_image_upload(self, *, show_dialog: bool = True, source: str = "manual"):
         if self.upload_thread and self.upload_thread.is_alive():
-            messagebox.showinfo("提示", "图片上传任务已在运行中")
+            if show_dialog:
+                messagebox.showinfo("提示", "图片上传任务已在运行中")
+            else:
+                self.upload_logger.info("上传跳过：图片上传任务已在运行中（source=%s）", source)
             return
 
         self.upload_stop_event.clear()
@@ -1403,18 +1549,35 @@ class App:
                 db = DatabaseManager()
                 uploader = SpiderImageUploader(db=db, logger=self.upload_logger, stop_event=self.upload_stop_event)
                 summary = uploader.run()
+                self.failed_upload_spider_ids = list(summary.get("spider_failed_log_ids", []))
+                self.failed_upload_artist_ids = list(summary.get("artist_failed_log_ids", []))
 
                 stopped_text = "（任务已手动停止）\n\n" if summary.get("stopped") else ""
                 result_msg = (
                     f"图片上传执行完成！\n\n{stopped_text}"
-                    f"spider_log: {summary['spider_updated']} / {summary['spider_total']}\n"
-                    f"artist_spider_log: {summary['artist_updated']} / {summary['artist_total']}\n"
-                    f"失败数: {summary['errors']}"
+                    f"spider_log: {summary['spider_updated']} / {summary['spider_total']}"
+                    f"（成功图 {summary['spider_image_success']} / 失败图 {summary['spider_image_failed']}）\n"
+                    f"artist_spider_log: {summary['artist_updated']} / {summary['artist_total']}"
+                    f"（成功图 {summary['artist_image_success']} / 失败图 {summary['artist_image_failed']}）\n"
+                    f"传图失败记录: spider {summary['spider_failed_log_count']} 条，artist {summary['artist_failed_log_count']} 条\n"
+                    f"运行异常数: {summary['errors']}"
                 )
-                self.ui(lambda: messagebox.showinfo("完成", result_msg))
+                if show_dialog:
+                    self.ui(lambda: messagebox.showinfo("完成", result_msg))
+                else:
+                    self.upload_logger.info(
+                        "自动上传完成：spider=%d/%d(成功图=%d,失败图=%d), artist=%d/%d(成功图=%d,失败图=%d), 失败记录 spider=%d artist=%d, errors=%d",
+                        summary['spider_updated'], summary['spider_total'],
+                        summary['spider_image_success'], summary['spider_image_failed'],
+                        summary['artist_updated'], summary['artist_total'],
+                        summary['artist_image_success'], summary['artist_image_failed'],
+                        summary['spider_failed_log_count'], summary['artist_failed_log_count'],
+                        summary['errors']
+                    )
             except Exception as e:
                 self.upload_logger.exception(f"图片上传执行失败: {e}")
-                self.ui(lambda: messagebox.showerror("错误", f"图片上传失败: {e}"))
+                if show_dialog:
+                    self.ui(lambda: messagebox.showerror("错误", f"图片上传失败: {e}"))
             finally:
                 try:
                     if db:
@@ -1438,6 +1601,51 @@ class App:
             self.ui_set_upload_buttons(stop_upload='disabled')
         else:
             messagebox.showinfo("提示", "当前没有运行中的图片上传任务")
+
+    def delete_failed_upload_records(self):
+        if self.upload_thread and self.upload_thread.is_alive():
+            messagebox.showwarning("提示", "请先停止上传任务后再删除失败记录")
+            return
+
+        spider_ids = list(self.failed_upload_spider_ids)
+        artist_ids = list(self.failed_upload_artist_ids)
+        if not spider_ids and not artist_ids:
+            messagebox.showinfo("提示", "当前没有传图失败记录可删除")
+            return
+
+        if not messagebox.askyesno(
+                "确认删除",
+                f"确认删除传图失败记录？\n\nspider_log: {len(spider_ids)} 条\nartist_spider_log: {len(artist_ids)} 条"
+        ):
+            return
+
+        def _run():
+            db = None
+            try:
+                db = DatabaseManager()
+                spider_affected = db.mark_spider_logs_deleted(spider_ids)
+                artist_affected = db.soft_delete_artist_logs(artist_ids)
+                self.upload_logger.info(
+                    "删除传图失败记录完成：spider_log=%d/%d, artist_spider_log=%d/%d",
+                    spider_affected, len(spider_ids), artist_affected, len(artist_ids)
+                )
+                self.failed_upload_spider_ids = []
+                self.failed_upload_artist_ids = []
+                self.ui(lambda: messagebox.showinfo(
+                    "完成",
+                    f"删除完成！\n\nspider_log: {spider_affected} 条\nartist_spider_log: {artist_affected} 条"
+                ))
+            except Exception as e:
+                self.upload_logger.exception(f"删除传图失败记录失败: {e}")
+                self.ui(lambda: messagebox.showerror("错误", f"删除失败: {e}"))
+            finally:
+                try:
+                    if db:
+                        db.connection.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ---------- 采集对象切换 ----------
     def on_target_type_change(self, target: str):
@@ -1701,6 +1909,13 @@ class App:
         self.logger.info("已触发“跳过本次等待”，即将继续下一步")
 
     def on_close(self):
+        self.auto_process_enabled = False
+        if self.auto_process_after_id is not None:
+            try:
+                self.master.after_cancel(self.auto_process_after_id)
+            except Exception:
+                pass
+            self.auto_process_after_id = None
         try:
             if self.crawler:
                 self.crawler.request_stop()
