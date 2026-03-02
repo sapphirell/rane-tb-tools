@@ -49,6 +49,20 @@ def convert_xhs_url(original_url: str) -> str:
     return urllib.parse.urlunparse(new_parsed)
 
 
+def get_rednote_urls(row: Dict) -> List[str]:
+    urls: List[str] = []
+    for key in ("rednote_url", "rednote_url2"):
+        url = str((row or {}).get(key) or '').strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def resolve_rednote_url(row: Dict) -> str:
+    urls = get_rednote_urls(row)
+    return urls[0] if urls else ""
+
+
 def parse_xhs_time(time_str: str) -> int:
     """解析小红书时间格式"""
     from datetime import datetime, timedelta
@@ -198,9 +212,11 @@ class DatabaseManager:
     # --- 品牌 ---
     def fetch_brand_urls(self) -> list:
         sql = """
-            SELECT id, brand_name, rednote_url, rednote_spd_setting 
+            SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting 
             FROM brand 
-            WHERE rednote_url != '' AND is_delete = 0 AND is_brand = 1
+            WHERE (rednote_url != '' OR rednote_url2 != '')
+              AND is_delete = 0
+              AND is_brand = 1
             ORDER BY spider_index DESC, last_gather_time ASC
         """
         cur, _ = self._exec(sql)
@@ -234,11 +250,11 @@ class DatabaseManager:
     # --- 艺术家 ---
     def fetch_artists(self) -> list:
         sql = """
-            SELECT id, brand_name, rednote_url, rednote_spd_setting_for_artist 
+            SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting_for_artist 
             FROM brand 
             WHERE is_delete = 0 
               AND (is_bjd_artist = 1 or is_bjd_hairstylist = 1)
-              AND rednote_url != '' 
+              AND (rednote_url != '' OR rednote_url2 != '')
               AND rednote_spd_setting_for_artist != 3
             ORDER BY spider_index DESC, last_gather_time ASC
         """
@@ -1048,54 +1064,57 @@ class XHSCrawler:
                     return True
                 max_scroll = self.max_scroll_default
 
-            if not row.get('rednote_url'):
+            target_urls = get_rednote_urls(row)
+            if not target_urls:
                 return True
 
-            self.driver.get(row['rednote_url'])
-            self._detect_and_handle_captcha("scroll")
-            self.smart_scroll(spd_setting, max_scroll)
+            for target_url in target_urls:
+                self.check_stop()
+                self.driver.get(target_url)
+                self._detect_and_handle_captcha("scroll")
+                self.smart_scroll(spd_setting, max_scroll)
 
-            if spd_setting == 1:
-                for note_url in list(self.all_links):
-                    self.check_stop()
-                    base_url = convert_xhs_url(note_url).split('?')[0]
-                    if self.url_checker and self.url_checker(base_url):
-                        continue
-                    detail = self.process_single_note(note_url)
-                    detail_sleep = max(0.0, float(self.get_detail_sleep()))
-                    self._sleep_with_progress("detail", detail_sleep)
+                if spd_setting == 1:
+                    for note_url in list(self.all_links):
+                        self.check_stop()
+                        base_url = convert_xhs_url(note_url).split('?')[0]
+                        if self.url_checker and self.url_checker(base_url):
+                            continue
+                        detail = self.process_single_note(note_url)
+                        detail_sleep = max(0.0, float(self.get_detail_sleep()))
+                        self._sleep_with_progress("detail", detail_sleep)
 
-                    if detail:
+                        if detail:
+                            if self.target_type == TargetType.BRAND:
+                                detail.update({'brand_id': row['id'], 'brand_name': row.get('brand_name', '')})
+                            else:
+                                detail.update(
+                                    {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'full_get': 0})
+                            if self.insert_callback:
+                                self.insert_callback(detail)
+
+                elif spd_setting == 2:
+                    for quick_data in self.collected_quick_data:
+                        self.check_stop()
                         if self.target_type == TargetType.BRAND:
-                            detail.update({'brand_id': row['id'], 'brand_name': row.get('brand_name', '')})
+                            quick_data.update(
+                                {'brand_id': row['id'], 'brand_name': row.get('brand_name', ''), 'auth_time': 0})
                         else:
-                            detail.update(
-                                {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'full_get': 0})
+                            quick_data.update(
+                                {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'auth_time': 0,
+                                 'full_get': 0})
                         if self.insert_callback:
-                            self.insert_callback(detail)
+                            self.insert_callback(quick_data)
+                    self.logger.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
 
-            elif spd_setting == 2:
-                for quick_data in self.collected_quick_data:
-                    self.check_stop()
-                    if self.target_type == TargetType.BRAND:
-                        quick_data.update(
-                            {'brand_id': row['id'], 'brand_name': row.get('brand_name', ''), 'auth_time': 0})
-                    else:
-                        quick_data.update(
-                            {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'auth_time': 0,
-                             'full_get': 0})
-                    if self.insert_callback:
-                        self.insert_callback(quick_data)
-                self.logger.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
-
-            self.all_links.clear()
-            self.collected_quick_data.clear()
+                self.all_links.clear()
+                self.collected_quick_data.clear()
             return True
         except KeyboardInterrupt:
             self.logger.info("收到停止信号，已终止当前对象采集")
             return False
         except Exception as e:
-            self.logger.error(f"对象采集失败 {row.get('rednote_url')}: {e}")
+            self.logger.error(f"对象采集失败 {resolve_rednote_url(row)}: {e}")
             return False
 
 

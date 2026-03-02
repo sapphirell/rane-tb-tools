@@ -38,6 +38,20 @@ def convert_xhs_url(original_url):
     return urllib.parse.urlunparse(new_parsed)
 
 
+def get_rednote_urls(row: Dict):
+    urls = []
+    for key in ('rednote_url', 'rednote_url2'):
+        url = str((row or {}).get(key) or '').strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def resolve_rednote_url(row: Dict) -> str:
+    urls = get_rednote_urls(row)
+    return urls[0] if urls else ''
+
+
 def parse_xhs_time(time_str: str) -> int:
     """解析小红书时间格式"""
     clean_str = time_str.replace('编辑于 ', '').strip()
@@ -345,60 +359,62 @@ class ArtistXHSCrawler:
                 return True
 
             # 检查是否设置小红书地址
-            if not artist.get('rednote_url'):
-                logging.info(f"艺术家[{artist['brand_name']}]未设置小红书地址，跳过")
+            target_urls = get_rednote_urls(artist)
+            if not target_urls:
+                logging.info(f"艺术家[{artist['brand_name']}]未设置小红书地址（rednote_url/rednote_url2），跳过")
                 return True
 
             # 无论是否采集过都最多滚动5次
             logging.info(f"艺术家[{artist['brand_name']}]开始采集，最多滚动5次")
 
-            # 开始采集
-            self.driver.get(artist['rednote_url'])
-            self.smart_scroll(spd_setting)
+            for target_url in target_urls:
+                # 开始采集
+                self.driver.get(target_url)
+                self.smart_scroll(spd_setting)
 
-            # 全量采集模式处理
-            if spd_setting == ARTIST_SPIDER_SETTING['full_collect']:
-                for artwork_url in self.all_links:
-                    base_url = convert_xhs_url(artwork_url).split('?')[0]
-                    if self.url_checker and self.url_checker(base_url):
-                        logging.info(f"已处理过，跳过: {base_url}")
-                        continue
+                # 全量采集模式处理
+                if spd_setting == ARTIST_SPIDER_SETTING['full_collect']:
+                    for artwork_url in self.all_links:
+                        base_url = convert_xhs_url(artwork_url).split('?')[0]
+                        if self.url_checker and self.url_checker(base_url):
+                            logging.info(f"已处理过，跳过: {base_url}")
+                            continue
 
-                    detail = self.process_single_artwork(artwork_url)
-                    if detail:
-                        detail.update({
+                        detail = self.process_single_artwork(artwork_url)
+                        if detail:
+                            detail.update({
+                                'artist_id': artist['id'],
+                                'artist_name': artist['brand_name'],
+                                'full_get': 0
+                            })
+                            if self.insert_callback:
+                                try:
+                                    self.insert_callback(detail)
+                                except Exception as e:
+                                    logging.error(f"数据库插入失败: {str(e)}")
+
+                # 快速采集模式处理
+                elif spd_setting == ARTIST_SPIDER_SETTING['partial_collect']:
+                    for quick_data in self.collected_quick_data:
+                        quick_data.update({
                             'artist_id': artist['id'],
                             'artist_name': artist['brand_name'],
+                            'auth_time': 0,
                             'full_get': 0
                         })
                         if self.insert_callback:
                             try:
-                                self.insert_callback(detail)
+                                self.insert_callback(quick_data)
                             except Exception as e:
                                 logging.error(f"数据库插入失败: {str(e)}")
+                    logging.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
 
-            # 快速采集模式处理
-            elif spd_setting == ARTIST_SPIDER_SETTING['partial_collect']:
-                for quick_data in self.collected_quick_data:
-                    quick_data.update({
-                        'artist_id': artist['id'],
-                        'artist_name': artist['brand_name'],
-                        'auth_time': 0,
-                        'full_get': 0
-                    })
-                    if self.insert_callback:
-                        try:
-                            self.insert_callback(quick_data)
-                        except Exception as e:
-                            logging.error(f"数据库插入失败: {str(e)}")
-                logging.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
-
-            # 清理缓存
-            self.all_links.clear()
-            self.collected_quick_data.clear()
+                # 清理缓存，继续采集该艺术家的下一个主页地址
+                self.all_links.clear()
+                self.collected_quick_data.clear()
             return True
         except Exception as e:
-            logging.error(f"艺术家采集失败 {artist['rednote_url']}: {str(e)}")
+            logging.error(f"艺术家采集失败 {resolve_rednote_url(artist)}: {str(e)}")
             return False
 
     def get_collected_count(self, artist_id: int) -> int:
@@ -472,11 +488,11 @@ class ArtistDatabaseManager:
         """获取需要采集的艺术家列表"""
         with self.connection.cursor() as cursor:
             sql = """
-                SELECT id, brand_name, rednote_url, rednote_spd_setting_for_artist 
+                SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting_for_artist 
                 FROM brand 
                 WHERE is_delete = 0 
                 AND is_bjd_artist = 1 
-                AND rednote_url != '' 
+                AND (rednote_url != '' OR rednote_url2 != '')
                 AND rednote_spd_setting_for_artist != 3
                 ORDER BY spider_index DESC, last_gather_time ASC
             """

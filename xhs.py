@@ -36,6 +36,20 @@ def convert_xhs_url(original_url):
     return urllib.parse.urlunparse(new_parsed)
 
 
+def get_rednote_urls(row: Dict):
+    urls = []
+    for key in ('rednote_url', 'rednote_url2'):
+        url = str((row or {}).get(key) or '').strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def resolve_rednote_url(row: Dict) -> str:
+    urls = get_rednote_urls(row)
+    return urls[0] if urls else ''
+
+
 def parse_xhs_time(time_str: str) -> int:
     """解析小红书时间格式（新增天前处理）"""
     from datetime import datetime, timedelta
@@ -392,51 +406,57 @@ class XHSCrawler:
             # 新增：如果全量采集且已采集>20，则不滚动
             max_scroll = 1 if (spd_setting == 1 and collected_count > 20) else 20
 
-            self.driver.get(brand['rednote_url'])
-            self.smart_scroll(spd_setting, max_scroll)  # 传入采集模式参数
+            target_urls = get_rednote_urls(brand)
+            if not target_urls:
+                logging.info(f"品牌[{brand['brand_name']}]未设置小红书地址（rednote_url/rednote_url2），跳过")
+                return True
 
-            # 全量采集模式处理
-            if spd_setting == 1:
-                for note_url in self.all_links:
-                    base_url = convert_xhs_url(note_url).split('?')[0]
-                    if self.url_checker and self.url_checker(base_url):
-                        logging.info(f"已处理过，跳过: {base_url}")
-                        continue
+            for target_url in target_urls:
+                self.driver.get(target_url)
+                self.smart_scroll(spd_setting, max_scroll)  # 传入采集模式参数
 
-                    detail = self.process_single_note(note_url)
-                    if detail:
-                        detail.update({
+                # 全量采集模式处理
+                if spd_setting == 1:
+                    for note_url in self.all_links:
+                        base_url = convert_xhs_url(note_url).split('?')[0]
+                        if self.url_checker and self.url_checker(base_url):
+                            logging.info(f"已处理过，跳过: {base_url}")
+                            continue
+
+                        detail = self.process_single_note(note_url)
+                        if detail:
+                            detail.update({
+                                'brand_id': brand['id'],
+                                'brand_name': brand['brand_name']
+                            })
+                            if self.insert_callback:
+                                try:
+                                    self.insert_callback(detail)
+                                except Exception as e:
+                                    logging.error(f"数据库插入失败: {str(e)}")
+
+                # 快速采集模式数据提交
+                elif spd_setting == 2:
+                    for quick_data in self.collected_quick_data:
+                        logging.info(f"写入快速采集数据: {quick_data}")
+                        quick_data.update({
                             'brand_id': brand['id'],
-                            'brand_name': brand['brand_name']
+                            'brand_name': brand['brand_name'],
+                            'auth_time': 0  # 快速模式无时间信息
                         })
                         if self.insert_callback:
                             try:
-                                self.insert_callback(detail)
+                                self.insert_callback(quick_data)
                             except Exception as e:
                                 logging.error(f"数据库插入失败: {str(e)}")
+                    logging.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
 
-            # 快速采集模式数据提交
-            elif spd_setting == 2:
-                for quick_data in self.collected_quick_data:
-                    logging.info(f"写入快速采集数据: {quick_data}")
-                    quick_data.update({
-                        'brand_id': brand['id'],
-                        'brand_name': brand['brand_name'],
-                        'auth_time': 0  # 快速模式无时间信息
-                    })
-                    if self.insert_callback:
-                        try:
-                            self.insert_callback(quick_data)
-                        except Exception as e:
-                            logging.error(f"数据库插入失败: {str(e)}")
-                logging.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
-
-            # 清理采集缓存
-            self.all_links.clear()
-            self.collected_quick_data.clear()
+                # 清理采集缓存，继续采集该品牌的下一个主页地址
+                self.all_links.clear()
+                self.collected_quick_data.clear()
             return True
         except Exception as e:
-            logging.error(f"作者采集失败 {brand['rednote_url']}: {str(e)}")
+            logging.error(f"作者采集失败 {resolve_rednote_url(brand)}: {str(e)}")
             return False
 
     def get_collected_count(self, brand_id: int) -> int:
@@ -512,9 +532,11 @@ class DatabaseManager:
         with self.connection.cursor() as cursor:
             # and id not in (SELECT DISTINCT brand_id from spider_log )
             sql = """
-                SELECT id, brand_name, rednote_url, rednote_spd_setting 
+                SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting 
                 FROM brand 
-                WHERE rednote_url != '' AND is_delete = 0 AND is_brand = 1
+                WHERE (rednote_url != '' OR rednote_url2 != '')
+                  AND is_delete = 0
+                  AND is_brand = 1
                 ORDER BY spider_index DESC, last_gather_time ASC
             """
             cursor.execute(sql)
