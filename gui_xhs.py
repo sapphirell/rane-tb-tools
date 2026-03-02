@@ -24,7 +24,7 @@ from typing import Dict, Optional, Callable, List, Tuple
 
 import pymysql
 import requests
-from selenium.webdriver import Chrome
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -620,16 +620,46 @@ class XHSCrawler:
         self.logger = logger or logging.getLogger(__name__)
         self.stop_requested = False
 
-        options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
-        options.add_experimental_option("excludeSwitches", ['enable-automation'])
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
+        # 根据操作系统选择浏览器：Windows 用 Edge，Mac/Linux 用 Chrome
+        import platform
+        system_name = platform.system()
+        
+        if system_name == "Windows":
+            # Windows 使用 Edge（系统自带，无需下载驱动）
+            options = webdriver.EdgeOptions()
+            if headless:
+                options.add_argument("--headless=new")
+            options.add_experimental_option("excludeSwitches", ['enable-automation'])
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
 
-        self.logger.info("准备初始化浏览器")
-        self.driver: Chrome = webdriver.Chrome(options=options)
+            self.logger.info("准备初始化浏览器")
+            try:
+                self.logger.info("正在初始化 Edge 浏览器...")
+                self.driver = webdriver.Edge(options=options)
+                self.logger.info("浏览器初始化成功")
+            except Exception as e:
+                self.logger.error(f"浏览器初始化失败: {e}")
+                raise
+        else:
+            # Mac/Linux 使用 Chrome
+            options = webdriver.ChromeOptions()
+            if headless:
+                options.add_argument("--headless=new")
+            options.add_experimental_option("excludeSwitches", ['enable-automation'])
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+
+            self.logger.info("准备初始化浏览器")
+            try:
+                self.logger.info("正在初始化 Chrome 浏览器...")
+                self.driver = webdriver.Chrome(options=options)
+                self.logger.info("浏览器初始化成功")
+            except Exception as e:
+                self.logger.error(f"浏览器初始化失败: {e}")
+                raise
 
         stealth_path = './stealth.min.js'
         if os.path.exists(stealth_path):
