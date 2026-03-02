@@ -6,7 +6,7 @@ from selenium.webdriver.common.by import By
 
 # 预先检查配置文件是否合理
 cf = configparser.ConfigParser()
-cf.read('config.ini', encoding='utf-8')
+cf.read('config.ini')
 configTime = cf['DEFAULT']['time']
 
 print("您配置的抢购时间为：" + configTime + "确认无误三秒后开始运行，按ctrl+c终止")
