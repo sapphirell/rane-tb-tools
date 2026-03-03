@@ -26,8 +26,9 @@ from typing import Dict, Optional, Callable, List, Tuple
 
 import pymysql
 import requests
-from selenium.webdriver import Chrome
+
 from selenium import webdriver
+from selenium.webdriver import Chrome
 from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
