@@ -3,4 +3,5 @@ venv/
 *.log
 logs/
 .idea/
-
+xhs_browser_profiles/*
+tmp/

@@ -10,12 +10,14 @@
 """
 
 import os
+import re
 import time
 import json  # 新增：用于序列化Cookie
 import base64
 import hashlib
 import hmac
 import random
+import shutil
 import urllib.parse
 import logging
 import threading
@@ -26,6 +28,8 @@ import pymysql
 import requests
 from selenium.webdriver import Chrome
 from selenium import webdriver
+from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -113,6 +117,26 @@ def parse_xhs_time(time_str: str) -> int:
     except Exception as e:
         logging.warning(f"时间解析失败: {clean_str} ({str(e)})")
         return 0
+
+
+def _safe_profile_key(name: str) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return "default"
+    # Chrome profile 路径统一使用 ASCII，避免中文路径在不同版本驱动上的兼容问题
+    ascii_key = re.sub(r"[^A-Za-z0-9_.-]", "_", text)
+    ascii_key = re.sub(r"_+", "_", ascii_key).strip("._-")
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return f"{(ascii_key or 'acc')}_{digest}"
+
+
+def _legacy_profile_key(name: str) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return "default"
+    text = re.sub(r"[^\w\-.]", "_", text)
+    text = text.strip("._-")
+    return text or "default"
 
 
 class TargetType:
@@ -608,6 +632,7 @@ class XHSCrawler:
     def __init__(
             self,
             target_type: str,
+            account_name: str = "",
             url_checker: Optional[Callable] = None,
             insert_callback: Optional[Callable] = None,
             *,
@@ -622,6 +647,7 @@ class XHSCrawler:
             logger: Optional[logging.Logger] = None
     ):
         self.target_type = target_type
+        self.account_name = str(account_name or "").strip()
         self.url_checker = url_checker
         self.insert_callback = insert_callback
         self.get_scroll_sleep = get_scroll_sleep or (lambda: 10.5)
@@ -636,16 +662,72 @@ class XHSCrawler:
         self.logger = logger or logging.getLogger(__name__)
         self.stop_requested = False
 
-        options = webdriver.ChromeOptions()
-        if headless:
-            options.add_argument("--headless=new")
-        options.add_experimental_option("excludeSwitches", ['enable-automation'])
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
+        self.profile_key = _safe_profile_key(self.account_name or f"{self.target_type}_default")
+        profiles_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs_browser_profiles")
+        os.makedirs(profiles_root, exist_ok=True)
 
-        self.logger.info("准备初始化浏览器")
-        self.driver: Chrome = webdriver.Chrome(options=options)
+        # 账号基础目录（保留历史数据），运行目录改放到独立 _runtime 下，彻底与旧损坏 profile 隔离
+        self.account_profile_base_dir = os.path.join(profiles_root, self.profile_key)
+        runtime_root = os.path.join(profiles_root, "_runtime")
+        os.makedirs(runtime_root, exist_ok=True)
+        self.account_profile_dir = os.path.join(runtime_root, self.profile_key)
+        os.makedirs(self.account_profile_dir, exist_ok=True)
+
+        # 兼容旧版本的中文目录，仅迁移到 base 目录，不直接拿旧目录当 user-data-dir
+        legacy_key = _legacy_profile_key(self.account_name or f"{self.target_type}_default")
+        legacy_profile_dir = os.path.join(profiles_root, legacy_key)
+        if (
+                legacy_profile_dir != self.account_profile_base_dir
+                and os.path.isdir(legacy_profile_dir)
+                and not os.path.exists(self.account_profile_base_dir)
+        ):
+            try:
+                shutil.move(legacy_profile_dir, self.account_profile_base_dir)
+                os.makedirs(self.account_profile_dir, exist_ok=True)
+                self.logger.info(
+                    f"已迁移历史 profile 基目录：{legacy_profile_dir} -> {self.account_profile_base_dir}"
+                )
+            except Exception as migrate_err:
+                self.logger.warning(f"迁移历史 profile 基目录失败，将继续使用新目录：{migrate_err}")
+
+        # 兼容上一版把 runtime_profile 建在旧 profile 目录里的情况；发现旧嵌套 runtime 时仅提示，不复用。
+        legacy_runtime_dir = os.path.join(self.account_profile_base_dir, "runtime_profile")
+        if os.path.isdir(legacy_runtime_dir):
+            self.logger.warning(
+                f"检测到旧版嵌套 runtime_profile，已停用该目录以避免个人资料损坏提示：{legacy_runtime_dir}"
+            )
+
+        self._clean_profile_runtime_locks(self.account_profile_dir)
+        self.logger.info(
+            f"准备初始化浏览器（账号: {self.account_name or '未命名'}，"
+            f"profile: {self.account_profile_dir}）"
+        )
+
+        try:
+            self.driver = self._start_chrome_with_profile(self.account_profile_dir, headless=headless)
+        except SessionNotCreatedException as e:
+            self.logger.error(f"启动浏览器失败（持久 profile）：{e}")
+            fallback_dir = os.path.join(
+                profiles_root,
+                "_tmp",
+                f"{self.profile_key}_{int(time.time())}"
+            )
+            os.makedirs(fallback_dir, exist_ok=True)
+            self._clean_profile_runtime_locks(fallback_dir)
+            self.logger.warning(f"改用临时 profile 重试启动：{fallback_dir}")
+            try:
+                self.driver = self._start_chrome_with_profile(fallback_dir, headless=headless)
+                self.account_profile_dir = fallback_dir
+            except Exception as retry_err:
+                raise RuntimeError(
+                    f"Chrome 启动失败；请关闭所有占用该 profile 的 Chrome 进程后重试。"
+                    f"chromedriver 日志见 spiders/tmp/chromedriver_*.log；原始错误：{retry_err}"
+                ) from retry_err
+        except WebDriverException as e:
+            raise RuntimeError(
+                f"ChromeDriver 启动异常：{e}。请检查 Chrome 是否可正常启动，"
+                f"并查看 spiders/tmp/chromedriver_*.log。"
+            ) from e
 
         stealth_path = './stealth.min.js'
         if os.path.exists(stealth_path):
@@ -661,6 +743,73 @@ class XHSCrawler:
 
         self.all_links = set()
         self.collected_quick_data = []
+
+    def _build_chrome_options(self, profile_dir: str, *, headless: bool) -> webdriver.ChromeOptions:
+        options = webdriver.ChromeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_experimental_option("excludeSwitches", ['enable-automation'])
+        options.add_experimental_option("prefs", {
+            "profile.exit_type": "Normal",
+            "profile.exited_cleanly": True,
+        })
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-features=AutomationControlled")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-session-crashed-bubble")
+        options.add_argument("--remote-debugging-pipe")
+        options.add_argument(f"--user-data-dir={profile_dir}")
+        options.add_argument("--profile-directory=Default")
+        return options
+
+    def _chromedriver_log_path(self, suffix: str = "") -> str:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = int(time.time())
+        tail = f"_{suffix}" if suffix else ""
+        return os.path.join(log_dir, f"chromedriver_{self.profile_key}_{ts}{tail}.log")
+
+    def _start_chrome_with_profile(self, profile_dir: str, *, headless: bool) -> Chrome:
+        log_path = self._chromedriver_log_path("init")
+        service = Service(log_output=log_path, service_args=["--verbose"])
+        options = self._build_chrome_options(profile_dir, headless=headless)
+        self.logger.info(f"ChromeDriver 日志路径: {log_path}")
+        return webdriver.Chrome(service=service, options=options)
+
+    def _clean_profile_runtime_locks(self, profile_dir: str):
+        targets = [
+            os.path.join(profile_dir, "SingletonLock"),
+            os.path.join(profile_dir, "SingletonSocket"),
+            os.path.join(profile_dir, "SingletonCookie"),
+            os.path.join(profile_dir, "DevToolsActivePort"),
+            os.path.join(profile_dir, "Default", "SingletonLock"),
+            os.path.join(profile_dir, "Default", "SingletonSocket"),
+            os.path.join(profile_dir, "Default", "SingletonCookie"),
+            os.path.join(profile_dir, "Default", "DevToolsActivePort"),
+        ]
+        lock_file_names = {"LOCK", "SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort"}
+        for root, _, files in os.walk(profile_dir):
+            for fname in files:
+                if fname in lock_file_names:
+                    targets.append(os.path.join(root, fname))
+
+        removed = []
+        for path in set(targets):
+            if not os.path.lexists(path):
+                continue
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                removed.append(path)
+            except Exception as e:
+                self.logger.warning(f"清理 Chrome 运行锁文件失败: {path} ({e})")
+        if removed:
+            self.logger.info(f"已清理 profile 锁文件: {len(removed)} 个")
 
     # ---- stop / pause ----
     def request_stop(self):
@@ -696,97 +845,242 @@ class XHSCrawler:
     # ---- captcha detect ----
     def _detect_and_handle_captcha(self, where: str):
         try:
+            can_pause = self.on_captcha_detected is not None
+
+            def _handle_detected(captcha_type: str, reason: str):
+                self.logger.warning(reason)
+                if can_pause:
+                    try:
+                        self.on_captcha_detected(where, captcha_type)
+                    except TypeError:
+                        self.on_captcha_detected(where)
+                    self.request_pause(f"{captcha_type}@{where}")
+                    self._wait_until_resumed()
+                    try:
+                        self.driver.refresh()
+                    except Exception:
+                        pass
+                else:
+                    self.logger.warning("当前无暂停回调，需在浏览器中手动完成验证后继续。")
+                    time.sleep(2.0)
+                return True
+
             # 1. 检查 .captcha-modal-content (新增)
             modal_els = self.driver.find_elements(By.CLASS_NAME, "captcha-modal-content")
             modal_visible = any(e.is_displayed() for e in modal_els) if modal_els else False
             if modal_visible:
-                self.logger.warning(f"检测到弹窗验证码 .captcha-modal-content（{where}），将暂停采集并等待你处理验证码。")
-                if self.on_captcha_detected:
-                    try:
-                        self.on_captcha_detected(where, "captcha-modal-content")
-                    except TypeError:
-                        self.on_captcha_detected(where)
-                self.request_pause(f"captcha-modal-content@{where}")
-                self._wait_until_resumed()
-                try:
-                    self.driver.refresh()
-                except Exception:
-                    pass
-                return True
+                return _handle_detected(
+                    "captcha-modal-content",
+                    f"检测到弹窗验证码 .captcha-modal-content（{where}），将暂停采集并等待你处理验证码。"
+                )
 
             # 2. 检查 #captcha-div (严格风控)
             strict_els = self.driver.find_elements(By.CSS_SELECTOR, "#captcha-div")
             strict_visible = any(e.is_displayed() for e in strict_els) if strict_els else False
             if strict_visible:
-                self.logger.warning(f"检测到扫码/风控验证码页 #captcha-div（{where}），将暂停采集并等待你处理验证码。")
-                if self.on_captcha_detected:
-                    try:
-                        self.on_captcha_detected(where, "captcha-div")
-                    except TypeError:
-                        self.on_captcha_detected(where)
-                self.request_pause(f"captcha-div@{where}")
-                self._wait_until_resumed()
-                try:
-                    self.driver.refresh()
-                except Exception:
-                    pass
-                return True
+                return _handle_detected(
+                    "captcha-div",
+                    f"检测到扫码/风控验证码页 #captcha-div（{where}），将暂停采集并等待你处理验证码。"
+                )
 
             # 3. 检查 #red-captcha
             els = self.driver.find_elements(By.CSS_SELECTOR, "#red-captcha, div#red-captcha")
             visible = any(e.is_displayed() for e in els) if els else False
             if visible:
-                self.logger.warning(f"检测到验证码 #red-captcha（{where}），将暂停采集并等待你处理验证码。")
-                if self.on_captcha_detected:
-                    try:
-                        self.on_captcha_detected(where, "red-captcha")
-                    except TypeError:
-                        self.on_captcha_detected(where)
-                self.request_pause(f"red-captcha@{where}")
-                self._wait_until_resumed()
-                try:
-                    self.driver.refresh()
-                except Exception:
-                    pass
+                return _handle_detected(
+                    "red-captcha",
+                    f"检测到验证码 #red-captcha（{where}），将暂停采集并等待你处理验证码。"
+                )
+        except Exception:
+            pass
+        return False
+
+    def _sanitize_cookie_for_injection(self, cookie: Dict) -> Optional[Dict]:
+        if not isinstance(cookie, dict):
+            return None
+        name = str(cookie.get("name") or "").strip()
+        value = str(cookie.get("value") or "").strip()
+        if not name or value == "":
+            return None
+
+        out = {
+            "name": name,
+            "value": value,
+            "path": str(cookie.get("path") or "/"),
+            "secure": bool(cookie.get("secure", False)),
+            "httpOnly": bool(cookie.get("httpOnly", False)),
+        }
+
+        domain = str(cookie.get("domain") or "").strip()
+        if domain:
+            out["domain"] = domain
+
+        expiry = cookie.get("expiry")
+        if expiry is not None:
+            try:
+                out["expiry"] = int(float(expiry))
+            except Exception:
+                pass
+
+        same_site = cookie.get("sameSite")
+        if same_site in ("Lax", "Strict", "None"):
+            out["sameSite"] = same_site
+
+        return out
+
+    def _has_login_marker(self) -> bool:
+        # 头像区域在不同页面结构略有差异，使用多组选择器 + web_session 兜底
+        selectors = [
+            ".user.side-bar-component",
+            ".side-bar-component .user",
+            "a[href*='/user/profile/'] img",
+            ".avatar img",
+        ]
+        for selector in selectors:
+            try:
+                els = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if any(e.is_displayed() for e in els):
+                    return True
+            except Exception:
+                continue
+        try:
+            ws = self.driver.get_cookie("web_session")
+            if ws and str(ws.get("value") or "").strip():
                 return True
         except Exception:
             pass
         return False
 
+    def _detect_captcha_or_risk_reason(self) -> str:
+        checks = [
+            ("captcha-modal-content", By.CLASS_NAME, "captcha-modal-content"),
+            ("captcha-div", By.CSS_SELECTOR, "#captcha-div"),
+            ("red-captcha", By.CSS_SELECTOR, "#red-captcha, div#red-captcha"),
+        ]
+        for label, by, selector in checks:
+            try:
+                els = self.driver.find_elements(by, selector)
+                if els and any(e.is_displayed() for e in els):
+                    return label
+            except Exception:
+                continue
+
+        try:
+            current_url = str(self.driver.current_url or "").lower()
+            if "captcha" in current_url or "verify" in current_url:
+                return f"url={current_url}"
+        except Exception:
+            pass
+
+        try:
+            body_text = self.driver.execute_script(
+                "return (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 6000);"
+            ) or ""
+            text = str(body_text)
+            risk_keywords = [
+                "请完成验证",
+                "请通过验证",
+                "扫码验证",
+                "异常流量",
+                "访问过于频繁",
+                "请先登录",
+                "登录后查看更多",
+                "登录以继续",
+            ]
+            for kw in risk_keywords:
+                if kw in text:
+                    return kw
+        except Exception:
+            pass
+        return ""
+
+    def _validate_cross_page_session(self) -> Tuple[bool, str]:
+        check_pages = [
+            ("explore", "https://www.xiaohongshu.com/explore"),
+            ("search", "https://www.xiaohongshu.com/search_result?keyword=BJD"),
+        ]
+        for where, url in check_pages:
+            self.driver.get(url)
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            risk_reason = self._detect_captcha_or_risk_reason()
+            if risk_reason:
+                return False, f"{where} 页触发风控/验证: {risk_reason}"
+
+        if not self._has_login_marker():
+            return False, "跨页后未检测到登录态标记"
+        return True, ""
+
+    def _wait_for_session_ready(self, timeout_sec: int, stage: str) -> Tuple[bool, str]:
+        deadline = time.time() + max(1, int(timeout_sec))
+        last_reason = "会话尚未就绪"
+
+        while time.time() < deadline:
+            if self.stop_requested:
+                raise KeyboardInterrupt("收到停止信号")
+
+            try:
+                if not self._has_login_marker():
+                    last_reason = "未检测到登录态标记"
+                    time.sleep(1.0)
+                    continue
+
+                ok, reason = self._validate_cross_page_session()
+                if ok:
+                    return True, ""
+                last_reason = reason or "跨页验证未通过"
+                self.logger.info(f"{stage} 会话未稳定：{last_reason}，等待重试...")
+            except Exception as exc:
+                last_reason = str(exc)
+                self.logger.info(f"{stage} 会话校验异常：{last_reason}，等待重试...")
+
+            time.sleep(2.0)
+
+        return False, last_reason
+
     def login(self, cookie_list: Optional[List[Dict]] = None) -> Optional[List[Dict]]:
         """
         登录逻辑
         :param cookie_list: 如果提供了 cookie_list，则注入 Cookie；否则等待扫码
-        :return: 如果是扫码登录，返回新的 Cookie 列表；否则返回 None
+        :return: 登录成功后返回最新 Cookie 列表
         """
-        self.driver.get('https://www.xiaohongshu.com/explore')
+        self.driver.get('https://www.xiaohongshu.com/')
         self._detect_and_handle_captcha("explore")
 
         if cookie_list:
             self.logger.info("正在注入选定的 Cookie...")
             try:
-                for cookie in cookie_list:
-                    # Selenium 对 cookie 字段有些要求，过滤掉不必要的
-                    c = {k: v for k, v in cookie.items() if
-                         k in ['name', 'value', 'domain', 'path', 'expiry', 'secure', 'httpOnly']}
-                    self.driver.add_cookie(c)
+                try:
+                    self.driver.delete_all_cookies()
+                except Exception:
+                    pass
 
+                injected = 0
+                for cookie in cookie_list:
+                    c = self._sanitize_cookie_for_injection(cookie)
+                    if not c:
+                        continue
+                    self.driver.add_cookie(c)
+                    injected += 1
+
+                self.logger.info(f"Cookie 注入完成：{injected} 条")
                 self.driver.refresh()
-                WebDriverWait(self.driver, 15).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
-                )
-                self.logger.info("Cookie 登录成功")
-                sleep(3)
-                return None
+                ok, reason = self._wait_for_session_ready(timeout_sec=30, stage="Cookie登录")
+                if ok:
+                    self.logger.info("Cookie 登录成功（已通过跨页会话校验）")
+                    sleep(1)
+                    return self.driver.get_cookies()
+                self.logger.warning(f"Cookie 登录会话不稳定：{reason}，将转为手动登录")
             except Exception as e:
                 self.logger.warning(f"Cookie 登录失败或失效: {e}，将转为手动登录")
 
         # 手动登录流程
-        self.logger.info("等待手动扫码登录（120s 超时）...")
-        WebDriverWait(self.driver, 120).until(
-            EC.presence_of_element_located((By.CLASS_NAME, 'user.side-bar-component'))
-        )
-        self.logger.info('扫码登录成功')
+        self.logger.info("等待手动扫码登录（180s 超时）...")
+        ok, reason = self._wait_for_session_ready(timeout_sec=180, stage="扫码登录")
+        if not ok:
+            raise RuntimeError(f"扫码后会话仍未稳定：{reason}")
+        self.logger.info('扫码登录成功（会话稳定）')
         return self.driver.get_cookies()
 
     def extract_current_links(self):
@@ -1415,50 +1709,64 @@ class App:
             messagebox.showinfo("提示", "采集进行中，请先停止")
             return
 
+        account_name = simpledialog.askstring("新增账号", "请输入该账号的备注名称（用于保存独立浏览器会话）:")
+        if account_name is None:
+            return
+        account_name = account_name.strip()
+        if not account_name:
+            messagebox.showwarning("提示", "账号名称不能为空")
+            return
+        if account_name in self.account_map:
+            overwrite = messagebox.askyesno("提示", f"账号 [{account_name}] 已存在，是否覆盖其登录信息？")
+            if not overwrite:
+                return
+
         self.ui_set_buttons(start='disabled', add_acc='disabled')
         self.var_status.set("正在启动浏览器录入账号...")
 
         def _run_add():
             temp_crawler = None
             try:
-                temp_crawler = XHSCrawler(target_type="temp", logger=self.logger, headless=False)
-                self.logger.info("浏览器已启动，请在弹出的浏览器中扫码登录...")
+                temp_crawler = XHSCrawler(
+                    target_type="temp",
+                    account_name=account_name,
+                    logger=self.logger,
+                    headless=False
+                )
+                self.logger.info(f"浏览器已启动（账号: {account_name}），请在弹出的浏览器中扫码登录...")
 
                 # 调用 login 不传 cookie，触发扫码逻辑
                 new_cookies = temp_crawler.login(cookie_list=None)
 
                 if new_cookies:
-                    # 获取用户输入需要在主线程
-                    user_input_name = [None]
+                    db = None
+                    try:
+                        db = DatabaseManager()
+                        db.upsert_xhs_cookie(account_name, new_cookies)
+                        self.logger.info(f"账号 [{account_name}] 登录信息已保存（cookies={len(new_cookies)}）")
 
-                    def _ask_name():
-                        name = simpledialog.askstring("保存账号", "登录成功！请输入该账号的备注名称：")
-                        user_input_name[0] = name
+                        def _on_saved():
+                            messagebox.showinfo("成功", f"账号 [{account_name}] 已保存！")
+                            self.load_accounts()
+                            self.ui_set_buttons(start='normal', add_acc='normal')
+                            self.var_status.set("就绪")
 
-                    # 阻塞等待用户输入，或者使用 event，这里简单用 after+delay 模拟同步是不行的
-                    # 所以我们在 thread 里调用 ui 方法，但需要等待结果
-                    # 实际上 simpledialog 会阻塞主循环，如果在 callback 里调用会卡住
-                    # 这里直接通过 sync 方式调用有点麻烦。
-                    # 简化处理：不阻塞，只是在保存前确认。
-
-                    def _save_step():
-                        name = simpledialog.askstring("保存账号", "登录成功！请输入该账号的备注名称：")
-                        if name:
-                            try:
-                                db = DatabaseManager()
-                                db.upsert_xhs_cookie(name, new_cookies)
-                                db.connection.close()
-                                messagebox.showinfo("成功", f"账号 [{name}] 已保存！")
-                                self.load_accounts()
-                            except Exception as db_e:
-                                messagebox.showerror("错误", f"数据库保存失败: {db_e}")
-                        else:
-                            self.logger.info("用户取消保存账号")
-
+                        self.ui(_on_saved)
+                    except Exception as db_e:
+                        self.logger.error(f"数据库保存失败: {db_e}")
+                        self.ui(lambda: messagebox.showerror("错误", f"数据库保存失败: {db_e}"))
                         self.ui_set_buttons(start='normal', add_acc='normal')
-                        self.var_status.set("就绪")
-
-                    self.ui(_save_step)
+                        self.var_status.set("录入失败")
+                    finally:
+                        try:
+                            if db and db.connection:
+                                db.connection.close()
+                        except Exception:
+                            pass
+                else:
+                    self.logger.warning(f"账号 [{account_name}] 未获取到有效登录信息，未保存。")
+                    self.ui_set_buttons(start='normal', add_acc='normal')
+                    self.var_status.set("录入失败")
 
             except Exception as e:
                 self.logger.error(f"录入账号异常: {e}")
@@ -1808,6 +2116,7 @@ class App:
 
                 self.crawler = XHSCrawler(
                     target_type=target_type,
+                    account_name=selected_acc_name,
                     url_checker=url_checker,
                     insert_callback=insert_cb,
                     get_scroll_sleep=self.get_scroll_sleep,
@@ -1822,7 +2131,14 @@ class App:
 
                 self.logger.info(f"使用账号 [{selected_acc_name}] 登录...")
                 # 注入 Cookie 登录
-                self.crawler.login(cookie_list=selected_cookies)
+                latest_cookies = self.crawler.login(cookie_list=selected_cookies)
+                try:
+                    snapshot = latest_cookies if latest_cookies else self.crawler.driver.get_cookies()
+                    if snapshot:
+                        self.db.upsert_xhs_cookie(selected_acc_name, snapshot)
+                        self.logger.info(f"账号 [{selected_acc_name}] Cookie 已刷新回写（{len(snapshot)}条）")
+                except Exception as refresh_err:
+                    self.logger.warning(f"回写最新 Cookie 失败: {refresh_err}")
 
                 rows = self.db.fetch_brand_urls() if target_type == TargetType.BRAND else self.db.fetch_artists()
                 self.total_rows = len(rows)
