@@ -727,12 +727,12 @@ class XHSCrawler:
             except Exception as retry_err:
                 raise RuntimeError(
                     f"Chrome 启动失败；请关闭所有占用该 profile 的 Chrome 进程后重试。"
-                    f"chromedriver 日志见 spider/tmp/chromedriver_*.log；原始错误：{retry_err}"
+                    f"chromedriver 日志见 spiders/tmp/chromedriver_*.log；原始错误：{retry_err}"
                 ) from retry_err
         except WebDriverException as e:
             raise RuntimeError(
                 f"ChromeDriver 启动异常：{e}。请检查 Chrome 是否可正常启动，"
-                f"并查看 spider/tmp/chromedriver_*.log。"
+                f"并查看 spiders/tmp/chromedriver_*.log。"
             ) from e
 
         stealth_path = './stealth.min.js'
@@ -750,13 +750,7 @@ class XHSCrawler:
         self.all_links = set()
         self.collected_quick_data = []
 
-    def _build_chrome_options(
-            self,
-            profile_dir: str,
-            *,
-            headless: bool,
-            use_debugging_pipe: bool = True
-    ) -> webdriver.ChromeOptions:
+    def _build_chrome_options(self, profile_dir: str, *, headless: bool) -> webdriver.ChromeOptions:
         options = webdriver.ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
@@ -772,8 +766,7 @@ class XHSCrawler:
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-session-crashed-bubble")
-        if use_debugging_pipe:
-            options.add_argument("--remote-debugging-pipe")
+        options.add_argument("--remote-debugging-pipe")
         options.add_argument(f"--user-data-dir={profile_dir}")
         options.add_argument("--profile-directory=Default")
         return options
@@ -785,32 +778,12 @@ class XHSCrawler:
         tail = f"_{suffix}" if suffix else ""
         return os.path.join(log_dir, f"chromedriver_{self.profile_key}_{ts}{tail}.log")
 
-    def _create_chromedriver_service(self, log_path: str) -> Service:
-        try:
-            return Service(log_output=log_path, service_args=["--verbose"])
-        except TypeError:
-            # 兼容老版本 selenium（Service 不支持 log_output / service_args 参数）
-            self.logger.warning("当前 selenium 版本较旧，已降级使用默认 ChromeDriver Service 参数")
-            return Service()
-
     def _start_chrome_with_profile(self, profile_dir: str, *, headless: bool) -> Chrome:
         log_path = self._chromedriver_log_path("init")
+        service = Service(log_output=log_path, service_args=["--verbose"])
+        options = self._build_chrome_options(profile_dir, headless=headless)
         self.logger.info(f"ChromeDriver 日志路径: {log_path}")
-
-        options = self._build_chrome_options(profile_dir, headless=headless, use_debugging_pipe=True)
-        service = self._create_chromedriver_service(log_path)
-        try:
-            return webdriver.Chrome(service=service, options=options)
-        except WebDriverException as e:
-            msg = str(e).lower()
-            pipe_maybe_unsupported = ("remote-debugging-pipe" in msg) or ("unrecognized chrome option" in msg)
-            if not pipe_maybe_unsupported:
-                raise
-
-            self.logger.warning("当前环境不支持 --remote-debugging-pipe，改用端口模式重试")
-            options = self._build_chrome_options(profile_dir, headless=headless, use_debugging_pipe=False)
-            service = self._create_chromedriver_service(log_path)
-            return webdriver.Chrome(service=service, options=options)
+        return webdriver.Chrome(service=service, options=options)
 
     def _clean_profile_runtime_locks(self, profile_dir: str):
         targets = [
