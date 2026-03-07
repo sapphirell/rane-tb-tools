@@ -213,6 +213,11 @@ class DatabaseManager:
         now = int(time.time())
         self._exec("UPDATE xhs_cookies SET last_used_at = %s WHERE account_name = %s", (now, account_name))
 
+    def delete_xhs_cookie(self, account_name: str) -> int:
+        """删除指定账号Cookie，返回影响行数"""
+        _, affected = self._exec("DELETE FROM xhs_cookies WHERE account_name = %s", (account_name,))
+        return int(affected or 0)
+
     # --- 字段检测 ---
     def _check_likes_col_spider(self) -> bool:
         if self._has_likes_col_spider is not None:
@@ -929,12 +934,27 @@ class XHSCrawler:
 
         return out
 
-    def _has_login_marker(self) -> bool:
-        # 头像区域在不同页面结构略有差异，使用多组选择器 + web_session 兜底
+    def _has_login_marker(self, *, allow_cookie_fallback: bool = True) -> bool:
+        # 优先使用强登录态标记：可见的 /user/profile/ 链接或头像区域
+        try:
+            profile_links = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='/user/profile/']")
+            for link in profile_links:
+                try:
+                    if not link.is_displayed():
+                        continue
+                    href = str(link.get_attribute("href") or "")
+                    if "/user/profile/" in href:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
         selectors = [
             ".user.side-bar-component",
             ".side-bar-component .user",
             "a[href*='/user/profile/'] img",
+            ".author-container a.name",
             ".avatar img",
         ]
         for selector in selectors:
@@ -944,6 +964,11 @@ class XHSCrawler:
                     return True
             except Exception:
                 continue
+
+        if not allow_cookie_fallback:
+            return False
+
+        # Cookie 登录时允许弱标记兜底；手动扫码模式不使用该兜底，避免误判访客态
         try:
             ws = self.driver.get_cookie("web_session")
             if ws and str(ws.get("value") or "").strip():
@@ -995,7 +1020,7 @@ class XHSCrawler:
             pass
         return ""
 
-    def _validate_cross_page_session(self) -> Tuple[bool, str]:
+    def _validate_cross_page_session(self, *, allow_cookie_fallback: bool = True) -> Tuple[bool, str]:
         check_pages = [
             ("explore", "https://www.xiaohongshu.com/explore"),
             ("search", "https://www.xiaohongshu.com/search_result?keyword=BJD"),
@@ -1009,11 +1034,17 @@ class XHSCrawler:
             if risk_reason:
                 return False, f"{where} 页触发风控/验证: {risk_reason}"
 
-        if not self._has_login_marker():
+        if not self._has_login_marker(allow_cookie_fallback=allow_cookie_fallback):
             return False, "跨页后未检测到登录态标记"
         return True, ""
 
-    def _wait_for_session_ready(self, timeout_sec: int, stage: str) -> Tuple[bool, str]:
+    def _wait_for_session_ready(
+            self,
+            timeout_sec: int,
+            stage: str,
+            *,
+            allow_cookie_fallback: bool = True
+    ) -> Tuple[bool, str]:
         deadline = time.time() + max(1, int(timeout_sec))
         last_reason = "会话尚未就绪"
 
@@ -1022,12 +1053,12 @@ class XHSCrawler:
                 raise KeyboardInterrupt("收到停止信号")
 
             try:
-                if not self._has_login_marker():
+                if not self._has_login_marker(allow_cookie_fallback=allow_cookie_fallback):
                     last_reason = "未检测到登录态标记"
                     time.sleep(1.0)
                     continue
 
-                ok, reason = self._validate_cross_page_session()
+                ok, reason = self._validate_cross_page_session(allow_cookie_fallback=allow_cookie_fallback)
                 if ok:
                     return True, ""
                 last_reason = reason or "跨页验证未通过"
@@ -1067,7 +1098,11 @@ class XHSCrawler:
 
                 self.logger.info(f"Cookie 注入完成：{injected} 条")
                 self.driver.refresh()
-                ok, reason = self._wait_for_session_ready(timeout_sec=30, stage="Cookie登录")
+                ok, reason = self._wait_for_session_ready(
+                    timeout_sec=30,
+                    stage="Cookie登录",
+                    allow_cookie_fallback=True
+                )
                 if ok:
                     self.logger.info("Cookie 登录成功（已通过跨页会话校验）")
                     sleep(1)
@@ -1078,7 +1113,11 @@ class XHSCrawler:
 
         # 手动登录流程
         self.logger.info("等待手动扫码登录（180s 超时）...")
-        ok, reason = self._wait_for_session_ready(timeout_sec=180, stage="扫码登录")
+        ok, reason = self._wait_for_session_ready(
+            timeout_sec=180,
+            stage="扫码登录",
+            allow_cookie_fallback=False
+        )
         if not ok:
             raise RuntimeError(f"扫码后会话仍未稳定：{reason}")
         self.logger.info('扫码登录成功（会话稳定）')
@@ -1419,6 +1458,9 @@ class App:
         self.btn_add_acc = ttk.Button(acc_frame, text="+ 新增/更新账号", command=self.add_new_account)
         self.btn_add_acc.pack(side='left', padx=10, pady=5)
 
+        self.btn_remove_acc = ttk.Button(acc_frame, text="- 移除账号", command=self.remove_account)
+        self.btn_remove_acc.pack(side='left', padx=5, pady=5)
+
         ttk.Button(acc_frame, text="刷新列表", command=self.load_accounts).pack(side='left', padx=5)
 
         # --- 采集参数 ---
@@ -1583,7 +1625,7 @@ class App:
     def ui_set_status(self, text: str):
         self.ui(lambda: self.var_status.set(text))
 
-    def ui_set_buttons(self, *, start=None, stop=None, resume=None, skip=None, add_acc=None):
+    def ui_set_buttons(self, *, start=None, stop=None, resume=None, skip=None, add_acc=None, remove_acc=None):
         def _apply():
             try:
                 if start is not None: self.btn_start.config(state=start)
@@ -1591,6 +1633,7 @@ class App:
                 if resume is not None: self.btn_resume.config(state=resume)
                 if skip is not None: self.btn_skip.config(state=skip)
                 if add_acc is not None: self.btn_add_acc.config(state=add_acc)
+                if remove_acc is not None: self.btn_remove_acc.config(state=remove_acc)
             except Exception:
                 pass
 
@@ -1695,14 +1738,57 @@ class App:
                     self.cb_account['values'] = cb_values
                     if cb_values:
                         self.cb_account.current(0)
+                        self.btn_remove_acc.config(state='normal')
                     else:
                         self.cb_account.set('暂无账号，请新增')
+                        self.btn_remove_acc.config(state='disabled')
 
                 self.ui(_ui_update)
             except Exception as e:
                 self.logger.error(f"加载账号列表失败: {e}")
 
         threading.Thread(target=_load, daemon=True).start()
+
+    def _purge_account_profile_dirs(self, account_name: str) -> int:
+        """清理账号本地浏览器会话目录，确保新增账号时进入扫码流程。"""
+        profile_key = _safe_profile_key(account_name)
+        legacy_key = _legacy_profile_key(account_name)
+        profiles_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs_browser_profiles")
+
+        removed = 0
+        targets = [
+            os.path.join(profiles_root, "_runtime", profile_key),
+            os.path.join(profiles_root, profile_key),
+            os.path.join(profiles_root, legacy_key),
+            os.path.join(profiles_root, profile_key, "runtime_profile"),
+        ]
+        for p in targets:
+            if not os.path.isdir(p):
+                continue
+            try:
+                shutil.rmtree(p)
+                removed += 1
+            except Exception as e:
+                self.logger.warning(f"清理账号目录失败: {p} ({e})")
+
+        tmp_root = os.path.join(profiles_root, "_tmp")
+        if os.path.isdir(tmp_root):
+            prefix = f"{profile_key}_"
+            try:
+                for name in os.listdir(tmp_root):
+                    if not (name == profile_key or name.startswith(prefix)):
+                        continue
+                    p = os.path.join(tmp_root, name)
+                    if not os.path.isdir(p):
+                        continue
+                    try:
+                        shutil.rmtree(p)
+                        removed += 1
+                    except Exception as e:
+                        self.logger.warning(f"清理账号临时目录失败: {p} ({e})")
+            except Exception as e:
+                self.logger.warning(f"扫描账号临时目录失败: {e}")
+        return removed
 
     def add_new_account(self):
         """新增账号流程：打开浏览器 -> 扫码 -> 输入名称 -> 保存"""
@@ -1722,12 +1808,16 @@ class App:
             if not overwrite:
                 return
 
-        self.ui_set_buttons(start='disabled', add_acc='disabled')
+        self.ui_set_buttons(start='disabled', add_acc='disabled', remove_acc='disabled')
         self.var_status.set("正在启动浏览器录入账号...")
 
         def _run_add():
             temp_crawler = None
             try:
+                purged = self._purge_account_profile_dirs(account_name)
+                if purged > 0:
+                    self.logger.info(f"新增账号前已清理历史会话目录: {purged} 个")
+
                 temp_crawler = XHSCrawler(
                     target_type="temp",
                     account_name=account_name,
@@ -1749,14 +1839,14 @@ class App:
                         def _on_saved():
                             messagebox.showinfo("成功", f"账号 [{account_name}] 已保存！")
                             self.load_accounts()
-                            self.ui_set_buttons(start='normal', add_acc='normal')
+                            self.ui_set_buttons(start='normal', add_acc='normal', remove_acc='normal')
                             self.var_status.set("就绪")
 
                         self.ui(_on_saved)
                     except Exception as db_e:
                         self.logger.error(f"数据库保存失败: {db_e}")
                         self.ui(lambda: messagebox.showerror("错误", f"数据库保存失败: {db_e}"))
-                        self.ui_set_buttons(start='normal', add_acc='normal')
+                        self.ui_set_buttons(start='normal', add_acc='normal', remove_acc='normal')
                         self.var_status.set("录入失败")
                     finally:
                         try:
@@ -1766,18 +1856,113 @@ class App:
                             pass
                 else:
                     self.logger.warning(f"账号 [{account_name}] 未获取到有效登录信息，未保存。")
-                    self.ui_set_buttons(start='normal', add_acc='normal')
+                    self.ui_set_buttons(start='normal', add_acc='normal', remove_acc='normal')
                     self.var_status.set("录入失败")
 
             except Exception as e:
                 self.logger.error(f"录入账号异常: {e}")
-                self.ui_set_buttons(start='normal', add_acc='normal')
+                self.ui_set_buttons(start='normal', add_acc='normal', remove_acc='normal')
                 self.var_status.set("录入失败")
             finally:
                 if temp_crawler and temp_crawler.driver:
                     temp_crawler.driver.quit()
 
         threading.Thread(target=_run_add, daemon=True).start()
+
+    def remove_account(self):
+        """移除当前选中账号：删除数据库 Cookie，并清理本地会话目录"""
+        if self.running_thread and self.running_thread.is_alive():
+            messagebox.showinfo("提示", "采集进行中，请先停止")
+            return
+
+        selected_acc_name = (self.cb_account.get() or "").strip()
+        if not selected_acc_name or selected_acc_name not in self.account_map:
+            messagebox.showwarning("提示", "请先选择一个有效账号")
+            return
+
+        confirm = messagebox.askyesno(
+            "确认移除账号",
+            f"确认移除账号 [{selected_acc_name}]？\n\n"
+            "将删除数据库中的登录信息，并清理本地浏览器会话目录。"
+        )
+        if not confirm:
+            return
+
+        self.ui_set_buttons(add_acc='disabled', remove_acc='disabled')
+        self.var_status.set("正在移除账号...")
+
+        def _run_remove():
+            db = None
+            try:
+                db = DatabaseManager()
+                affected = db.delete_xhs_cookie(selected_acc_name)
+
+                profile_key = _safe_profile_key(selected_acc_name)
+                legacy_key = _legacy_profile_key(selected_acc_name)
+                profiles_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs_browser_profiles")
+                candidate_dirs = [
+                    os.path.join(profiles_root, profile_key),
+                    os.path.join(profiles_root, legacy_key),
+                    os.path.join(profiles_root, "_runtime", profile_key),
+                ]
+
+                removed_dirs = []
+                for p in candidate_dirs:
+                    if os.path.isdir(p):
+                        try:
+                            shutil.rmtree(p)
+                            removed_dirs.append(p)
+                        except Exception as clean_err:
+                            self.logger.warning(f"清理账号目录失败: {p} ({clean_err})")
+
+                tmp_root = os.path.join(profiles_root, "_tmp")
+                if os.path.isdir(tmp_root):
+                    prefix = f"{profile_key}_"
+                    try:
+                        for name in os.listdir(tmp_root):
+                            if not (name == profile_key or name.startswith(prefix)):
+                                continue
+                            p = os.path.join(tmp_root, name)
+                            if not os.path.isdir(p):
+                                continue
+                            try:
+                                shutil.rmtree(p)
+                                removed_dirs.append(p)
+                            except Exception as clean_err:
+                                self.logger.warning(f"清理账号临时目录失败: {p} ({clean_err})")
+                    except Exception as list_err:
+                        self.logger.warning(f"扫描账号临时目录失败: {list_err}")
+
+                self.logger.info(
+                    f"账号 [{selected_acc_name}] 已移除（db={affected} 行, profile={len(removed_dirs)} 个目录）")
+
+                def _on_success():
+                    messagebox.showinfo(
+                        "成功",
+                        f"账号 [{selected_acc_name}] 已移除。\n"
+                        f"数据库删除: {affected} 行\n"
+                        f"本地目录清理: {len(removed_dirs)} 个"
+                    )
+                    self.load_accounts()
+                    self.var_status.set("就绪")
+
+                self.ui(_on_success)
+            except Exception as e:
+                self.logger.error(f"移除账号失败: {e}")
+                self.ui(lambda: messagebox.showerror("错误", f"移除账号失败: {e}"))
+                self.ui_set_status("移除失败")
+            finally:
+                try:
+                    if db and db.connection:
+                        db.connection.close()
+                except Exception:
+                    pass
+                if self.running_thread and self.running_thread.is_alive():
+                    self.ui_set_buttons(add_acc='disabled', remove_acc='disabled')
+                else:
+                    self.ui_set_buttons(add_acc='normal', remove_acc='normal')
+
+        threading.Thread(target=_run_remove, daemon=True).start()
 
     # ---------- 新增：数据维护功能 ----------
     def run_data_maintenance(self, *, show_dialog: bool = True, source: str = "manual",
@@ -2084,6 +2269,7 @@ class App:
 
         self.btn_start.config(state='disabled')
         self.btn_add_acc.config(state='disabled')  # 运行时不可新增
+        self.btn_remove_acc.config(state='disabled')
         self.btn_stop.config(state='normal')
         self.btn_resume.config(state='disabled')
         self.btn_skip.config(state='normal')
@@ -2196,7 +2382,7 @@ class App:
                     pass
 
                 self.ui_set_buttons(start='normal', stop='disabled', resume='disabled', skip='disabled',
-                                    add_acc='normal')
+                                    add_acc='normal', remove_acc='normal')
                 self.ui(lambda: self._clear_sleep_bar())
 
         self.running_thread = threading.Thread(target=run, daemon=True)
