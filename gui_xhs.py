@@ -1444,6 +1444,7 @@ class TextHandler(logging.Handler):
 class App:
     def __init__(self, master: tk.Tk):
         self.master = master
+        self._input_focus_classes = {"Entry", "TEntry", "Text", "Spinbox", "TCombobox"}
         self.master.title("小红书爬虫 · 采集控制台（数据库Cookie管理版）")
         self.master.geometry("1000x980")
 
@@ -1610,6 +1611,7 @@ class App:
         self._backup_scroll_sleep: Optional[str] = None
         self._backup_detail_sleep: Optional[str] = None
 
+        self.master.bind_all("<Button-1>", self._blur_input_on_outside_click, add="+")
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # 初始化加载账号
@@ -1624,6 +1626,25 @@ class App:
 
     def ui_set_status(self, text: str):
         self.ui(lambda: self.var_status.set(text))
+
+    def _is_input_widget(self, widget) -> bool:
+        current = widget
+        while current is not None:
+            try:
+                if current.winfo_class() in self._input_focus_classes:
+                    return True
+                current = current.master
+            except Exception:
+                return False
+        return False
+
+    def _blur_input_on_outside_click(self, event):
+        focus_widget = self.master.focus_get()
+        if not focus_widget or not self._is_input_widget(focus_widget):
+            return
+        if self._is_input_widget(event.widget):
+            return
+        self.master.after_idle(self.master.focus_set)
 
     def ui_set_buttons(self, *, start=None, stop=None, resume=None, skip=None, add_acc=None, remove_acc=None):
         def _apply():
