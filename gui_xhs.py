@@ -21,6 +21,7 @@ import shutil
 import urllib.parse
 import logging
 import threading
+import queue
 from time import sleep
 from typing import Dict, Optional, Callable, List, Tuple
 
@@ -1423,14 +1424,18 @@ class XHSCrawler:
 
 
 class TextHandler(logging.Handler):
-    def __init__(self, text_widget: tk.Text):
+    def __init__(self, text_widget: tk.Text, ui_dispatch: Optional[Callable[[Callable], None]] = None):
         super().__init__()
         self.text_widget = text_widget
+        self.ui_dispatch = ui_dispatch
 
     def emit(self, record):
         msg = self.format(record)
         try:
-            self.text_widget.after(0, self._append, msg)
+            if self.ui_dispatch:
+                self.ui_dispatch(lambda: self._append(msg))
+            else:
+                self._append(msg)
         except RuntimeError:
             pass
 
@@ -1445,6 +1450,9 @@ class App:
     def __init__(self, master: tk.Tk):
         self.master = master
         self._input_focus_classes = {"Entry", "TEntry", "Text", "Spinbox", "TCombobox"}
+        self._ui_queue: "queue.Queue[Callable]" = queue.Queue()
+        self._ui_pump_after_id = None
+        self._captcha_prompt_active = False
         self.master.title("小红书爬虫 · 采集控制台（数据库Cookie管理版）")
         self.master.geometry("1000x980")
 
@@ -1568,7 +1576,7 @@ class App:
         if self.logger.handlers:
             self.logger.handlers.clear()
         fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        self.gui_handler = TextHandler(self.txt_log)
+        self.gui_handler = TextHandler(self.txt_log, self.ui)
         self.gui_handler.setFormatter(fmt)
         self.logger.addHandler(self.gui_handler)
         file_handler = logging.FileHandler('xhs_crawler.log', encoding='utf-8')
@@ -1580,7 +1588,7 @@ class App:
         self.upload_logger.propagate = False
         if self.upload_logger.handlers:
             self.upload_logger.handlers.clear()
-        self.upload_gui_handler = TextHandler(self.txt_upload_log)
+        self.upload_gui_handler = TextHandler(self.txt_upload_log, self.ui)
         self.upload_gui_handler.setFormatter(fmt)
         self.upload_logger.addHandler(self.upload_gui_handler)
         upload_file_handler = logging.FileHandler('xhs_upload.log', encoding='utf-8')
@@ -1613,6 +1621,7 @@ class App:
 
         self.master.bind_all("<Button-1>", self._blur_input_on_outside_click, add="+")
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._schedule_ui_pump()
 
         # 初始化加载账号
         self.load_accounts()
@@ -1620,9 +1629,36 @@ class App:
     # ---------- UI 线程安全 ----------
     def ui(self, fn):
         try:
-            self.master.after(0, fn)
+            if threading.current_thread() is threading.main_thread():
+                fn()
+            else:
+                self._ui_queue.put(fn)
         except Exception:
             pass
+
+    def _schedule_ui_pump(self):
+        try:
+            self._ui_pump_after_id = self.master.after(20, self._drain_ui_queue)
+        except Exception:
+            self._ui_pump_after_id = None
+
+    def _drain_ui_queue(self):
+        try:
+            for _ in range(200):
+                try:
+                    fn = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn()
+                except Exception:
+                    pass
+        finally:
+            try:
+                if self.master.winfo_exists():
+                    self._schedule_ui_pump()
+            except Exception:
+                self._ui_pump_after_id = None
 
     def ui_set_status(self, text: str):
         self.ui(lambda: self.var_status.set(text))
@@ -1639,7 +1675,18 @@ class App:
         return False
 
     def _blur_input_on_outside_click(self, event):
-        focus_widget = self.master.focus_get()
+        try:
+            focus_widget = self.master.focus_get()
+        except (KeyError, tk.TclError):
+            # ttk.Combobox 弹出层关闭瞬间可能返回已失效的 popdown，直接忽略本次点击事件
+            return
+        except Exception:
+            return
+        try:
+            if focus_widget and not focus_widget.winfo_exists():
+                return
+        except Exception:
+            return
         if not focus_widget or not self._is_input_widget(focus_widget):
             return
         if self._is_input_widget(event.widget):
@@ -1830,7 +1877,7 @@ class App:
                 return
 
         self.ui_set_buttons(start='disabled', add_acc='disabled', remove_acc='disabled')
-        self.var_status.set("正在启动浏览器录入账号...")
+        self.ui_set_status("正在启动浏览器录入账号...")
 
         def _run_add():
             temp_crawler = None
@@ -1861,14 +1908,14 @@ class App:
                             messagebox.showinfo("成功", f"账号 [{account_name}] 已保存！")
                             self.load_accounts()
                             self.ui_set_buttons(start='normal', add_acc='normal', remove_acc='normal')
-                            self.var_status.set("就绪")
+                            self.ui_set_status("就绪")
 
                         self.ui(_on_saved)
                     except Exception as db_e:
                         self.logger.error(f"数据库保存失败: {db_e}")
                         self.ui(lambda: messagebox.showerror("错误", f"数据库保存失败: {db_e}"))
                         self.ui_set_buttons(start='normal', add_acc='normal', remove_acc='normal')
-                        self.var_status.set("录入失败")
+                        self.ui_set_status("录入失败")
                     finally:
                         try:
                             if db and db.connection:
@@ -1878,12 +1925,12 @@ class App:
                 else:
                     self.logger.warning(f"账号 [{account_name}] 未获取到有效登录信息，未保存。")
                     self.ui_set_buttons(start='normal', add_acc='normal', remove_acc='normal')
-                    self.var_status.set("录入失败")
+                    self.ui_set_status("录入失败")
 
             except Exception as e:
                 self.logger.error(f"录入账号异常: {e}")
                 self.ui_set_buttons(start='normal', add_acc='normal', remove_acc='normal')
-                self.var_status.set("录入失败")
+                self.ui_set_status("录入失败")
             finally:
                 if temp_crawler and temp_crawler.driver:
                     temp_crawler.driver.quit()
@@ -1910,7 +1957,7 @@ class App:
             return
 
         self.ui_set_buttons(add_acc='disabled', remove_acc='disabled')
-        self.var_status.set("正在移除账号...")
+        self.ui_set_status("正在移除账号...")
 
         def _run_remove():
             db = None
@@ -1965,7 +2012,7 @@ class App:
                         f"本地目录清理: {len(removed_dirs)} 个"
                     )
                     self.load_accounts()
-                    self.var_status.set("就绪")
+                    self.ui_set_status("就绪")
 
                 self.ui(_on_success)
             except Exception as e:
@@ -1999,7 +2046,7 @@ class App:
 
         def _run():
             success = False
-            self.var_status.set("正在执行数据维护...")
+            self.ui_set_status("正在执行数据维护...")
             self.ui(lambda: self.btn_maintenance.config(state='disabled'))
             db = None
             try:
@@ -2244,6 +2291,9 @@ class App:
             # 更新 UI 状态
             self.btn_resume.config(state='normal')
             self.var_status.set("已暂停：等待验证码处理后恢复运行")
+            if self._captcha_prompt_active:
+                return
+            self._captcha_prompt_active = True
 
             log_msg = (
                 f"检测到验证码页面({captcha_type}, {where})，采集已暂停。\n"
@@ -2294,7 +2344,7 @@ class App:
         self.btn_stop.config(state='normal')
         self.btn_resume.config(state='disabled')
         self.btn_skip.config(state='normal')
-        self.var_status.set("启动中…")
+        self.ui_set_status("启动中…")
 
         self.done_rows = 0
         self.total_rows = 0
@@ -2408,15 +2458,15 @@ class App:
 
         self.running_thread = threading.Thread(target=run, daemon=True)
         self.running_thread.start()
-        self.var_status.set("运行中…")
+        self.ui_set_status("运行中…")
 
     def stop(self):
         if self.crawler:
             self.crawler.request_stop()
-            self.var_status.set("停止中…")
+            self.ui_set_status("停止中…")
             self.logger.info("已请求停止，请等待当前步骤完成")
         else:
-            self.var_status.set("就绪")
+            self.ui_set_status("就绪")
 
     def resume(self):
         """扫码/风控完成后，手动恢复采集"""
@@ -2436,8 +2486,9 @@ class App:
                 self.btn_resume.config(state='disabled')
             except Exception:
                 pass
+            self._captcha_prompt_active = False
 
-            self.var_status.set("运行中…")
+            self.ui_set_status("运行中…")
             self.logger.info("已点击“恢复运行”，采集将继续执行")
 
         self.ui(_apply_restore)
@@ -2452,6 +2503,7 @@ class App:
         self.logger.info("已触发“跳过本次等待”，即将继续下一步")
 
     def on_close(self):
+        self._captcha_prompt_active = False
         self.auto_process_enabled = False
         if self.auto_process_after_id is not None:
             try:
@@ -2474,6 +2526,12 @@ class App:
             except Exception:
                 pass
             self._tick_after_id = None
+        if self._ui_pump_after_id is not None:
+            try:
+                self.master.after_cancel(self._ui_pump_after_id)
+            except Exception:
+                pass
+            self._ui_pump_after_id = None
         self.master.after(200, self.master.destroy)
 
 
