@@ -12,6 +12,7 @@
 import os
 import re
 import time
+import glob
 import json  # 新增：用于序列化Cookie
 import base64
 import hashlib
@@ -29,9 +30,10 @@ import pymysql
 import requests
 
 from selenium import webdriver
-from selenium.webdriver import Chrome
+from selenium.webdriver import Chrome, Edge
 from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
-from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -651,6 +653,7 @@ class XHSCrawler:
             pause_event: Optional[threading.Event] = None,
             max_scroll_default: int = 20,
             headless: bool = False,
+            browser: str = "chrome",
             logger: Optional[logging.Logger] = None
     ):
         self.target_type = target_type
@@ -668,6 +671,7 @@ class XHSCrawler:
         self.max_scroll_default = int(max_scroll_default)
         self.logger = logger or logging.getLogger(__name__)
         self.stop_requested = False
+        self.browser_name = self._normalize_browser_name(browser)
 
         self.profile_key = _safe_profile_key(self.account_name or f"{self.target_type}_default")
         profiles_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs_browser_profiles")
@@ -707,11 +711,11 @@ class XHSCrawler:
         self._clean_profile_runtime_locks(self.account_profile_dir)
         self.logger.info(
             f"准备初始化浏览器（账号: {self.account_name or '未命名'}，"
-            f"profile: {self.account_profile_dir}）"
+            f"browser: {self.browser_name}，profile: {self.account_profile_dir}）"
         )
 
         try:
-            self.driver = self._start_chrome_with_profile(self.account_profile_dir, headless=headless)
+            self.driver = self._start_browser_with_profile(self.account_profile_dir, headless=headless)
         except SessionNotCreatedException as e:
             self.logger.error(f"启动浏览器失败（持久 profile）：{e}")
             fallback_dir = os.path.join(
@@ -723,17 +727,17 @@ class XHSCrawler:
             self._clean_profile_runtime_locks(fallback_dir)
             self.logger.warning(f"改用临时 profile 重试启动：{fallback_dir}")
             try:
-                self.driver = self._start_chrome_with_profile(fallback_dir, headless=headless)
+                self.driver = self._start_browser_with_profile(fallback_dir, headless=headless)
                 self.account_profile_dir = fallback_dir
             except Exception as retry_err:
                 raise RuntimeError(
-                    f"Chrome 启动失败；请关闭所有占用该 profile 的 Chrome 进程后重试。"
-                    f"chromedriver 日志见 spiders/tmp/chromedriver_*.log；原始错误：{retry_err}"
+                    f"{self.browser_name} 启动失败；请关闭所有占用该 profile 的浏览器进程后重试。"
+                    f"driver 日志见 spiders/tmp/*driver_*.log；原始错误：{retry_err}"
                 ) from retry_err
         except WebDriverException as e:
             raise RuntimeError(
-                f"ChromeDriver 启动异常：{e}。请检查 Chrome 是否可正常启动，"
-                f"并查看 spiders/tmp/chromedriver_*.log。"
+                f"{self.browser_name} driver 启动异常：{e}。请检查浏览器是否可正常启动，"
+                f"并查看 spiders/tmp/*driver_*.log。"
             ) from e
 
         stealth_path = './stealth.min.js'
@@ -772,19 +776,97 @@ class XHSCrawler:
         options.add_argument("--profile-directory=Default")
         return options
 
-    def _chromedriver_log_path(self, suffix: str = "") -> str:
+    def _build_edge_options(self, profile_dir: str, *, headless: bool) -> webdriver.EdgeOptions:
+        options = webdriver.EdgeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_experimental_option("excludeSwitches", ['enable-automation'])
+        options.add_experimental_option("prefs", {
+            "profile.exit_type": "Normal",
+            "profile.exited_cleanly": True,
+        })
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-features=AutomationControlled")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-session-crashed-bubble")
+        options.add_argument("--remote-debugging-pipe")
+        options.add_argument(f"--user-data-dir={profile_dir}")
+        options.add_argument("--profile-directory=Default")
+        return options
+
+    @staticmethod
+    def _normalize_browser_name(browser: str) -> str:
+        text = str(browser or "").strip().lower()
+        if text in {"edge", "msedge", "microsoft-edge"}:
+            return "edge"
+        return "chrome"
+
+    def _driver_log_path(self, suffix: str = "") -> str:
         log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
         os.makedirs(log_dir, exist_ok=True)
         ts = int(time.time())
         tail = f"_{suffix}" if suffix else ""
-        return os.path.join(log_dir, f"chromedriver_{self.profile_key}_{ts}{tail}.log")
+        return os.path.join(log_dir, f"{self.browser_name}driver_{self.profile_key}_{ts}{tail}.log")
+
+    def _resolve_driver_executable(self, browser_name: str) -> str:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        bin_dir = os.path.join(base_dir, "bin")
+        tmp_dir = os.path.join(base_dir, "tmp")
+
+        candidates: List[str] = []
+        if browser_name == "edge":
+            candidates.extend([
+                os.path.join(bin_dir, "msedgedriver.exe"),
+                os.path.join(bin_dir, "edgedriver.exe"),
+            ])
+            candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "msedgedriver.exe"), recursive=True))
+            candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "edgedriver.exe"), recursive=True))
+        else:
+            candidates.extend([
+                os.path.join(bin_dir, "chromedriver.exe"),
+                os.path.join(bin_dir, "chromedriver"),
+            ])
+            candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "chromedriver.exe"), recursive=True))
+            candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "chromedriver"), recursive=True))
+
+        for path in candidates:
+            if path and os.path.isfile(path):
+                return path
+        return ""
 
     def _start_chrome_with_profile(self, profile_dir: str, *, headless: bool) -> Chrome:
-        log_path = self._chromedriver_log_path("init")
-        service = Service(log_output=log_path, service_args=["--verbose"])
+        log_path = self._driver_log_path("init")
+        driver_path = self._resolve_driver_executable("chrome")
+        if driver_path:
+            service = ChromeService(executable_path=driver_path, log_output=log_path, service_args=["--verbose"])
+            self.logger.info(f"使用本地 ChromeDriver: {driver_path}")
+        else:
+            service = ChromeService(log_output=log_path, service_args=["--verbose"])
+            self.logger.warning("未找到本地 ChromeDriver，改用 Selenium 自动解析 driver")
         options = self._build_chrome_options(profile_dir, headless=headless)
         self.logger.info(f"ChromeDriver 日志路径: {log_path}")
         return webdriver.Chrome(service=service, options=options)
+
+    def _start_edge_with_profile(self, profile_dir: str, *, headless: bool) -> Edge:
+        log_path = self._driver_log_path("init")
+        driver_path = self._resolve_driver_executable("edge")
+        if driver_path:
+            service = EdgeService(executable_path=driver_path, log_output=log_path, service_args=["--verbose"])
+            self.logger.info(f"使用本地 EdgeDriver: {driver_path}")
+        else:
+            service = EdgeService(log_output=log_path, service_args=["--verbose"])
+            self.logger.warning("未找到本地 EdgeDriver，改用 Selenium 自动解析 driver")
+        options = self._build_edge_options(profile_dir, headless=headless)
+        self.logger.info(f"EdgeDriver 日志路径: {log_path}")
+        return webdriver.Edge(service=service, options=options)
+
+    def _start_browser_with_profile(self, profile_dir: str, *, headless: bool):
+        if self.browser_name == "edge":
+            return self._start_edge_with_profile(profile_dir, headless=headless)
+        return self._start_chrome_with_profile(profile_dir, headless=headless)
 
     def _clean_profile_runtime_locks(self, profile_dir: str):
         targets = [
@@ -1488,8 +1570,19 @@ class App:
         self.var_max_scroll = tk.StringVar(value="20")
         ttk.Entry(frm, textvariable=self.var_max_scroll, width=10).grid(row=0, column=5, padx=6, pady=6, sticky='w')
 
+        ttk.Label(frm, text="浏览器：").grid(row=0, column=6, padx=6, pady=6, sticky='e')
+        self.var_browser = tk.StringVar(value="chrome")
+        self.cb_browser = ttk.Combobox(
+            frm,
+            state='readonly',
+            width=10,
+            textvariable=self.var_browser,
+            values=("chrome", "edge")
+        )
+        self.cb_browser.grid(row=0, column=7, padx=6, pady=6, sticky='w')
+
         self.var_headless = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="无头模式(Headless)", variable=self.var_headless).grid(row=0, column=6, padx=6,
+        ttk.Checkbutton(frm, text="无头模式(Headless)", variable=self.var_headless).grid(row=0, column=8, padx=6,
                                                                                          pady=6)
 
         type_frame = ttk.LabelFrame(master, text="采集对象")
@@ -1890,7 +1983,8 @@ class App:
                     target_type="temp",
                     account_name=account_name,
                     logger=self.logger,
-                    headless=False
+                    headless=False,
+                    browser=self.var_browser.get()
                 )
                 self.logger.info(f"浏览器已启动（账号: {account_name}），请在弹出的浏览器中扫码登录...")
 
@@ -2384,6 +2478,7 @@ class App:
                     skip_event=self.skip_event,
                     max_scroll_default=max_scroll,
                     headless=self.var_headless.get(),
+                    browser=self.var_browser.get(),
                     logger=self.logger
                 )
 
