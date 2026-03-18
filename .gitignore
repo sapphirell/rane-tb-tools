@@ -3,5 +3,12 @@ venv/
 *.log
 logs/
 .idea/
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+bin/*.exe
 xhs_browser_profiles/*
 tmp/
+*.pkl

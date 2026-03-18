@@ -11,6 +11,7 @@
 
 import os
 import re
+import sys
 import time
 import glob
 import json  # 新增：用于序列化Cookie
@@ -29,10 +30,12 @@ from typing import Dict, Optional, Callable, List, Tuple
 import pymysql
 import requests
 
-from selenium import webdriver
-from selenium.webdriver import Chrome, Edge
 from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
+from selenium.webdriver.chrome import webdriver as chrome_webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.edge import webdriver as edge_webdriver
+from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -40,6 +43,20 @@ from selenium.webdriver.support import expected_conditions as EC
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+
+
+def get_resource_base_dir() -> str:
+    """返回打包资源目录；源码模式下回落到当前脚本目录。"""
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_runtime_base_dir() -> str:
+    """返回运行时可写目录；打包后使用 exe 同级目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def convert_xhs_url(original_url: str) -> str:
@@ -194,7 +211,15 @@ class DatabaseManager:
     # --- Cookie 管理 ---
     def fetch_cookies(self) -> List[Dict]:
         """获取所有可用账号"""
-        sql = "SELECT id, account_name, cookie_data, last_used_at FROM xhs_cookies ORDER BY last_used_at DESC, id DESC"
+        sql = """
+            SELECT
+                id,
+                account_name,
+                cookie_data,
+                last_used_at
+            FROM xhs_cookies
+            ORDER BY last_used_at DESC, id DESC
+        """
         cur, _ = self._exec(sql)
         return cur.fetchall()
 
@@ -222,6 +247,79 @@ class DatabaseManager:
         return int(affected or 0)
 
     # --- 字段检测 ---
+    def fetch_account_settings(self, account_name: str) -> Optional[Dict]:
+        cur, _ = self._exec(
+            """
+            SELECT
+                account_name,
+                crawl_settings_json
+            FROM xhs_cookies
+            WHERE account_name = %s
+            LIMIT 1
+            """,
+            (account_name,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+
+        raw_json = row.get("crawl_settings_json")
+        if not raw_json:
+            return None
+
+        try:
+            payload = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        except Exception:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        params = payload.get("params")
+        if isinstance(params, dict):
+            return params
+
+        # 兼容早期/异常数据：如果直接存的是参数平铺对象，也尽量兜底读取
+        known_keys = {"scroll_sleep", "detail_sleep", "max_scroll", "browser", "headless", "target_type"}
+        if any(key in payload for key in known_keys):
+            return payload
+        return None
+
+    def upsert_account_settings(self, account_name: str, settings: Dict):
+        now = int(time.time())
+        payload = {
+            "purpose": "gui_xhs_crawl_settings",
+            "version": 1,
+            "updated_at": now,
+            "params": settings,
+        }
+        self._exec(
+            """
+            UPDATE xhs_cookies
+            SET
+                crawl_settings_json = %s,
+                last_used_at = %s
+            WHERE account_name = %s
+            """,
+            (
+                json.dumps(payload, ensure_ascii=False),
+                now,
+                account_name,
+            )
+        )
+
+    def delete_account_settings(self, account_name: str) -> int:
+        _, affected = self._exec(
+            """
+            UPDATE xhs_cookies
+            SET
+                crawl_settings_json = NULL
+            WHERE account_name = %s
+            """,
+            (account_name,)
+        )
+        return int(affected or 0)
+
     def _check_likes_col_spider(self) -> bool:
         if self._has_likes_col_spider is not None:
             return self._has_likes_col_spider
@@ -674,7 +772,7 @@ class XHSCrawler:
         self.browser_name = self._normalize_browser_name(browser)
 
         self.profile_key = _safe_profile_key(self.account_name or f"{self.target_type}_default")
-        profiles_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs_browser_profiles")
+        profiles_root = os.path.join(get_runtime_base_dir(), "xhs_browser_profiles")
         os.makedirs(profiles_root, exist_ok=True)
 
         # 账号基础目录（保留历史数据），运行目录改放到独立 _runtime 下，彻底与旧损坏 profile 隔离
@@ -740,7 +838,7 @@ class XHSCrawler:
                 f"并查看 spiders/tmp/*driver_*.log。"
             ) from e
 
-        stealth_path = './stealth.min.js'
+        stealth_path = os.path.join(get_resource_base_dir(), 'stealth.min.js')
         if os.path.exists(stealth_path):
             try:
                 with open(stealth_path, 'r', encoding='utf-8') as f:
@@ -755,8 +853,8 @@ class XHSCrawler:
         self.all_links = set()
         self.collected_quick_data = []
 
-    def _build_chrome_options(self, profile_dir: str, *, headless: bool) -> webdriver.ChromeOptions:
-        options = webdriver.ChromeOptions()
+    def _build_chrome_options(self, profile_dir: str, *, headless: bool) -> ChromeOptions:
+        options = ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
@@ -776,8 +874,8 @@ class XHSCrawler:
         options.add_argument("--profile-directory=Default")
         return options
 
-    def _build_edge_options(self, profile_dir: str, *, headless: bool) -> webdriver.EdgeOptions:
-        options = webdriver.EdgeOptions()
+    def _build_edge_options(self, profile_dir: str, *, headless: bool) -> EdgeOptions:
+        options = EdgeOptions()
         if headless:
             options.add_argument("--headless=new")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
@@ -805,14 +903,14 @@ class XHSCrawler:
         return "chrome"
 
     def _driver_log_path(self, suffix: str = "") -> str:
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+        log_dir = os.path.join(get_runtime_base_dir(), "tmp")
         os.makedirs(log_dir, exist_ok=True)
         ts = int(time.time())
         tail = f"_{suffix}" if suffix else ""
         return os.path.join(log_dir, f"{self.browser_name}driver_{self.profile_key}_{ts}{tail}.log")
 
     def _resolve_driver_executable(self, browser_name: str) -> str:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir = get_resource_base_dir()
         bin_dir = os.path.join(base_dir, "bin")
         tmp_dir = os.path.join(base_dir, "tmp")
 
@@ -837,7 +935,7 @@ class XHSCrawler:
                 return path
         return ""
 
-    def _start_chrome_with_profile(self, profile_dir: str, *, headless: bool) -> Chrome:
+    def _start_chrome_with_profile(self, profile_dir: str, *, headless: bool):
         log_path = self._driver_log_path("init")
         driver_path = self._resolve_driver_executable("chrome")
         if driver_path:
@@ -848,9 +946,9 @@ class XHSCrawler:
             self.logger.warning("未找到本地 ChromeDriver，改用 Selenium 自动解析 driver")
         options = self._build_chrome_options(profile_dir, headless=headless)
         self.logger.info(f"ChromeDriver 日志路径: {log_path}")
-        return webdriver.Chrome(service=service, options=options)
+        return chrome_webdriver.WebDriver(service=service, options=options)
 
-    def _start_edge_with_profile(self, profile_dir: str, *, headless: bool) -> Edge:
+    def _start_edge_with_profile(self, profile_dir: str, *, headless: bool):
         log_path = self._driver_log_path("init")
         driver_path = self._resolve_driver_executable("edge")
         if driver_path:
@@ -861,7 +959,7 @@ class XHSCrawler:
             self.logger.warning("未找到本地 EdgeDriver，改用 Selenium 自动解析 driver")
         options = self._build_edge_options(profile_dir, headless=headless)
         self.logger.info(f"EdgeDriver 日志路径: {log_path}")
-        return webdriver.Edge(service=service, options=options)
+        return edge_webdriver.WebDriver(service=service, options=options)
 
     def _start_browser_with_profile(self, profile_dir: str, *, headless: bool):
         if self.browser_name == "edge":
@@ -1545,6 +1643,7 @@ class App:
         ttk.Label(acc_frame, text="选择登录账号：").pack(side='left', padx=5, pady=5)
         self.cb_account = ttk.Combobox(acc_frame, state='readonly', width=30)
         self.cb_account.pack(side='left', padx=5, pady=5)
+        self.cb_account.bind("<<ComboboxSelected>>", self.on_account_selected)
 
         self.btn_add_acc = ttk.Button(acc_frame, text="+ 新增/更新账号", command=self.add_new_account)
         self.btn_add_acc.pack(side='left', padx=10, pady=5)
@@ -1672,7 +1771,7 @@ class App:
         self.gui_handler = TextHandler(self.txt_log, self.ui)
         self.gui_handler.setFormatter(fmt)
         self.logger.addHandler(self.gui_handler)
-        file_handler = logging.FileHandler('xhs_crawler.log', encoding='utf-8')
+        file_handler = logging.FileHandler(os.path.join(get_runtime_base_dir(), 'xhs_crawler.log'), encoding='utf-8')
         file_handler.setFormatter(fmt)
         self.logger.addHandler(file_handler)
 
@@ -1684,7 +1783,7 @@ class App:
         self.upload_gui_handler = TextHandler(self.txt_upload_log, self.ui)
         self.upload_gui_handler.setFormatter(fmt)
         self.upload_logger.addHandler(self.upload_gui_handler)
-        upload_file_handler = logging.FileHandler('xhs_upload.log', encoding='utf-8')
+        upload_file_handler = logging.FileHandler(os.path.join(get_runtime_base_dir(), 'xhs_upload.log'), encoding='utf-8')
         upload_file_handler.setFormatter(fmt)
         self.upload_logger.addHandler(upload_file_handler)
 
@@ -1698,6 +1797,7 @@ class App:
 
         # 缓存账号列表 {name: cookie_json_list}
         self.account_map = {}
+        self.current_account_name: Optional[str] = None
 
         self.start_ts = None
         self._tick_after_id = None
@@ -1875,6 +1975,113 @@ class App:
         self.ui(_apply)
 
     # ---------- 账号管理 ----------
+    def _is_valid_account_name(self, account_name: str) -> bool:
+        return bool(account_name and account_name in self.account_map)
+
+    def _default_account_settings(self) -> Dict:
+        return {
+            "scroll_sleep": "10.5",
+            "detail_sleep": "5.0",
+            "max_scroll": "20",
+            "browser": "chrome",
+            "headless": False,
+            "target_type": TargetType.BRAND,
+        }
+
+    def _normalize_account_settings(self, settings: Optional[Dict]) -> Dict:
+        normalized = self._default_account_settings()
+        if isinstance(settings, dict):
+            for key in normalized.keys():
+                if key in settings and settings.get(key) is not None:
+                    normalized[key] = settings.get(key)
+
+        normalized["scroll_sleep"] = str(normalized.get("scroll_sleep") or "10.5")
+        normalized["detail_sleep"] = str(normalized.get("detail_sleep") or "5.0")
+        normalized["max_scroll"] = str(normalized.get("max_scroll") or "20")
+
+        browser = str(normalized.get("browser") or "chrome").strip().lower()
+        normalized["browser"] = browser if browser in ("chrome", "edge") else "chrome"
+
+        target_type = str(normalized.get("target_type") or TargetType.BRAND).strip()
+        normalized["target_type"] = target_type if target_type in (TargetType.BRAND, TargetType.ARTIST) else TargetType.BRAND
+
+        headless = normalized.get("headless")
+        if isinstance(headless, str):
+            normalized["headless"] = headless.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            normalized["headless"] = bool(headless)
+        return normalized
+
+    def _collect_current_account_settings(self) -> Dict:
+        return self._normalize_account_settings({
+            "scroll_sleep": (self.var_scroll_sleep.get() or "").strip() or "10.5",
+            "detail_sleep": (self.var_detail_sleep.get() or "").strip() or "5.0",
+            "max_scroll": (self.var_max_scroll.get() or "").strip() or "20",
+            "browser": (self.var_browser.get() or "").strip() or "chrome",
+            "headless": bool(self.var_headless.get()),
+            "target_type": (self.var_target_type.get() or "").strip() or TargetType.BRAND,
+        })
+
+    def _apply_account_settings(self, settings: Optional[Dict]):
+        settings = self._normalize_account_settings(settings)
+        self.var_scroll_sleep.set(str(settings.get("scroll_sleep") or "10.5"))
+        self.var_detail_sleep.set(str(settings.get("detail_sleep") or "5.0"))
+        self.var_max_scroll.set(str(settings.get("max_scroll") or "20"))
+        self.var_browser.set(str(settings.get("browser") or "chrome"))
+        self.var_headless.set(bool(settings.get("headless")))
+        target_type = str(settings.get("target_type") or TargetType.BRAND)
+        if target_type not in (TargetType.BRAND, TargetType.ARTIST):
+            target_type = TargetType.BRAND
+        self.var_target_type.set(target_type)
+        self.on_target_type_change(target_type)
+
+    def save_account_settings(self, account_name: Optional[str] = None, *, log_errors: bool = True):
+        target_account = (account_name or self.current_account_name or self.cb_account.get() or "").strip()
+        if not self._is_valid_account_name(target_account):
+            return
+        db = None
+        try:
+            db = DatabaseManager()
+            db.upsert_account_settings(target_account, self._collect_current_account_settings())
+        except Exception as e:
+            if log_errors:
+                self.logger.warning(f"保存账号参数失败 [{target_account}]: {e}")
+        finally:
+            try:
+                if db and db.connection:
+                    db.connection.close()
+            except Exception:
+                pass
+
+    def load_account_settings(self, account_name: str):
+        target_account = (account_name or "").strip()
+        if not self._is_valid_account_name(target_account):
+            return
+        db = None
+        try:
+            db = DatabaseManager()
+            settings = db.fetch_account_settings(target_account)
+        except Exception as e:
+            self.logger.warning(f"加载账号参数失败 [{target_account}]: {e}")
+            settings = None
+        finally:
+            try:
+                if db and db.connection:
+                    db.connection.close()
+            except Exception:
+                pass
+
+        self._apply_account_settings(settings)
+
+    def on_account_selected(self, _event=None):
+        selected_account = (self.cb_account.get() or "").strip()
+        previous_account = (self.current_account_name or "").strip()
+        if previous_account and previous_account != selected_account:
+            self.save_account_settings(previous_account)
+        self.current_account_name = selected_account if self._is_valid_account_name(selected_account) else None
+        if self.current_account_name:
+            self.load_account_settings(self.current_account_name)
+
     def load_accounts(self):
         """加载数据库中的账号列表"""
 
@@ -1898,10 +2105,18 @@ class App:
                 def _ui_update():
                     self.cb_account['values'] = cb_values
                     if cb_values:
-                        self.cb_account.current(0)
+                        selected_account = (
+                            self.current_account_name
+                            if self.current_account_name in cb_values
+                            else cb_values[0]
+                        )
+                        self.cb_account.set(selected_account)
+                        self.current_account_name = selected_account
+                        self.load_account_settings(selected_account)
                         self.btn_remove_acc.config(state='normal')
                     else:
                         self.cb_account.set('暂无账号，请新增')
+                        self.current_account_name = None
                         self.btn_remove_acc.config(state='disabled')
 
                 self.ui(_ui_update)
@@ -1914,7 +2129,7 @@ class App:
         """清理账号本地浏览器会话目录，确保新增账号时进入扫码流程。"""
         profile_key = _safe_profile_key(account_name)
         legacy_key = _legacy_profile_key(account_name)
-        profiles_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs_browser_profiles")
+        profiles_root = os.path.join(get_runtime_base_dir(), "xhs_browser_profiles")
 
         removed = 0
         targets = [
@@ -2058,10 +2273,11 @@ class App:
             try:
                 db = DatabaseManager()
                 affected = db.delete_xhs_cookie(selected_acc_name)
+                db.delete_account_settings(selected_acc_name)
 
                 profile_key = _safe_profile_key(selected_acc_name)
                 legacy_key = _legacy_profile_key(selected_acc_name)
-                profiles_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs_browser_profiles")
+                profiles_root = os.path.join(get_runtime_base_dir(), "xhs_browser_profiles")
                 candidate_dirs = [
                     os.path.join(profiles_root, profile_key),
                     os.path.join(profiles_root, legacy_key),
@@ -2332,6 +2548,8 @@ class App:
                 if self.var_max_scroll.get().strip() == "0":
                     self.var_max_scroll.set("20")
                 self.logger.info("切换到【品牌】采集：最大滚动次数保持/恢复为常用默认（20）")
+            if self.current_account_name and self._is_valid_account_name(self.current_account_name):
+                self.save_account_settings(self.current_account_name)
 
         self.ui(_apply)
 
@@ -2424,6 +2642,7 @@ class App:
             messagebox.showwarning("提示", "请先选择一个有效的登录账号（或点击新增录入）")
             return
 
+        self.current_account_name = selected_acc_name
         selected_cookies = self.account_map[selected_acc_name]
 
         try:
@@ -2431,6 +2650,8 @@ class App:
         except ValueError:
             messagebox.showerror("错误", "最大滚动次数需为整数")
             return
+
+        self.save_account_settings(selected_acc_name)
 
         self.btn_start.config(state='disabled')
         self.btn_add_acc.config(state='disabled')  # 运行时不可新增
@@ -2600,6 +2821,7 @@ class App:
     def on_close(self):
         self._captcha_prompt_active = False
         self.auto_process_enabled = False
+        self.save_account_settings(log_errors=False)
         if self.auto_process_after_id is not None:
             try:
                 self.master.after_cancel(self.auto_process_after_id)
