@@ -24,6 +24,7 @@ import urllib.parse
 import logging
 import threading
 import queue
+import subprocess
 from time import sleep
 from typing import Dict, Optional, Callable, List, Tuple
 
@@ -280,7 +281,10 @@ class DatabaseManager:
             return params
 
         # 兼容早期/异常数据：如果直接存的是参数平铺对象，也尽量兜底读取
-        known_keys = {"scroll_sleep", "detail_sleep", "max_scroll", "browser", "headless", "target_type"}
+        known_keys = {
+            "scroll_sleep", "detail_sleep", "max_scroll", "browser", "headless", "target_type",
+            "shutdown_after_finish", "shutdown_timer_minutes"
+        }
         if any(key in payload for key in known_keys):
             return payload
         return None
@@ -1698,6 +1702,37 @@ class App:
             command=lambda: self.on_target_type_change(TargetType.ARTIST)
         ).pack(side='left', padx=10, pady=6)
 
+        shutdown_frame = ttk.LabelFrame(master, text="自动关机")
+        shutdown_frame.pack(fill='x', padx=10, pady=(0, 10))
+
+        ttk.Label(shutdown_frame, text="定时关机(分钟)：").grid(row=0, column=0, padx=6, pady=6, sticky='e')
+        self.var_shutdown_timer_minutes = tk.StringVar(value="")
+        ttk.Entry(shutdown_frame, textvariable=self.var_shutdown_timer_minutes, width=10).grid(
+            row=0, column=1, padx=6, pady=6, sticky='w'
+        )
+
+        self.btn_schedule_shutdown = ttk.Button(
+            shutdown_frame, text="设置/重设定时关机", command=self.schedule_timed_shutdown
+        )
+        self.btn_schedule_shutdown.grid(row=0, column=2, padx=6, pady=6, sticky='w')
+
+        self.btn_cancel_shutdown = ttk.Button(
+            shutdown_frame, text="取消关机计划", command=self.cancel_scheduled_shutdown, state='disabled'
+        )
+        self.btn_cancel_shutdown.grid(row=0, column=3, padx=6, pady=6, sticky='w')
+
+        self.var_shutdown_after_finish = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            shutdown_frame,
+            text="抓取完毕后自动关机（提前1分钟提醒）",
+            variable=self.var_shutdown_after_finish
+        ).grid(row=0, column=4, padx=6, pady=6, sticky='w')
+
+        self.var_shutdown_status = tk.StringVar(value="关机计划：未设置")
+        ttk.Label(shutdown_frame, textvariable=self.var_shutdown_status).grid(
+            row=1, column=0, columnspan=5, padx=6, pady=(0, 6), sticky='w'
+        )
+
         ctrl = ttk.Frame(master)
         ctrl.pack(fill='x', padx=10)
 
@@ -1808,9 +1843,13 @@ class App:
         self.upload_stop_event = threading.Event()
         self.auto_process_enabled = False
         self.auto_process_after_id = None
-
-        self._backup_scroll_sleep: Optional[str] = None
-        self._backup_detail_sleep: Optional[str] = None
+        self.shutdown_warning_after_id = None
+        self.shutdown_status_after_id = None
+        self.shutdown_warning_at: Optional[float] = None
+        self.shutdown_execute_at: Optional[float] = None
+        self.shutdown_reason: Optional[str] = None
+        self.shutdown_trigger: Optional[str] = None
+        self.shutdown_os_armed = False
 
         self.master.bind_all("<Button-1>", self._blur_input_on_outside_click, add="+")
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1986,6 +2025,8 @@ class App:
             "browser": "chrome",
             "headless": False,
             "target_type": TargetType.BRAND,
+            "shutdown_after_finish": False,
+            "shutdown_timer_minutes": "",
         }
 
     def _normalize_account_settings(self, settings: Optional[Dict]) -> Dict:
@@ -2010,6 +2051,14 @@ class App:
             normalized["headless"] = headless.strip().lower() in ("1", "true", "yes", "on")
         else:
             normalized["headless"] = bool(headless)
+
+        shutdown_after_finish = normalized.get("shutdown_after_finish")
+        if isinstance(shutdown_after_finish, str):
+            normalized["shutdown_after_finish"] = shutdown_after_finish.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            normalized["shutdown_after_finish"] = bool(shutdown_after_finish)
+
+        normalized["shutdown_timer_minutes"] = str(normalized.get("shutdown_timer_minutes") or "").strip()
         return normalized
 
     def _collect_current_account_settings(self) -> Dict:
@@ -2020,6 +2069,8 @@ class App:
             "browser": (self.var_browser.get() or "").strip() or "chrome",
             "headless": bool(self.var_headless.get()),
             "target_type": (self.var_target_type.get() or "").strip() or TargetType.BRAND,
+            "shutdown_after_finish": bool(self.var_shutdown_after_finish.get()),
+            "shutdown_timer_minutes": (self.var_shutdown_timer_minutes.get() or "").strip(),
         })
 
     def _apply_account_settings(self, settings: Optional[Dict]):
@@ -2029,11 +2080,194 @@ class App:
         self.var_max_scroll.set(str(settings.get("max_scroll") or "20"))
         self.var_browser.set(str(settings.get("browser") or "chrome"))
         self.var_headless.set(bool(settings.get("headless")))
+        self.var_shutdown_after_finish.set(bool(settings.get("shutdown_after_finish")))
+        self.var_shutdown_timer_minutes.set(str(settings.get("shutdown_timer_minutes") or "").strip())
         target_type = str(settings.get("target_type") or TargetType.BRAND)
         if target_type not in (TargetType.BRAND, TargetType.ARTIST):
             target_type = TargetType.BRAND
         self.var_target_type.set(target_type)
         self.on_target_type_change(target_type)
+
+    def _run_shutdown_command(self, *args: str) -> Tuple[bool, str]:
+        if not sys.platform.startswith("win"):
+            return False, "当前仅支持 Windows 系统自动关机"
+        try:
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "errors": "ignore",
+                "check": False,
+            }
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(["shutdown", *args], **kwargs)
+            output = (completed.stdout or completed.stderr or "").strip()
+            return completed.returncode == 0, output
+        except Exception as e:
+            return False, str(e)
+
+    def _set_shutdown_status(self, text: str, *, cancel_enabled: bool):
+        def _apply():
+            self.var_shutdown_status.set(text)
+            try:
+                self.btn_cancel_shutdown.config(state='normal' if cancel_enabled else 'disabled')
+            except Exception:
+                pass
+
+        self.ui(_apply)
+
+    def _stop_shutdown_status_timer(self):
+        if self.shutdown_status_after_id is not None:
+            try:
+                self.master.after_cancel(self.shutdown_status_after_id)
+            except Exception:
+                pass
+            self.shutdown_status_after_id = None
+
+    def _refresh_shutdown_status(self):
+        self.shutdown_status_after_id = None
+        if self.shutdown_execute_at is None:
+            self._set_shutdown_status("关机计划：未设置", cancel_enabled=False)
+            return
+
+        remaining = max(0, int(round(self.shutdown_execute_at - time.time())))
+        if not self.shutdown_os_armed and remaining > 60:
+            reminder_after = remaining - 60
+            text = (
+                f"关机计划：{reminder_after // 60}分{reminder_after % 60}秒后提醒，"
+                f"{remaining // 60}分{remaining % 60}秒后关机"
+            )
+        else:
+            text = f"关机计划：{remaining // 60}分{remaining % 60}秒后自动关机"
+        self._set_shutdown_status(text, cancel_enabled=True)
+
+        if remaining > 0:
+            self.shutdown_status_after_id = self.master.after(1000, self._refresh_shutdown_status)
+
+    def _clear_shutdown_plan(self, *, cancel_os_shutdown: bool):
+        if self.shutdown_warning_after_id is not None:
+            try:
+                self.master.after_cancel(self.shutdown_warning_after_id)
+            except Exception:
+                pass
+            self.shutdown_warning_after_id = None
+
+        self._stop_shutdown_status_timer()
+
+        if cancel_os_shutdown and self.shutdown_os_armed:
+            ok, output = self._run_shutdown_command("/a")
+            if not ok and output:
+                self.logger.warning(f"取消系统关机失败: {output}")
+
+        self.shutdown_warning_at = None
+        self.shutdown_execute_at = None
+        self.shutdown_reason = None
+        self.shutdown_trigger = None
+        self.shutdown_os_armed = False
+        self._set_shutdown_status("关机计划：未设置", cancel_enabled=False)
+
+    def _arm_system_shutdown(self, reason: str) -> Tuple[bool, str]:
+        if self.shutdown_os_armed:
+            self._run_shutdown_command("/a")
+        ok, output = self._run_shutdown_command("/s", "/t", "60", "/c", reason)
+        if ok:
+            self.shutdown_os_armed = True
+        return ok, output
+
+    def _trigger_shutdown_warning(self):
+        self.shutdown_warning_after_id = None
+        if self.shutdown_execute_at is None:
+            return
+
+        trigger_name = self.shutdown_trigger or "自动关机"
+        reason = self.shutdown_reason or f"{trigger_name}，系统将在 1 分钟后自动关机。"
+        ok, output = self._arm_system_shutdown(reason)
+        if not ok:
+            self.logger.error(f"设置自动关机失败: {output}")
+            self._clear_shutdown_plan(cancel_os_shutdown=False)
+            self.ui(lambda: messagebox.showerror("错误", f"设置自动关机失败: {output or '未知错误'}"))
+            return
+
+        notice = f"{trigger_name}，系统将在 1 分钟后自动关机，请及时保存其它工作。"
+        self.logger.warning(notice)
+        self._refresh_shutdown_status()
+        self.ui(lambda: messagebox.showwarning("自动关机提醒", notice))
+
+    def _schedule_shutdown_plan(self, delay_seconds: int, trigger_name: str, *, replace_only_if_earlier: bool = False) -> bool:
+        delay_seconds = max(60, int(delay_seconds))
+        new_execute_at = time.time() + delay_seconds
+
+        if replace_only_if_earlier and self.shutdown_execute_at is not None and self.shutdown_execute_at <= new_execute_at:
+            remaining = max(0, int(round(self.shutdown_execute_at - time.time())))
+            self.logger.info(
+                "已有更早的关机计划，跳过 [%s]（剩余 %d 秒）",
+                trigger_name, remaining
+            )
+            return False
+
+        self._clear_shutdown_plan(cancel_os_shutdown=True)
+
+        self.shutdown_trigger = trigger_name
+        self.shutdown_reason = f"{trigger_name}，系统将在 1 分钟后自动关机。"
+        self.shutdown_execute_at = new_execute_at
+        self.shutdown_warning_at = new_execute_at - 60
+
+        wait_ms = max(0, int(round((self.shutdown_warning_at - time.time()) * 1000)))
+        self.shutdown_warning_after_id = self.master.after(wait_ms, self._trigger_shutdown_warning)
+        self._refresh_shutdown_status()
+
+        self.logger.info(
+            "已设置自动关机计划 [%s]，将在 %d 分 %d 秒后关机",
+            trigger_name, delay_seconds // 60, delay_seconds % 60
+        )
+        return True
+
+    def schedule_timed_shutdown(self):
+        raw_minutes = (self.var_shutdown_timer_minutes.get() or "").strip()
+        if not raw_minutes:
+            messagebox.showwarning("提示", "请输入定时关机的分钟数（至少 1 分钟）")
+            return
+
+        try:
+            minutes = int(raw_minutes)
+        except ValueError:
+            messagebox.showerror("错误", "定时关机只支持整数分钟")
+            return
+
+        if minutes < 1:
+            messagebox.showwarning("提示", "定时关机至少需要 1 分钟")
+            return
+
+        if not self._schedule_shutdown_plan(minutes * 60, f"定时关机（{minutes} 分钟）"):
+            return
+
+        self.save_account_settings(log_errors=False)
+        if minutes > 1:
+            messagebox.showinfo(
+                "成功",
+                f"已设置定时关机：{minutes} 分钟后关机。\n系统会在关机前 1 分钟弹出提醒。"
+            )
+
+    def cancel_scheduled_shutdown(self, show_dialog: bool = True):
+        has_plan = self.shutdown_execute_at is not None or self.shutdown_os_armed
+        if not has_plan:
+            if show_dialog:
+                messagebox.showinfo("提示", "当前没有关机计划")
+            return
+
+        self._clear_shutdown_plan(cancel_os_shutdown=True)
+        self.save_account_settings(log_errors=False)
+        self.logger.info("已取消自动关机计划")
+        if show_dialog:
+            messagebox.showinfo("成功", "已取消自动关机计划")
+
+    def _schedule_shutdown_after_completion(self):
+        if not bool(self.var_shutdown_after_finish.get()):
+            return
+
+        scheduled = self._schedule_shutdown_plan(60, "抓取完毕后自动关机", replace_only_if_earlier=True)
+        if scheduled:
+            self.logger.info("抓取已完成，已进入 1 分钟关机倒计时...")
 
     def save_account_settings(self, account_name: Optional[str] = None, *, log_errors: bool = True):
         target_account = (account_name or self.current_account_name or self.cb_account.get() or "").strip()
@@ -2588,21 +2822,12 @@ class App:
     def on_captcha_detected(self, where: str, captcha_type: str = "unknown"):
         """当爬虫线程检测到验证码时调用此方法"""
         def _apply():
-            # 保存当前设置的速度
-            cur_scroll = (self.var_scroll_sleep.get() or "").strip()
-            cur_detail = (self.var_detail_sleep.get() or "").strip()
-            if self._backup_scroll_sleep is None and cur_scroll and cur_scroll != "99999999":
-                self._backup_scroll_sleep = cur_scroll
-            if self._backup_detail_sleep is None and cur_detail and cur_detail != "99999999":
-                self._backup_detail_sleep = cur_detail
-
-            # 暂停计时器（设为极长时间）
-            self.var_scroll_sleep.set("99999999")
-            self.var_detail_sleep.set("99999999")
-
-            # 更新 UI 状态
+            # 暂停完全由 pause_event 控制，不再改写用户输入的等待参数，
+            # 避免恢复后界面残留 99999999 或被错误保存到账号配置中。
             self.btn_resume.config(state='normal')
             self.var_status.set("已暂停：等待验证码处理后恢复运行")
+            self.var_sleep_text.set("已暂停：等待扫码/验证码处理")
+            self.sleep_bar['value'] = 0
             if self._captcha_prompt_active:
                 return
             self._captcha_prompt_active = True
@@ -2672,6 +2897,7 @@ class App:
         target_type = self.var_target_type.get()
 
         def run():
+            completed_normally = False
             try:
                 self.logger.info("初始化DB")
                 self.db = DatabaseManager()
@@ -2750,6 +2976,7 @@ class App:
                 else:
                     self.logger.info("任务结束")
                     self.ui_set_status("已完成")
+                    completed_normally = True
             except KeyboardInterrupt:
                 self.logger.info("用户停止或被验证码拦截")
                 self.ui_set_status("已停止")
@@ -2771,6 +2998,8 @@ class App:
                 self.ui_set_buttons(start='normal', stop='disabled', resume='disabled', skip='disabled',
                                     add_acc='normal', remove_acc='normal')
                 self.ui(lambda: self._clear_sleep_bar())
+                if completed_normally:
+                    self.ui(self._schedule_shutdown_after_completion)
 
         self.running_thread = threading.Thread(target=run, daemon=True)
         self.running_thread.start()
@@ -2790,14 +3019,6 @@ class App:
             return
 
         def _apply_restore():
-            if (self.var_scroll_sleep.get() or '').strip() == "99999999" and self._backup_scroll_sleep:
-                self.var_scroll_sleep.set(self._backup_scroll_sleep)
-            if (self.var_detail_sleep.get() or '').strip() == "99999999" and self._backup_detail_sleep:
-                self.var_detail_sleep.set(self._backup_detail_sleep)
-
-            self._backup_scroll_sleep = None
-            self._backup_detail_sleep = None
-
             try:
                 self.btn_resume.config(state='disabled')
             except Exception:
@@ -2805,6 +3026,7 @@ class App:
             self._captcha_prompt_active = False
 
             self.ui_set_status("运行中…")
+            self._clear_sleep_bar()
             self.logger.info("已点击“恢复运行”，采集将继续执行")
 
         self.ui(_apply_restore)
@@ -2822,6 +3044,7 @@ class App:
         self._captcha_prompt_active = False
         self.auto_process_enabled = False
         self.save_account_settings(log_errors=False)
+        self._clear_shutdown_plan(cancel_os_shutdown=True)
         if self.auto_process_after_id is not None:
             try:
                 self.master.after_cancel(self.auto_process_after_id)
