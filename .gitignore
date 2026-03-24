@@ -12,3 +12,4 @@ bin/*.exe
 xhs_browser_profiles/*
 tmp/
 *.pkl
+xhs_spider_service
