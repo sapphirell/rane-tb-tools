@@ -27,6 +27,7 @@ import queue
 import subprocess
 from time import sleep
 from typing import Dict, Optional, Callable, List, Tuple
+from pathlib import Path
 
 import pymysql
 import requests
@@ -774,6 +775,14 @@ class XHSCrawler:
         self.logger = logger or logging.getLogger(__name__)
         self.stop_requested = False
         self.browser_name = self._normalize_browser_name(browser)
+        self.accept_language = "zh-CN,zh;q=0.9,en;q=0.8"
+        self.locale = "zh-CN"
+        # 采集计数器：
+        # - opened_urls: 实际打开详情页 URL 的数量（主要用于精采模式）
+        # - inserted_urls: 成功写入数据库的数量
+        # - skipped_existing_urls: 因数据库已存在而跳过的数量
+        self.total_crawl_stats = self._new_crawl_stats()
+        self.last_target_stats = self._new_crawl_stats()
 
         self.profile_key = _safe_profile_key(self.account_name or f"{self.target_type}_default")
         profiles_root = os.path.join(get_runtime_base_dir(), "xhs_browser_profiles")
@@ -854,17 +863,278 @@ class XHSCrawler:
         else:
             self.logger.warning("未找到 stealth.min.js，跳过注入")
 
+        # 再补一层运行期反检测脚本，重点清理 cdc_* 与 webdriver 暴露。
+        self._inject_runtime_stealth_overrides()
+        self._apply_cdp_anti_detection(headless=headless)
+
         self.all_links = set()
         self.collected_quick_data = []
+
+    @staticmethod
+    def _new_crawl_stats() -> Dict[str, int]:
+        """创建一份采集统计字典。"""
+        return {
+            "opened_urls": 0,
+            "inserted_urls": 0,
+            "skipped_existing_urls": 0,
+        }
+
+    @staticmethod
+    def _inc_stat(stats: Dict[str, int], key: str, step: int = 1):
+        """对采集统计中的指定字段做自增。"""
+        stats[key] = int(stats.get(key, 0)) + int(step)
+
+    def _inject_runtime_stealth_overrides(self):
+        """注入补充反检测脚本，尽量降低 webdriver/cdc_* 暴露特征。"""
+        script = r"""
+(() => {
+  const hiddenKey = (k) => /^cdc_/i.test(k) || /webdriver/i.test(k);
+  const win = window;
+  const nav = win.navigator;
+
+  const defineGetter = (obj, key, getter) => {
+    try {
+      Object.defineProperty(obj, key, {
+        get: getter,
+        configurable: true
+      });
+    } catch (_) {}
+  };
+
+  // 优先删除 webdriver 属性，尽量让 `'webdriver' in navigator` 返回 false。
+  // 仅当浏览器不允许删除且值仍为 true 时，再退回 getter 覆盖。
+  try {
+    delete Navigator.prototype.webdriver;
+  } catch (_) {}
+  try {
+    const navProto = Object.getPrototypeOf(nav);
+    if (navProto) {
+      delete navProto.webdriver;
+    }
+  } catch (_) {}
+  try {
+    if (nav.webdriver === true) {
+      defineGetter(Navigator.prototype, 'webdriver', () => undefined);
+      defineGetter(nav, 'webdriver', () => undefined);
+    }
+  } catch (_) {}
+
+  try {
+    if (!win.chrome) {
+      Object.defineProperty(win, 'chrome', {
+        value: {
+          runtime: {},
+          app: {},
+          csi: function () { return {}; },
+          loadTimes: function () { return {}; }
+        },
+        configurable: false,
+        enumerable: true,
+        writable: true
+      });
+    } else if (!win.chrome.runtime) {
+      win.chrome.runtime = {};
+    }
+  } catch (_) {}
+
+  // 注意：这里不再强行伪造 plugins，避免被检测为“不是 PluginArray”。
+
+  try {
+    const langs = ['zh-CN', 'zh', 'en-US', 'en'];
+    defineGetter(Navigator.prototype, 'languages', () => langs.slice());
+    defineGetter(nav, 'languages', () => langs.slice());
+    defineGetter(nav, 'language', () => 'zh-CN');
+  } catch (_) {}
+
+  try {
+    if (nav.permissions && typeof nav.permissions.query === 'function') {
+      const originQuery = nav.permissions.query.bind(nav.permissions);
+      nav.permissions.query = (parameters) => {
+        const name = parameters && parameters.name ? parameters.name : '';
+        if (name === 'notifications') {
+          return Promise.resolve({ state: Notification.permission });
+        }
+        return originQuery(parameters);
+      };
+    }
+  } catch (_) {}
+
+  const filterWindowKeys = (keys) => {
+    if (!Array.isArray(keys)) return keys;
+    return keys.filter((k) => !hiddenKey(String(k || '')));
+  };
+
+  const scrubWindow = () => {
+    try {
+      for (const key of Object.getOwnPropertyNames(win)) {
+        if (!hiddenKey(key)) continue;
+        try {
+          delete win[key];
+        } catch (_) {
+          try {
+            Object.defineProperty(win, key, {
+              value: undefined,
+              configurable: true
+            });
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  };
+
+  scrubWindow();
+
+  try {
+    const origKeys = Object.keys;
+    Object.keys = new Proxy(origKeys, {
+      apply(target, thisArg, args) {
+        const result = Reflect.apply(target, thisArg, args);
+        if (args && args[0] === win) {
+          return filterWindowKeys(result);
+        }
+        return result;
+      }
+    });
+  } catch (_) {}
+
+  try {
+    const origGetOwnPropertyNames = Object.getOwnPropertyNames;
+    Object.getOwnPropertyNames = new Proxy(origGetOwnPropertyNames, {
+      apply(target, thisArg, args) {
+        const result = Reflect.apply(target, thisArg, args);
+        if (args && args[0] === win) {
+          return filterWindowKeys(result);
+        }
+        return result;
+      }
+    });
+  } catch (_) {}
+
+  try {
+    const origOwnKeys = Reflect.ownKeys;
+    Reflect.ownKeys = new Proxy(origOwnKeys, {
+      apply(target, thisArg, args) {
+        const result = Reflect.apply(target, thisArg, args);
+        if (args && args[0] === win && Array.isArray(result)) {
+          return result.filter((k) => !hiddenKey(String(k || '')));
+        }
+        return result;
+      }
+    });
+  } catch (_) {}
+
+  try {
+    const origGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+    Object.getOwnPropertyDescriptors = new Proxy(origGetOwnPropertyDescriptors, {
+      apply(target, thisArg, args) {
+        const result = Reflect.apply(target, thisArg, args);
+        if (args && args[0] === win && result && typeof result === 'object') {
+          for (const key of Object.keys(result)) {
+            if (hiddenKey(key)) {
+              delete result[key];
+            }
+          }
+        }
+        return result;
+      }
+    });
+  } catch (_) {}
+
+  try {
+    const originalContentWindow = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+    if (originalContentWindow && originalContentWindow.get) {
+      Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+        get: function () {
+          return originalContentWindow.get.call(this);
+        },
+        configurable: true
+      });
+    }
+  } catch (_) {}
+})();
+"""
+        try:
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': script})
+            try:
+                self.driver.execute_script(script)
+            except Exception:
+                pass
+            self.logger.info("已注入补充反检测脚本（webdriver/cdc/plugins/languages）")
+        except Exception as e:
+            self.logger.warning(f"补充反检测注入失败：{e}")
+
+    def _apply_cdp_anti_detection(self, *, headless: bool):
+        """通过 CDP 进一步覆盖 UA/语言等基础指纹，降低默认自动化特征。"""
+        try:
+            self.driver.execute_cdp_cmd("Network.enable", {})
+        except Exception as e:
+            self.logger.warning(f"CDP Network.enable 失败，跳过指纹覆盖：{e}")
+            return
+
+        user_agent = ""
+        platform = "MacIntel"
+        try:
+            current_ua = self.driver.execute_script("return navigator.userAgent || '';")
+            if isinstance(current_ua, str):
+                user_agent = current_ua.strip()
+            current_platform = self.driver.execute_script("return navigator.platform || '';")
+            if isinstance(current_platform, str) and current_platform.strip():
+                platform = current_platform.strip()
+        except Exception:
+            pass
+
+        if not user_agent:
+            user_agent = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+            )
+        if "HeadlessChrome/" in user_agent:
+            user_agent = user_agent.replace("HeadlessChrome/", "Chrome/")
+
+        try:
+            self.driver.execute_cdp_cmd(
+                "Network.setUserAgentOverride",
+                {
+                    "userAgent": user_agent,
+                    "acceptLanguage": self.accept_language,
+                    "platform": platform,
+                },
+            )
+            self.logger.info("已应用 CDP 指纹覆盖（UA/语言/平台）")
+        except Exception as e:
+            self.logger.warning(f"CDP 设置 UA 覆盖失败：{e}")
+
+        try:
+            self.driver.execute_cdp_cmd("Emulation.setLocaleOverride", {"locale": self.locale})
+        except Exception:
+            pass
+
+        if headless:
+            try:
+                self.driver.execute_cdp_cmd(
+                    "Emulation.setDeviceMetricsOverride",
+                    {
+                        "width": 1366,
+                        "height": 864,
+                        "deviceScaleFactor": 1,
+                        "mobile": False,
+                    },
+                )
+            except Exception:
+                pass
 
     def _build_chrome_options(self, profile_dir: str, *, headless: bool) -> ChromeOptions:
         options = ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
+        else:
+            options.add_argument("--start-maximized")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
+        options.add_experimental_option("useAutomationExtension", False)
         options.add_experimental_option("prefs", {
             "profile.exit_type": "Normal",
             "profile.exited_cleanly": True,
+            "intl.accept_languages": "zh-CN,zh,en-US,en",
         })
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--disable-features=AutomationControlled")
@@ -873,6 +1143,8 @@ class XHSCrawler:
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-session-crashed-bubble")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--lang=zh-CN")
         options.add_argument("--remote-debugging-pipe")
         options.add_argument(f"--user-data-dir={profile_dir}")
         options.add_argument("--profile-directory=Default")
@@ -882,10 +1154,14 @@ class XHSCrawler:
         options = EdgeOptions()
         if headless:
             options.add_argument("--headless=new")
+        else:
+            options.add_argument("--start-maximized")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
+        options.add_experimental_option("useAutomationExtension", False)
         options.add_experimental_option("prefs", {
             "profile.exit_type": "Normal",
             "profile.exited_cleanly": True,
+            "intl.accept_languages": "zh-CN,zh,en-US,en",
         })
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--disable-features=AutomationControlled")
@@ -894,6 +1170,8 @@ class XHSCrawler:
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-session-crashed-bubble")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--lang=zh-CN")
         options.add_argument("--remote-debugging-pipe")
         options.add_argument(f"--user-data-dir={profile_dir}")
         options.add_argument("--profile-directory=Default")
@@ -917,53 +1195,146 @@ class XHSCrawler:
         base_dir = get_resource_base_dir()
         bin_dir = os.path.join(base_dir, "bin")
         tmp_dir = os.path.join(base_dir, "tmp")
+        is_windows = (os.name == "nt")
+        home_dir = os.path.expanduser("~")
 
         candidates: List[str] = []
         if browser_name == "edge":
-            candidates.extend([
-                os.path.join(bin_dir, "msedgedriver.exe"),
-                os.path.join(bin_dir, "edgedriver.exe"),
-            ])
-            candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "msedgedriver.exe"), recursive=True))
-            candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "edgedriver.exe"), recursive=True))
+            if is_windows:
+                candidates.extend([
+                    os.path.join(bin_dir, "msedgedriver.exe"),
+                    os.path.join(bin_dir, "edgedriver.exe"),
+                ])
+                candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "msedgedriver.exe"), recursive=True))
+                candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "edgedriver.exe"), recursive=True))
+            else:
+                candidates.extend([
+                    os.path.join(bin_dir, "msedgedriver"),
+                    os.path.join(bin_dir, "edgedriver"),
+                ])
+                candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "msedgedriver"), recursive=True))
+                candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "edgedriver"), recursive=True))
+                cache_candidates = []
+                cache_candidates.extend(
+                    glob.glob(os.path.join(home_dir, ".cache", "selenium", "msedgedriver", "**", "msedgedriver"),
+                              recursive=True)
+                )
+                cache_candidates.extend(
+                    glob.glob(os.path.join(home_dir, ".cache", "selenium", "msedgedriver", "**", "edgedriver"),
+                              recursive=True)
+                )
+                cache_candidates.extend(
+                    glob.glob(os.path.join(home_dir, "Library", "Caches", "selenium", "msedgedriver", "**",
+                                           "msedgedriver"), recursive=True)
+                )
+                cache_candidates.extend(
+                    glob.glob(os.path.join(home_dir, "Library", "Caches", "selenium", "msedgedriver", "**",
+                                           "edgedriver"), recursive=True)
+                )
+                cache_candidates = sorted(
+                    set(cache_candidates),
+                    key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+                    reverse=True
+                )
+                candidates.extend(cache_candidates)
+                system_edge_driver = shutil.which("msedgedriver") or shutil.which("edgedriver")
+                if system_edge_driver:
+                    candidates.append(system_edge_driver)
         else:
-            candidates.extend([
-                os.path.join(bin_dir, "chromedriver.exe"),
-                os.path.join(bin_dir, "chromedriver"),
-            ])
-            candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "chromedriver.exe"), recursive=True))
-            candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "chromedriver"), recursive=True))
+            if is_windows:
+                candidates.extend([
+                    os.path.join(bin_dir, "chromedriver.exe"),
+                ])
+                candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "chromedriver.exe"), recursive=True))
+            else:
+                candidates.extend([
+                    os.path.join(bin_dir, "chromedriver"),
+                ])
+                candidates.extend(glob.glob(os.path.join(tmp_dir, "**", "chromedriver"), recursive=True))
+                cache_candidates = []
+                cache_candidates.extend(
+                    glob.glob(os.path.join(home_dir, ".cache", "selenium", "chromedriver", "**", "chromedriver"),
+                              recursive=True)
+                )
+                cache_candidates.extend(
+                    glob.glob(os.path.join(home_dir, "Library", "Caches", "selenium", "chromedriver", "**",
+                                           "chromedriver"), recursive=True)
+                )
+                cache_candidates = sorted(
+                    set(cache_candidates),
+                    key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+                    reverse=True
+                )
+                candidates.extend(cache_candidates)
+                system_chrome_driver = shutil.which("chromedriver")
+                if system_chrome_driver:
+                    candidates.append(system_chrome_driver)
 
         for path in candidates:
             if path and os.path.isfile(path):
                 return path
         return ""
 
+    def _ensure_driver_executable(self, driver_path: str):
+        """确保非 Windows 平台的 driver 文件具备可执行权限。"""
+        if not driver_path or os.name == "nt":
+            return
+        try:
+            mode = os.stat(driver_path).st_mode
+            if mode & 0o111:
+                return
+            os.chmod(driver_path, mode | 0o755)
+            self.logger.info(f"已补充 driver 执行权限: {driver_path}")
+        except Exception as chmod_err:
+            self.logger.warning(f"补充 driver 执行权限失败: {driver_path}, err={chmod_err}")
+
     def _start_chrome_with_profile(self, profile_dir: str, *, headless: bool):
         log_path = self._driver_log_path("init")
         driver_path = self._resolve_driver_executable("chrome")
         if driver_path:
+            self._ensure_driver_executable(driver_path)
             service = ChromeService(executable_path=driver_path, log_output=log_path, service_args=["--verbose"])
             self.logger.info(f"使用本地 ChromeDriver: {driver_path}")
         else:
             service = ChromeService(log_output=log_path, service_args=["--verbose"])
-            self.logger.warning("未找到本地 ChromeDriver，改用 Selenium 自动解析 driver")
+            self.logger.warning("未找到可复用的本地 ChromeDriver（bin/缓存/PATH），改用 Selenium 自动解析 driver（首次或版本变更会较慢）")
         options = self._build_chrome_options(profile_dir, headless=headless)
         self.logger.info(f"ChromeDriver 日志路径: {log_path}")
-        return chrome_webdriver.WebDriver(service=service, options=options)
+        try:
+            return chrome_webdriver.WebDriver(service=service, options=options)
+        except WebDriverException as local_err:
+            if driver_path:
+                self.logger.warning(
+                    "本地 ChromeDriver 启动失败，自动回退 Selenium 解析 driver: %s",
+                    local_err
+                )
+                fallback_service = ChromeService(log_output=log_path, service_args=["--verbose"])
+                return chrome_webdriver.WebDriver(service=fallback_service, options=options)
+            raise
 
     def _start_edge_with_profile(self, profile_dir: str, *, headless: bool):
         log_path = self._driver_log_path("init")
         driver_path = self._resolve_driver_executable("edge")
         if driver_path:
+            self._ensure_driver_executable(driver_path)
             service = EdgeService(executable_path=driver_path, log_output=log_path, service_args=["--verbose"])
             self.logger.info(f"使用本地 EdgeDriver: {driver_path}")
         else:
             service = EdgeService(log_output=log_path, service_args=["--verbose"])
-            self.logger.warning("未找到本地 EdgeDriver，改用 Selenium 自动解析 driver")
+            self.logger.warning("未找到可复用的本地 EdgeDriver（bin/缓存/PATH），改用 Selenium 自动解析 driver（首次或版本变更会较慢）")
         options = self._build_edge_options(profile_dir, headless=headless)
         self.logger.info(f"EdgeDriver 日志路径: {log_path}")
-        return edge_webdriver.WebDriver(service=service, options=options)
+        try:
+            return edge_webdriver.WebDriver(service=service, options=options)
+        except WebDriverException as local_err:
+            if driver_path:
+                self.logger.warning(
+                    "本地 EdgeDriver 启动失败，自动回退 Selenium 解析 driver: %s",
+                    local_err
+                )
+                fallback_service = EdgeService(log_output=log_path, service_args=["--verbose"])
+                return edge_webdriver.WebDriver(service=fallback_service, options=options)
+            raise
 
     def _start_browser_with_profile(self, profile_dir: str, *, headless: bool):
         if self.browser_name == "edge":
@@ -1324,7 +1695,7 @@ class XHSCrawler:
             self.logger.warning(f"提取链接异常: {e}")
         return current_links
 
-    def smart_scroll(self, spd_setting=1, max_scroll=None):
+    def smart_scroll(self, spd_setting=1, max_scroll=None, stats: Optional[Dict[str, int]] = None):
         total_scroll = 0
         no_new_count = 0
         max_no_new = 6
@@ -1340,7 +1711,7 @@ class XHSCrawler:
         new_links = converted_new_links - {convert_xhs_url(x).split('?')[0] for x in self.all_links}
 
         if spd_setting == 2 and new_links:
-            self.process_quick_data(new_links)
+            self.process_quick_data(new_links, stats=stats)
 
         self.all_links.update(current_links)
         self.logger.info(f"[首屏] 当前总链接数：{len(self.all_links)} 新增：{len(new_links)}")
@@ -1357,7 +1728,7 @@ class XHSCrawler:
             new_links = converted_new_links - {convert_xhs_url(x).split('?')[0] for x in self.all_links}
 
             if spd_setting == 2 and new_links:
-                self.process_quick_data(new_links)
+                self.process_quick_data(new_links, stats=stats)
 
             self.all_links.update(current_links)
             self.logger.info(f"当前总链接数：{len(self.all_links)} 新增：{len(new_links)}")
@@ -1462,7 +1833,7 @@ class XHSCrawler:
             self.logger.error(f"笔记处理失败 {note_url}: {e}", exc_info=True)
             return None
 
-    def process_quick_data(self, new_links: set):
+    def process_quick_data(self, new_links: set, stats: Optional[Dict[str, int]] = None):
         current_items = self.driver.find_elements(By.CSS_SELECTOR, '.note-item')
         for item in current_items:
             try:
@@ -1471,6 +1842,8 @@ class XHSCrawler:
 
                 if self.url_checker and self.url_checker(clean_url):
                     self.logger.info(f"已存在，跳过快速采集: {clean_url}")
+                    if stats is not None:
+                        self._inc_stat(stats, "skipped_existing_urls")
                     continue
                 if clean_url not in new_links:
                     continue
@@ -1537,6 +1910,8 @@ class XHSCrawler:
                 pass
 
     def crawl_target(self, row: Dict):
+        current_stats = self._new_crawl_stats()
+        self.last_target_stats = current_stats
         try:
             self.check_stop()
 
@@ -1561,14 +1936,16 @@ class XHSCrawler:
                 self.check_stop()
                 self.driver.get(target_url)
                 self._detect_and_handle_captcha("scroll")
-                self.smart_scroll(spd_setting, max_scroll)
+                self.smart_scroll(spd_setting, max_scroll, stats=current_stats)
 
                 if spd_setting == 1:
                     for note_url in list(self.all_links):
                         self.check_stop()
                         base_url = convert_xhs_url(note_url).split('?')[0]
                         if self.url_checker and self.url_checker(base_url):
+                            self._inc_stat(current_stats, "skipped_existing_urls")
                             continue
+                        self._inc_stat(current_stats, "opened_urls")
                         detail = self.process_single_note(note_url)
                         detail_sleep = max(0.0, float(self.get_detail_sleep()))
                         self._sleep_with_progress("detail", detail_sleep)
@@ -1581,6 +1958,7 @@ class XHSCrawler:
                                     {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'full_get': 0})
                             if self.insert_callback:
                                 self.insert_callback(detail)
+                                self._inc_stat(current_stats, "inserted_urls")
 
                 elif spd_setting == 2:
                     for quick_data in self.collected_quick_data:
@@ -1594,10 +1972,13 @@ class XHSCrawler:
                                  'full_get': 0})
                         if self.insert_callback:
                             self.insert_callback(quick_data)
+                            self._inc_stat(current_stats, "inserted_urls")
                     self.logger.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
 
                 self.all_links.clear()
                 self.collected_quick_data.clear()
+            for k in current_stats.keys():
+                self.total_crawl_stats[k] = int(self.total_crawl_stats.get(k, 0)) + int(current_stats.get(k, 0))
             return True
         except KeyboardInterrupt:
             self.logger.info("收到停止信号，已终止当前对象采集")
@@ -1744,6 +2125,8 @@ class App:
         self.btn_maintenance = ttk.Button(ctrl, text="数据维护", command=self.run_data_maintenance)
         self.btn_upload_images = ttk.Button(ctrl, text="上传图片", command=self.run_spider_image_upload)
         self.btn_stop_upload = ttk.Button(ctrl, text="停止上传", command=self.stop_spider_image_upload, state='disabled')
+        self.btn_open_detection_page = ttk.Button(ctrl, text="访问检测页", command=self.open_detection_page)
+        self.btn_open_sannysoft = ttk.Button(ctrl, text="访问 SannySoft", command=self.open_sannysoft_detection_page)
         self.btn_delete_failed_upload = ttk.Button(
             ctrl,
             text="删除传图失败记录",
@@ -1758,6 +2141,8 @@ class App:
         self.btn_maintenance.pack(side='left', padx=6, pady=4)
         self.btn_upload_images.pack(side='left', padx=6, pady=4)
         self.btn_stop_upload.pack(side='left', padx=6, pady=4)
+        self.btn_open_detection_page.pack(side='left', padx=6, pady=4)
+        self.btn_open_sannysoft.pack(side='left', padx=6, pady=4)
         self.btn_delete_failed_upload.pack(side='left', padx=6, pady=4)
         self.btn_auto_process.pack(side='left', padx=6, pady=4)
 
@@ -1826,6 +2211,7 @@ class App:
         self.maintenance_thread: Optional[threading.Thread] = None
         self.upload_thread: Optional[threading.Thread] = None
         self.crawler: Optional[XHSCrawler] = None
+        self.detector_crawler: Optional[XHSCrawler] = None
         self.db: Optional[DatabaseManager] = None
         self.failed_upload_spider_ids: List[int] = []
         self.failed_upload_artist_ids: List[int] = []
@@ -1906,7 +2292,18 @@ class App:
                 return False
         return False
 
+    def _belongs_to_main_window(self, widget) -> bool:
+        """判断控件是否属于主窗口，避免全局点击处理影响弹窗。"""
+        try:
+            if not widget or not widget.winfo_exists():
+                return False
+            return widget.winfo_toplevel() == self.master
+        except Exception:
+            return False
+
     def _blur_input_on_outside_click(self, event):
+        if not self._belongs_to_main_window(getattr(event, "widget", None)):
+            return
         try:
             focus_widget = self.master.focus_get()
         except (KeyError, tk.TclError):
@@ -1918,6 +2315,8 @@ class App:
             if focus_widget and not focus_widget.winfo_exists():
                 return
         except Exception:
+            return
+        if focus_widget and not self._belongs_to_main_window(focus_widget):
             return
         if not focus_widget or not self._is_input_widget(focus_widget):
             return
@@ -1948,6 +2347,90 @@ class App:
                 pass
 
         self.ui(_apply)
+
+    def _get_detection_page_url(self) -> str:
+        detection_file = Path(get_resource_base_dir()) / "scripts" / "selenium_detection_landing.html"
+        if not detection_file.exists():
+            raise FileNotFoundError(f"未找到检测页文件: {detection_file}")
+        return detection_file.resolve().as_uri()
+
+    def _quit_detector_browser(self):
+        crawler = self.detector_crawler
+        self.detector_crawler = None
+        if not crawler:
+            return
+        try:
+            if crawler.driver:
+                crawler.driver.quit()
+        except Exception:
+            pass
+
+    def _open_detection_target(self, *, target_url: str, page_name: str, button_attr: str):
+        """使用检测浏览器打开指定检测页面。"""
+        if self.running_thread and self.running_thread.is_alive():
+            messagebox.showinfo("提示", "采集运行中，请先停止采集后再访问检测页，避免打断当前任务。")
+            return
+
+        button = getattr(self, button_attr, None)
+        if button is not None:
+            self.ui(lambda: button.config(state='disabled'))
+        self.ui_set_status(f"正在打开{page_name}...")
+
+        def _run():
+            try:
+                # 优先复用已存在的检测浏览器，避免重复启动 driver。
+                if self.detector_crawler and self.detector_crawler.driver:
+                    try:
+                        self.detector_crawler.driver.get(target_url)
+                        self.logger.info("已在检测浏览器中打开%s：%s", page_name, target_url)
+                        self.ui_set_status(f"{page_name}已打开")
+                        return
+                    except Exception:
+                        self._quit_detector_browser()
+
+                account_name = (self.cb_account.get() or "检测页").strip() or "检测页"
+                detector_account = f"{account_name}_detect"
+                self.detector_crawler = XHSCrawler(
+                    target_type="detect",
+                    account_name=detector_account,
+                    headless=False,
+                    browser=self.var_browser.get(),
+                    logger=self.logger
+                )
+                self.detector_crawler.driver.get(target_url)
+                self.logger.info("已打开%s：%s", page_name, target_url)
+                self.ui_set_status(f"{page_name}已打开")
+            except Exception as e:
+                self.logger.error(f"打开{page_name}失败: {e}")
+                self.ui(lambda: messagebox.showerror("错误", f"打开{page_name}失败: {e}"))
+                self.ui_set_status(f"打开{page_name}失败")
+            finally:
+                if button is not None:
+                    self.ui(lambda: button.config(state='normal'))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def open_detection_page(self):
+        """打开本地 Selenium 检测页，快速查看当前浏览器的自动化特征。"""
+        try:
+            url = self._get_detection_page_url()
+        except Exception as e:
+            self.logger.error(f"检测页文件不可用: {e}")
+            messagebox.showerror("错误", f"检测页文件不可用: {e}")
+            return
+        self._open_detection_target(
+            target_url=url,
+            page_name="检测页",
+            button_attr="btn_open_detection_page"
+        )
+
+    def open_sannysoft_detection_page(self):
+        """打开 SannySoft 浏览器指纹检测页。"""
+        self._open_detection_target(
+            target_url="https://bot.sannysoft.com/",
+            page_name="SannySoft",
+            button_attr="btn_open_sannysoft"
+        )
 
     def _set_auto_process_button_text(self):
         text = "自动处理(每1分钟): 开" if self.auto_process_enabled else "自动处理(每1分钟): 关"
@@ -2406,7 +2889,11 @@ class App:
             messagebox.showinfo("提示", "采集进行中，请先停止")
             return
 
-        account_name = simpledialog.askstring("新增账号", "请输入该账号的备注名称（用于保存独立浏览器会话）:")
+        account_name = simpledialog.askstring(
+            "新增账号",
+            "请输入该账号的备注名称（用于保存独立浏览器会话）:",
+            parent=self.master
+        )
         if account_name is None:
             return
         account_name = account_name.strip()
@@ -2420,6 +2907,7 @@ class App:
 
         self.ui_set_buttons(start='disabled', add_acc='disabled', remove_acc='disabled')
         self.ui_set_status("正在启动浏览器录入账号...")
+        self.logger.info("开始新增账号流程：%s", account_name)
 
         def _run_add():
             temp_crawler = None
@@ -2962,6 +3450,18 @@ class App:
                         if ok:
                             self.db.update_last_gather_time(row['id'])
                             self.logger.info(f"已更新采集时间: {name}")
+                        target_stats = dict(self.crawler.last_target_stats or {})
+                        total_stats = dict(self.crawler.total_crawl_stats or {})
+                        self.logger.info(
+                            "处理完成[%s]：打开URL=%d，入库=%d，DB已存在跳过=%d；累计 打开URL=%d，入库=%d，DB已存在跳过=%d",
+                            name,
+                            int(target_stats.get("opened_urls", 0)),
+                            int(target_stats.get("inserted_urls", 0)),
+                            int(target_stats.get("skipped_existing_urls", 0)),
+                            int(total_stats.get("opened_urls", 0)),
+                            int(total_stats.get("inserted_urls", 0)),
+                            int(total_stats.get("skipped_existing_urls", 0)),
+                        )
 
                         self.crawler.all_links.clear()
                     except Exception as e:
@@ -3056,6 +3556,7 @@ class App:
                 self.crawler.request_stop()
         except Exception:
             pass
+        self._quit_detector_browser()
         try:
             self.upload_stop_event.set()
         except Exception:

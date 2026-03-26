@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>浏览器访问检测页</title>
+  <style>
+    :root {
+      --blue: #49caee;
+      --bg: #f2f7fb;
+      --card: #ffffff;
+      --text: #10243d;
+      --sub: #5a6f87;
+      --ok: #15a67a;
+      --warn: #f08f30;
+      --risk: #e24d5a;
+      --shadow: 0 14px 36px rgba(33, 76, 128, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 10%, rgba(73, 202, 238, 0.22), transparent 38%),
+        radial-gradient(circle at 85% 90%, rgba(16, 36, 61, 0.08), transparent 42%),
+        var(--bg);
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 1024px;
+      margin: 0 auto;
+      padding: 28px 16px 42px;
+    }
+
+    .hero {
+      background: var(--card);
+      box-shadow: var(--shadow);
+      border-radius: 18px;
+      padding: 22px 22px 18px;
+      margin-bottom: 18px;
+    }
+
+    .hero h1 {
+      margin: 0 0 8px;
+      font-size: 30px;
+      line-height: 1.2;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--sub);
+      line-height: 1.6;
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+
+    .btn {
+      appearance: none;
+      background: var(--blue);
+      color: #0e233a;
+      cursor: pointer;
+      padding: 10px 16px;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 700;
+      box-shadow: 0 8px 16px rgba(73, 202, 238, 0.32);
+      transition: transform .16s ease, filter .16s ease;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.04);
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .summary-item {
+      background: var(--card);
+      box-shadow: var(--shadow);
+      border-radius: 14px;
+      padding: 14px 16px;
+    }
+
+    .summary-label {
+      margin: 0 0 6px;
+      color: var(--sub);
+      font-size: 13px;
+    }
+
+    .summary-value {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: 0.2px;
+    }
+
+    .risk-low {
+      color: var(--ok);
+    }
+
+    .risk-mid {
+      color: var(--warn);
+    }
+
+    .risk-high {
+      color: var(--risk);
+    }
+
+    .card {
+      background: var(--card);
+      box-shadow: var(--shadow);
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    th,
+    td {
+      text-align: left;
+      padding: 10px 8px;
+      vertical-align: top;
+      box-shadow: inset 0 -1px rgba(16, 36, 61, 0.08);
+      font-size: 14px;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+
+    th {
+      color: var(--sub);
+      font-size: 13px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .tag-ok {
+      background: rgba(21, 166, 122, 0.14);
+      color: var(--ok);
+    }
+
+    .tag-risk {
+      background: rgba(226, 77, 90, 0.12);
+      color: var(--risk);
+    }
+
+    .footnote {
+      margin: 8px 0 0;
+      color: var(--sub);
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    @media (max-width: 760px) {
+      .hero h1 {
+        font-size: 24px;
+      }
+
+      .summary-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="hero">
+      <h1>浏览器访问检测页</h1>
+      <p>本页会检测一些常见自动化特征（如 <code>navigator.webdriver</code>、插件列表、WebGL 渲染信息等），用于快速判断当前会话是否容易被反爬规则命中。</p>
+      <div class="actions">
+        <button class="btn" id="btn-run">重新检测</button>
+      </div>
+    </section>
+
+    <section class="summary-grid">
+      <article class="summary-item">
+        <p class="summary-label">综合风险评分</p>
+        <p class="summary-value" id="score-text">-</p>
+      </article>
+      <article class="summary-item">
+        <p class="summary-label">结果判断</p>
+        <p class="summary-value" id="result-text">检测中…</p>
+      </article>
+      <article class="summary-item">
+        <p class="summary-label">检测时间</p>
+        <p class="summary-value" id="time-text">-</p>
+      </article>
+    </section>
+
+    <section class="card">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 28%;">检测项</th>
+            <th style="width: 14%;">结果</th>
+            <th style="width: 58%;">详情</th>
+          </tr>
+        </thead>
+        <tbody id="result-body"></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <p class="footnote">
+        说明：本页是“风险提示”而非最终判定。网站风控通常会结合更多维度（行为轨迹、请求节奏、IP信誉、TLS 指纹等）。
+      </p>
+    </section>
+  </div>
+
+  <script>
+    function maskText(value) {
+      if (value === null || value === undefined) return "(空)";
+      const text = String(value);
+      return text.length > 200 ? text.slice(0, 200) + "..." : text;
+    }
+
+    function createCheck(name, suspicious, detail, weight) {
+      return { name, suspicious: !!suspicious, detail: maskText(detail), weight: Number(weight) || 0 };
+    }
+
+    function getWebGLInfo() {
+      const canvas = document.createElement("canvas");
+      const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+      if (!gl) {
+        return { supported: false, vendor: "N/A", renderer: "N/A" };
+      }
+      const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+      const vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : "unknown";
+      const renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : "unknown";
+      return { supported: true, vendor, renderer };
+    }
+
+    async function runDetection() {
+      const checks = [];
+      const nav = window.navigator || {};
+      const ua = nav.userAgent || "";
+      const webgl = getWebGLInfo();
+      const winKeys = Object.keys(window);
+      const cdcKeys = winKeys.filter((key) => /^cdc_/i.test(key) || key.includes("webdriver"));
+      const pluginsLen = nav.plugins ? nav.plugins.length : 0;
+      const languages = Array.isArray(nav.languages) ? nav.languages : [];
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "unknown";
+
+      checks.push(
+        createCheck("navigator.webdriver", nav.webdriver === true, nav.webdriver, 5)
+      );
+
+      checks.push(
+        createCheck(
+          "window 中 cdc_/webdriver 痕迹",
+          cdcKeys.length > 0,
+          cdcKeys.length > 0 ? cdcKeys.join(", ") : "未发现可疑键",
+          4
+        )
+      );
+
+      checks.push(
+        createCheck(
+          "User-Agent 含 HeadlessChrome",
+          /HeadlessChrome/i.test(ua),
+          ua || "未读取到 UA",
+          3
+        )
+      );
+
+      checks.push(
+        createCheck(
+          "插件列表为空",
+          pluginsLen === 0,
+          "plugins.length = " + pluginsLen,
+          2
+        )
+      );
+
+      checks.push(
+        createCheck(
+          "语言列表异常",
+          languages.length === 0,
+          languages.length ? languages.join(", ") : "languages 为空",
+          2
+        )
+      );
+
+      checks.push(
+        createCheck(
+          "WebGL 渲染可疑",
+          /swiftshader|mesa|llvmpipe|software/i.test((webgl.vendor + " " + webgl.renderer).toLowerCase()),
+          "vendor: " + webgl.vendor + " / renderer: " + webgl.renderer,
+          2
+        )
+      );
+
+      checks.push(
+        createCheck(
+          "窗口尺寸异常",
+          window.outerWidth === 0 || window.outerHeight === 0,
+          "outer: " + window.outerWidth + " x " + window.outerHeight,
+          1
+        )
+      );
+
+      checks.push(
+        createCheck(
+          "硬件并发可疑",
+          Number(nav.hardwareConcurrency || 0) > 0 && Number(nav.hardwareConcurrency) <= 1,
+          "hardwareConcurrency = " + (nav.hardwareConcurrency ?? "unknown"),
+          1
+        )
+      );
+
+      checks.push(
+        createCheck(
+          "设备内存可疑",
+          Number(nav.deviceMemory || 0) > 0 && Number(nav.deviceMemory) < 2,
+          "deviceMemory = " + (nav.deviceMemory ?? "unknown"),
+          1
+        )
+      );
+
+      try {
+        if (navigator.permissions && navigator.permissions.query) {
+          const p = await navigator.permissions.query({ name: "notifications" });
+          checks.push(
+            createCheck(
+              "通知权限默认拒绝",
+              Notification.permission === "denied" && p.state === "denied",
+              "Notification.permission = " + Notification.permission + ", permissions = " + p.state,
+              1
+            )
+          );
+        } else {
+          checks.push(createCheck("通知权限检查", false, "当前浏览器不支持 permissions API", 0));
+        }
+      } catch (err) {
+        checks.push(createCheck("通知权限检查", false, "检查异常: " + err, 0));
+      }
+
+      checks.push(
+        createCheck("时区", false, timezone, 0)
+      );
+
+      const score = checks.reduce((sum, item) => sum + (item.suspicious ? item.weight : 0), 0);
+      const suspiciousCount = checks.filter((item) => item.suspicious).length;
+      renderResult(checks, score, suspiciousCount);
+    }
+
+    function renderResult(checks, score, suspiciousCount) {
+      const body = document.getElementById("result-body");
+      body.innerHTML = "";
+
+      checks.forEach((item) => {
+        const tr = document.createElement("tr");
+
+        const tdName = document.createElement("td");
+        tdName.textContent = item.name;
+
+        const tdState = document.createElement("td");
+        const tag = document.createElement("span");
+        tag.className = "tag " + (item.suspicious ? "tag-risk" : "tag-ok");
+        tag.textContent = item.suspicious ? "可疑" : "正常";
+        tdState.appendChild(tag);
+
+        const tdDetail = document.createElement("td");
+        tdDetail.textContent = item.detail;
+
+        tr.appendChild(tdName);
+        tr.appendChild(tdState);
+        tr.appendChild(tdDetail);
+        body.appendChild(tr);
+      });
+
+      const scoreText = document.getElementById("score-text");
+      const resultText = document.getElementById("result-text");
+      const timeText = document.getElementById("time-text");
+
+      scoreText.textContent = String(score);
+      scoreText.className = "summary-value " + (score >= 8 ? "risk-high" : score >= 4 ? "risk-mid" : "risk-low");
+
+      if (score >= 8) {
+        resultText.textContent = "高风险（易被判为自动化）";
+        resultText.className = "summary-value risk-high";
+      } else if (score >= 4) {
+        resultText.textContent = "中风险（建议继续排查）";
+        resultText.className = "summary-value risk-mid";
+      } else {
+        resultText.textContent = "低风险（更接近常规浏览器）";
+        resultText.className = "summary-value risk-low";
+      }
+
+      timeText.textContent = new Date().toLocaleString("zh-CN");
+      timeText.className = "summary-value";
+
+      console.log("[Detection] score=", score, "suspicious=", suspiciousCount, checks);
+    }
+
+    document.getElementById("btn-run").addEventListener("click", runDetection);
+    runDetection();
+  </script>
+</body>
+</html>
