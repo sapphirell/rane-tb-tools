@@ -1208,6 +1208,68 @@ class XHSCrawler:
         tail = f"_{suffix}" if suffix else ""
         return os.path.join(log_dir, f"{self.browser_name}driver_{self.profile_key}_{ts}{tail}.log")
 
+    @staticmethod
+    def _extract_major_version(version_text: str) -> int:
+        """从版本文本中提取主版本号，提取失败时返回 0。"""
+        match = re.search(r"(\d+)\.", str(version_text or ""))
+        if not match:
+            return 0
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 0
+
+    def _detect_browser_major_version(self, browser_name: str) -> int:
+        """读取本机浏览器主版本号，用于优先匹配对应版本的 driver 缓存。"""
+        if os.name == "nt":
+            commands = [
+                ["reg", "query", r"HKEY_CURRENT_USER\Software\Google\Chrome\BLBeacon", "/v", "version"],
+                ["reg", "query", r"HKEY_CURRENT_USER\Software\Microsoft\Edge\BLBeacon", "/v", "version"],
+            ] if browser_name == "chrome" else [
+                ["reg", "query", r"HKEY_CURRENT_USER\Software\Microsoft\Edge\BLBeacon", "/v", "version"],
+                ["reg", "query", r"HKEY_CURRENT_USER\Software\Google\Chrome\BLBeacon", "/v", "version"],
+            ]
+        else:
+            commands = [
+                ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"],
+                ["google-chrome", "--version"],
+                ["chromium", "--version"],
+                ["chromium-browser", "--version"],
+            ] if browser_name == "chrome" else [
+                ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "--version"],
+                ["microsoft-edge", "--version"],
+                ["microsoft-edge-stable", "--version"],
+            ]
+
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+            except Exception:
+                continue
+            output = (result.stdout or result.stderr or "").strip()
+            major_version = self._extract_major_version(output)
+            if major_version > 0:
+                return major_version
+        return 0
+
+    def _sort_cached_driver_candidates(self, cache_candidates: List[str], browser_name: str) -> List[str]:
+        """优先选择与当前浏览器主版本一致的缓存 driver，其次按最近更新时间排序。"""
+        browser_major = self._detect_browser_major_version(browser_name)
+
+        def sort_key(path: str) -> Tuple[int, int]:
+            driver_major = self._extract_major_version(path)
+            version_match = 1 if browser_major > 0 and driver_major == browser_major else 0
+            mtime = int(os.path.getmtime(path)) if os.path.exists(path) else 0
+            return version_match, mtime
+
+        return sorted(set(cache_candidates), key=sort_key, reverse=True)
+
     def _resolve_driver_executable(self, browser_name: str) -> str:
         base_dir = get_resource_base_dir()
         bin_dir = os.path.join(base_dir, "bin")
@@ -1248,11 +1310,7 @@ class XHSCrawler:
                     glob.glob(os.path.join(home_dir, "Library", "Caches", "selenium", "msedgedriver", "**",
                                            "edgedriver"), recursive=True)
                 )
-                cache_candidates = sorted(
-                    set(cache_candidates),
-                    key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
-                    reverse=True
-                )
+                cache_candidates = self._sort_cached_driver_candidates(cache_candidates, "edge")
                 candidates.extend(cache_candidates)
                 system_edge_driver = shutil.which("msedgedriver") or shutil.which("edgedriver")
                 if system_edge_driver:
@@ -1277,11 +1335,7 @@ class XHSCrawler:
                     glob.glob(os.path.join(home_dir, "Library", "Caches", "selenium", "chromedriver", "**",
                                            "chromedriver"), recursive=True)
                 )
-                cache_candidates = sorted(
-                    set(cache_candidates),
-                    key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
-                    reverse=True
-                )
+                cache_candidates = self._sort_cached_driver_candidates(cache_candidates, "chrome")
                 candidates.extend(cache_candidates)
                 system_chrome_driver = shutil.which("chromedriver")
                 if system_chrome_driver:
