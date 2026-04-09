@@ -750,12 +750,15 @@ class XHSCrawler:
             *,
             get_scroll_sleep: Optional[Callable[[], float]] = None,
             get_detail_sleep: Optional[Callable[[], float]] = None,
+            get_login_qr_offset: Optional[Callable[[], Tuple[int, int]]] = None,
             on_sleep: Optional[Callable[[str, float, float], None]] = None,
             on_captcha_detected: Optional[Callable[..., None]] = None,
+            on_login_qr_detected: Optional[Callable[[Dict], None]] = None,
             skip_event: Optional[threading.Event] = None,
             pause_event: Optional[threading.Event] = None,
             max_scroll_default: int = 20,
             headless: bool = False,
+            run_in_background: bool = False,
             browser: str = "chrome",
             logger: Optional[logging.Logger] = None
     ):
@@ -765,15 +768,20 @@ class XHSCrawler:
         self.insert_callback = insert_callback
         self.get_scroll_sleep = get_scroll_sleep or (lambda: 10.5)
         self.get_detail_sleep = get_detail_sleep or (lambda: 5.0)
+        self.get_login_qr_offset = get_login_qr_offset or (lambda: (0, 0))
         self.on_sleep = on_sleep
         self.on_captcha_detected = on_captcha_detected
+        self.on_login_qr_detected = on_login_qr_detected
         self.skip_event = skip_event or threading.Event()
         self.pause_event = pause_event or threading.Event()
         self.pause_reason = ''
         self._pause_logged = False
+        self._last_login_qr_fingerprint = ""
+        self._last_login_qr_emit_ts = 0.0
         self.max_scroll_default = int(max_scroll_default)
         self.logger = logger or logging.getLogger(__name__)
         self.stop_requested = False
+        self.run_in_background = bool(run_in_background) and (not bool(headless))
         self.browser_name = self._normalize_browser_name(browser)
         self.accept_language = "zh-CN,zh;q=0.9,en;q=0.8"
         self.locale = "zh-CN"
@@ -866,6 +874,11 @@ class XHSCrawler:
         # 再补一层运行期反检测脚本，重点清理 cdc_* 与 webdriver 暴露。
         self._inject_runtime_stealth_overrides()
         self._apply_cdp_anti_detection(headless=headless)
+        if self.run_in_background:
+            if self._minimize_browser_window():
+                self.logger.info("后台模式已启用：浏览器已最小化")
+            else:
+                self.logger.warning("后台模式已启用，但最小化浏览器失败，请手动最小化窗口")
 
         self.all_links = set()
         self.collected_quick_data = []
@@ -1127,6 +1140,8 @@ class XHSCrawler:
         options = ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
+        elif self.run_in_background:
+            options.add_argument("--start-minimized")
         else:
             options.add_argument("--start-maximized")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
@@ -1154,6 +1169,8 @@ class XHSCrawler:
         options = EdgeOptions()
         if headless:
             options.add_argument("--headless=new")
+        elif self.run_in_background:
+            options.add_argument("--start-minimized")
         else:
             options.add_argument("--start-maximized")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
@@ -1341,6 +1358,49 @@ class XHSCrawler:
             return self._start_edge_with_profile(profile_dir, headless=headless)
         return self._start_chrome_with_profile(profile_dir, headless=headless)
 
+    def _set_window_state_via_cdp(self, state: str) -> bool:
+        if state not in {"normal", "minimized", "maximized", "fullscreen"}:
+            return False
+        try:
+            info = self.driver.execute_cdp_cmd("Browser.getWindowForTarget", {})
+            window_id = info.get("windowId")
+            if window_id is None:
+                return False
+            self.driver.execute_cdp_cmd(
+                "Browser.setWindowBounds",
+                {"windowId": window_id, "bounds": {"windowState": state}}
+            )
+            return True
+        except Exception:
+            return False
+
+    def _minimize_browser_window(self) -> bool:
+        try:
+            if self._set_window_state_via_cdp("minimized"):
+                return True
+            self.driver.minimize_window()
+            return True
+        except Exception:
+            return False
+
+    def _restore_browser_window_for_verify(self) -> bool:
+        try:
+            restored = self._set_window_state_via_cdp("normal")
+            if not restored:
+                try:
+                    self.driver.maximize_window()
+                    restored = True
+                except Exception:
+                    restored = False
+            if restored:
+                try:
+                    self.driver.switch_to.window(self.driver.current_window_handle)
+                except Exception:
+                    pass
+            return restored
+        except Exception:
+            return False
+
     def _clean_profile_runtime_locks(self, profile_dir: str):
         targets = [
             os.path.join(profile_dir, "SingletonLock"),
@@ -1411,6 +1471,25 @@ class XHSCrawler:
 
             def _handle_detected(captcha_type: str, reason: str):
                 self.logger.warning(reason)
+                if self.run_in_background:
+                    if self._restore_browser_window_for_verify():
+                        self.logger.warning("检测到验证码：已恢复浏览器窗口，等待人工处理")
+                    else:
+                        self.logger.warning("检测到验证码：尝试恢复浏览器窗口失败，请手动切换浏览器处理")
+                try:
+                    captured = self._try_capture_login_qr(
+                        stage=f"{where}-captcha",
+                        reason=f"{captcha_type}:{where}",
+                        force_center=True,
+                        container_selectors=["#captcha-div", "#red-captcha", ".captcha-modal-content"],
+                        override_offset=(0, 0)
+                    )
+                    if captured:
+                        self.logger.info("已自动捕获风控二维码并回显到 GUI（captcha_type=%s, where=%s）", captcha_type, where)
+                    else:
+                        self.logger.info("未捕获到风控二维码（captcha_type=%s, where=%s），请在浏览器手动处理", captcha_type, where)
+                except Exception as cap_err:
+                    self.logger.warning("风控二维码捕获异常: %s", cap_err)
                 if can_pause:
                     try:
                         self.on_captcha_detected(where, captcha_type)
@@ -1422,6 +1501,9 @@ class XHSCrawler:
                         self.driver.refresh()
                     except Exception:
                         pass
+                    if self.run_in_background:
+                        if self._minimize_browser_window():
+                            self.logger.info("恢复运行后已重新最小化窗口")
                 else:
                     self.logger.warning("当前无暂停回调，需在浏览器中手动完成验证后继续。")
                     time.sleep(2.0)
@@ -1491,9 +1573,17 @@ class XHSCrawler:
         return out
 
     def _has_login_marker(self, *, allow_cookie_fallback: bool = True) -> bool:
-        # 优先使用强登录态标记：可见的 /user/profile/ 链接或头像区域
+        # 若页面明确出现“登录”入口，优先判定为未登录，避免误把公共页面元素当作登录态
+        logged_out_reason = self._detect_logged_out_reason()
+        if logged_out_reason:
+            return False
+
+        # 优先使用强登录态标记：侧边栏/头部里的个人中心链接（公共 feed 区域的 profile 链接不算）
         try:
-            profile_links = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='/user/profile/']")
+            profile_links = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                ".side-bar-component a[href*='/user/profile/'], header a[href*='/user/profile/']"
+            )
             for link in profile_links:
                 try:
                     if not link.is_displayed():
@@ -1507,16 +1597,21 @@ class XHSCrawler:
             pass
 
         selectors = [
-            ".user.side-bar-component",
-            ".side-bar-component .user",
-            "a[href*='/user/profile/'] img",
-            ".author-container a.name",
-            ".avatar img",
+            ".side-bar-component a[href*='/user/profile/']",
+            "header a[href*='/user/profile/']",
         ]
         for selector in selectors:
             try:
                 els = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                if any(e.is_displayed() for e in els):
+                for e in els:
+                    if not e.is_displayed():
+                        continue
+                    href = str(e.get_attribute("href") or "")
+                    if "/user/profile/" not in href:
+                        continue
+                    txt = str(e.text or "").strip()
+                    if "登录" in txt:
+                        continue
                     return True
             except Exception:
                 continue
@@ -1532,6 +1627,343 @@ class XHSCrawler:
         except Exception:
             pass
         return False
+
+    def _detect_logged_out_reason(self) -> str:
+        checks = [
+            ("login-btn-css", By.CSS_SELECTOR, "button[class*='login'], a[class*='login'], div[class*='login']"),
+            ("login-text-btn", By.XPATH, "//button[contains(normalize-space(.), '登录')]"),
+            ("login-text-link", By.XPATH, "//a[contains(normalize-space(.), '登录')]"),
+            ("login-text-div", By.XPATH, "//div[contains(normalize-space(.), '登录') and @role='button']"),
+        ]
+        for label, by, selector in checks:
+            try:
+                els = self.driver.find_elements(by, selector)
+                for e in els:
+                    try:
+                        if not e.is_displayed():
+                            continue
+                        txt = str(e.text or "").strip()
+                        if "登录" in txt or "扫码" in txt:
+                            return f"{label}:{txt[:30]}"
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return ""
+
+    def _emit_login_qr_event(self, payload: Dict):
+        cb = self.on_login_qr_detected
+        if not cb:
+            return
+        try:
+            cb(payload)
+        except Exception:
+            pass
+
+    def _notify_login_qr_cleared(self, stage: str, reason: str = ""):
+        self._last_login_qr_fingerprint = ""
+        self._last_login_qr_emit_ts = 0.0
+        self._emit_login_qr_event({
+            "cleared": True,
+            "stage": stage,
+            "reason": reason,
+            "ts": int(time.time())
+        })
+
+    def _safe_element_rect(self, elem) -> Optional[Dict[str, float]]:
+        try:
+            if not elem or not elem.is_displayed():
+                return None
+            r = elem.rect or {}
+            x = float(r.get("x") or 0.0)
+            y = float(r.get("y") or 0.0)
+            w = float(r.get("width") or 0.0)
+            h = float(r.get("height") or 0.0)
+            if w <= 0 or h <= 0:
+                return None
+            return {"x": x, "y": y, "width": w, "height": h}
+        except Exception:
+            return None
+
+    @staticmethod
+    def _rect_contains(outer: Dict[str, float], inner: Dict[str, float]) -> bool:
+        try:
+            ox, oy = float(outer["x"]), float(outer["y"])
+            ow, oh = float(outer["width"]), float(outer["height"])
+            ix, iy = float(inner["x"]), float(inner["y"])
+            iw, ih = float(inner["width"]), float(inner["height"])
+            return (
+                ix >= ox and iy >= oy and
+                ix + iw <= ox + ow and
+                iy + ih <= oy + oh
+            )
+        except Exception:
+            return False
+
+    def _find_login_context_rects(self) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+        anchor_rects: List[Dict[str, float]] = []
+        modal_rects: List[Dict[str, float]] = []
+
+        anchor_xpath = (
+            "//*[contains(normalize-space(.), '扫码登录') "
+            "or contains(normalize-space(.), '请先登录') "
+            "or contains(normalize-space(.), '登录后查看更多') "
+            "or contains(normalize-space(.), '登录以继续') "
+            "or contains(normalize-space(.), '二维码登录')]"
+        )
+        try:
+            anchors = self.driver.find_elements(By.XPATH, anchor_xpath)
+        except Exception:
+            anchors = []
+
+        for a in anchors:
+            r = self._safe_element_rect(a)
+            if r:
+                anchor_rects.append(r)
+            try:
+                host = self.driver.execute_script(
+                    "return arguments[0] && arguments[0].closest("
+                    "'[class*=login],[class*=modal],[class*=dialog],[class*=popup]'"
+                    ");",
+                    a
+                )
+            except Exception:
+                host = None
+            hr = self._safe_element_rect(host) if host is not None else None
+            if hr:
+                modal_rects.append(hr)
+
+        # 去重（保留大致不同区域）
+        uniq_modal: List[Dict[str, float]] = []
+        for r in modal_rects:
+            duplicated = False
+            for u in uniq_modal:
+                if (
+                    abs(r["x"] - u["x"]) < 8 and
+                    abs(r["y"] - u["y"]) < 8 and
+                    abs(r["width"] - u["width"]) < 8 and
+                    abs(r["height"] - u["height"]) < 8
+                ):
+                    duplicated = True
+                    break
+            if not duplicated:
+                uniq_modal.append(r)
+
+        return anchor_rects, uniq_modal
+
+    def _find_visible_rects_by_selectors(self, selectors: List[str]) -> List[Dict[str, float]]:
+        rects: List[Dict[str, float]] = []
+        for selector in selectors:
+            try:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                elems = []
+            for elem in elems:
+                r = self._safe_element_rect(elem)
+                if r:
+                    rects.append(r)
+        uniq: List[Dict[str, float]] = []
+        for r in rects:
+            duplicated = False
+            for u in uniq:
+                if (
+                    abs(r["x"] - u["x"]) < 8 and
+                    abs(r["y"] - u["y"]) < 8 and
+                    abs(r["width"] - u["width"]) < 8 and
+                    abs(r["height"] - u["height"]) < 8
+                ):
+                    duplicated = True
+                    break
+            if not duplicated:
+                uniq.append(r)
+        return uniq
+
+    def _try_capture_login_qr(
+            self,
+            *,
+            stage: str,
+            reason: str,
+            force_center: bool = False,
+            container_selectors: Optional[List[str]] = None,
+            override_offset: Optional[Tuple[int, int]] = None
+    ) -> bool:
+        selectors = []
+        if container_selectors:
+            for csel in container_selectors:
+                selectors.append((f"container-img:{csel}", f"{csel} img"))
+                selectors.append((f"container-canvas:{csel}", f"{csel} canvas"))
+        selectors.extend([
+            ("login-qrcode-img", "[class*='login'] [class*='qrcode'] img, [class*='qrcode'] img"),
+            ("login-qrcode-canvas", "[class*='login'] [class*='qrcode'] canvas, [class*='qrcode'] canvas"),
+            ("qrcode-img-src", "img[src*='qrcode'], img[src*='qr']"),
+            ("login-img", "[class*='login'] img"),
+            ("dialog-img", "[class*='modal'] img, [class*='dialog'] img, [class*='popup'] img"),
+            ("captcha-img", "[class*='captcha'] img"),
+            ("captcha-canvas", "[class*='captcha'] canvas"),
+        ])
+
+        now = time.time()
+        if self._last_login_qr_emit_ts > 0 and now - self._last_login_qr_emit_ts < 1.2:
+            return False
+
+        anchor_rects, modal_rects = self._find_login_context_rects()
+        container_rects = self._find_visible_rects_by_selectors(container_selectors or []) if container_selectors else []
+        try:
+            if override_offset is not None:
+                offset_x, offset_y = int(override_offset[0]), int(override_offset[1])
+            else:
+                offset_x, offset_y = self.get_login_qr_offset()
+                offset_x = int(offset_x)
+                offset_y = int(offset_y)
+        except Exception:
+            offset_x, offset_y = 0, 0
+
+        try:
+            viewport = self.driver.execute_script(
+                "return {w: window.innerWidth || 0, h: window.innerHeight || 0};"
+            ) or {}
+            vw = float(viewport.get("w") or 0.0)
+            vh = float(viewport.get("h") or 0.0)
+        except Exception:
+            vw, vh = 0.0, 0.0
+
+        candidates: List[Tuple[float, str, str, object, Dict[str, float]]] = []
+        for source, selector in selectors:
+            try:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                continue
+            for elem in elems:
+                try:
+                    rect = self._safe_element_rect(elem)
+                    if not rect:
+                        continue
+                    w = rect["width"]
+                    h = rect["height"]
+                    if w < 90 or h < 90 or w > 640 or h > 640:
+                        continue
+                    ratio = w / h if h > 0 else 0
+                    if ratio < 0.65 or ratio > 1.45:
+                        continue
+
+                    cx = rect["x"] + w / 2.0
+                    cy = rect["y"] + h / 2.0
+
+                    score = 0.0
+                    source_weight = {
+                        "captcha-img": 130.0,
+                        "captcha-canvas": 130.0,
+                        "login-qrcode-img": 120.0,
+                        "login-qrcode-canvas": 110.0,
+                        "qrcode-img-src": 80.0,
+                        "login-img": 35.0,
+                        "dialog-img": 20.0,
+                    }.get(source, 0.0)
+                    if source.startswith("container-img"):
+                        source_weight = 145.0
+                    elif source.startswith("container-canvas"):
+                        source_weight = 145.0
+                    score += source_weight
+
+                    # 尺寸和比例越像二维码，分越高
+                    score += max(0.0, 60.0 - abs(min(w, h) - 220.0) * 0.35)
+                    score += max(0.0, 35.0 - abs(1.0 - ratio) * 120.0)
+
+                    # 倾向登录弹窗内元素
+                    inside_modal = any(self._rect_contains(mr, rect) for mr in modal_rects) if modal_rects else False
+                    if inside_modal:
+                        score += 95.0
+                    elif modal_rects:
+                        score -= 55.0
+
+                    inside_container = any(self._rect_contains(cr, rect) for cr in container_rects) if container_rects else False
+                    if inside_container:
+                        score += 120.0
+                    elif container_rects:
+                        score -= 85.0
+
+                    if force_center:
+                        if container_rects:
+                            # 风控码常在弹层正中，优先靠近容器中心
+                            for cr in container_rects:
+                                tx = cr["x"] + cr["width"] / 2.0
+                                ty = cr["y"] + cr["height"] / 2.0
+                                score += max(0.0, 55.0 - abs(cx - tx) * 0.14)
+                                score += max(0.0, 55.0 - abs(cy - ty) * 0.14)
+                        elif vw > 0 and vh > 0:
+                            # 无容器时退化到视口中心
+                            score += max(0.0, 50.0 - abs(cx - vw / 2.0) * 0.12)
+                            score += max(0.0, 50.0 - abs(cy - vh / 2.0) * 0.12)
+                    else:
+                        # 倾向登录文案左侧元素（Cookie 失效登录态）
+                        for ar in anchor_rects:
+                            ax = ar["x"] + ar["width"] / 2.0
+                            ay = ar["y"] + ar["height"] / 2.0
+                            target_x = ax + float(offset_x)
+                            target_y = ay + float(offset_y)
+                            score += max(0.0, 44.0 - abs(cx - target_x) * 0.12)
+                            score += max(0.0, 28.0 - abs(cy - target_y) * 0.10)
+                            if cx < ax:
+                                score += 10.0
+
+                    # 略偏向视口中间区域，避免命中左侧列表缩略图
+                    if vw > 0 and vh > 0:
+                        dx = abs(cx - vw / 2.0) / max(vw / 2.0, 1.0)
+                        dy = abs(cy - vh / 2.0) / max(vh / 2.0, 1.0)
+                        score += max(-25.0, 20.0 - (dx + dy) * 40.0)
+
+                    candidates.append((score, source, selector, elem, rect))
+                except Exception:
+                    continue
+
+        if not candidates:
+            return False
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top_score, top_source, top_selector, top_elem, top_rect = candidates[0]
+
+        try:
+            self.logger.info(
+                "二维码候选已选中: score=%.1f, source=%s, rect=(x=%.1f,y=%.1f,w=%.1f,h=%.1f), offset=(%d,%d), reason=%s",
+                top_score, top_source,
+                top_rect["x"], top_rect["y"], top_rect["width"], top_rect["height"],
+                offset_x, offset_y, reason
+            )
+        except Exception:
+            pass
+
+        try:
+            png_bytes = top_elem.screenshot_as_png
+            if not png_bytes or len(png_bytes) < 300:
+                return False
+        except Exception:
+            return False
+
+        fp = hashlib.sha1(png_bytes).hexdigest()
+        if fp == self._last_login_qr_fingerprint and (now - self._last_login_qr_emit_ts) < 8.0:
+            return False
+
+        self._last_login_qr_fingerprint = fp
+        self._last_login_qr_emit_ts = now
+
+        payload = {
+            "cleared": False,
+            "stage": stage,
+            "reason": reason,
+            "source": top_source,
+            "selector": top_selector,
+            "url": str(self.driver.current_url or ""),
+            "x": int(round(top_rect["x"])),
+            "y": int(round(top_rect["y"])),
+            "width": int(round(top_rect["width"])),
+            "height": int(round(top_rect["height"])),
+            "offset_x": int(offset_x),
+            "offset_y": int(offset_y),
+            "png_b64": base64.b64encode(png_bytes).decode("ascii"),
+            "ts": int(now),
+        }
+        self._emit_login_qr_event(payload)
+        return True
 
     def _detect_captcha_or_risk_reason(self) -> str:
         checks = [
@@ -1589,6 +2021,9 @@ class XHSCrawler:
             risk_reason = self._detect_captcha_or_risk_reason()
             if risk_reason:
                 return False, f"{where} 页触发风控/验证: {risk_reason}"
+            logged_out_reason = self._detect_logged_out_reason()
+            if logged_out_reason:
+                return False, f"{where} 页检测到未登录信号: {logged_out_reason}"
 
         if not self._has_login_marker(allow_cookie_fallback=allow_cookie_fallback):
             return False, "跨页后未检测到登录态标记"
@@ -1611,13 +2046,17 @@ class XHSCrawler:
             try:
                 if not self._has_login_marker(allow_cookie_fallback=allow_cookie_fallback):
                     last_reason = "未检测到登录态标记"
+                    self._try_capture_login_qr(stage=stage, reason=last_reason)
                     time.sleep(1.0)
                     continue
 
                 ok, reason = self._validate_cross_page_session(allow_cookie_fallback=allow_cookie_fallback)
                 if ok:
+                    self._notify_login_qr_cleared(stage=stage, reason="会话已稳定")
                     return True, ""
                 last_reason = reason or "跨页验证未通过"
+                if ("登录" in last_reason) or ("未检测到登录态" in last_reason):
+                    self._try_capture_login_qr(stage=stage, reason=last_reason)
                 self.logger.info(f"{stage} 会话未稳定：{last_reason}，等待重试...")
             except Exception as exc:
                 last_reason = str(exc)
@@ -1657,10 +2096,11 @@ class XHSCrawler:
                 ok, reason = self._wait_for_session_ready(
                     timeout_sec=30,
                     stage="Cookie登录",
-                    allow_cookie_fallback=True
+                    allow_cookie_fallback=False
                 )
                 if ok:
                     self.logger.info("Cookie 登录成功（已通过跨页会话校验）")
+                    self._notify_login_qr_cleared(stage="Cookie登录", reason="Cookie 登录成功")
                     sleep(1)
                     return self.driver.get_cookies()
                 self.logger.warning(f"Cookie 登录会话不稳定：{reason}，将转为手动登录")
@@ -1677,6 +2117,7 @@ class XHSCrawler:
         if not ok:
             raise RuntimeError(f"扫码后会话仍未稳定：{reason}")
         self.logger.info('扫码登录成功（会话稳定）')
+        self._notify_login_qr_cleared(stage="扫码登录", reason="扫码登录成功")
         return self.driver.get_cookies()
 
     def extract_current_links(self):
@@ -2019,166 +2460,225 @@ class App:
         self._ui_pump_after_id = None
         self._captcha_prompt_active = False
         self.master.title("小红书爬虫 · 采集控制台（数据库Cookie管理版）")
-        self.master.geometry("1000x980")
+        self.master.geometry("920x820")
+        compact_style = ttk.Style(self.master)
+        compact_style.configure("Compact.TButton", padding=(4, 1))
+        compact_style.configure("Compact.TCheckbutton", padding=(0, 0))
+        compact_style.configure("Compact.TRadiobutton", padding=(0, 0))
 
         # --- 账号管理区域 ---
         acc_frame = ttk.LabelFrame(master, text="账号管理")
-        acc_frame.pack(fill="x", padx=10, pady=10)
+        acc_frame.pack(fill="x", padx=8, pady=(8, 6))
 
-        ttk.Label(acc_frame, text="选择登录账号：").pack(side='left', padx=5, pady=5)
+        ttk.Label(acc_frame, text="选择登录账号：").pack(side='left', padx=4, pady=4)
         self.cb_account = ttk.Combobox(acc_frame, state='readonly', width=30)
-        self.cb_account.pack(side='left', padx=5, pady=5)
+        self.cb_account.pack(side='left', padx=4, pady=4)
         self.cb_account.bind("<<ComboboxSelected>>", self.on_account_selected)
 
-        self.btn_add_acc = ttk.Button(acc_frame, text="+ 新增/更新账号", command=self.add_new_account)
-        self.btn_add_acc.pack(side='left', padx=10, pady=5)
+        self.btn_add_acc = ttk.Button(
+            acc_frame, text="+ 新增/更新账号", command=self.add_new_account, style="Compact.TButton"
+        )
+        self.btn_add_acc.pack(side='left', padx=(8, 4), pady=4)
 
-        self.btn_remove_acc = ttk.Button(acc_frame, text="- 移除账号", command=self.remove_account)
-        self.btn_remove_acc.pack(side='left', padx=5, pady=5)
+        self.btn_remove_acc = ttk.Button(
+            acc_frame, text="- 移除账号", command=self.remove_account, style="Compact.TButton"
+        )
+        self.btn_remove_acc.pack(side='left', padx=4, pady=4)
 
-        ttk.Button(acc_frame, text="刷新列表", command=self.load_accounts).pack(side='left', padx=5)
+        ttk.Button(
+            acc_frame, text="刷新列表", command=self.load_accounts, style="Compact.TButton"
+        ).pack(side='left', padx=4, pady=4)
 
         # --- 采集参数 ---
         frm = ttk.LabelFrame(master, text="采集参数（可运行中随时修改）")
-        frm.pack(fill="x", padx=10, pady=10)
+        frm.pack(fill="x", padx=8, pady=(0, 6))
 
-        ttk.Label(frm, text="滚动等待(秒)：").grid(row=0, column=0, padx=6, pady=6, sticky='e')
+        ttk.Label(frm, text="滚动等待(秒)：").grid(row=0, column=0, padx=4, pady=4, sticky='e')
         self.var_scroll_sleep = tk.StringVar(value="10.5")
-        ttk.Entry(frm, textvariable=self.var_scroll_sleep, width=10).grid(row=0, column=1, padx=6, pady=6, sticky='w')
+        ttk.Entry(frm, textvariable=self.var_scroll_sleep, width=9).grid(row=0, column=1, padx=4, pady=4, sticky='w')
 
-        ttk.Label(frm, text="详情等待(秒)：").grid(row=0, column=2, padx=6, pady=6, sticky='e')
+        ttk.Label(frm, text="详情等待(秒)：").grid(row=0, column=2, padx=4, pady=4, sticky='e')
         self.var_detail_sleep = tk.StringVar(value="5.0")
-        ttk.Entry(frm, textvariable=self.var_detail_sleep, width=10).grid(row=0, column=3, padx=6, pady=6, sticky='w')
+        ttk.Entry(frm, textvariable=self.var_detail_sleep, width=9).grid(row=0, column=3, padx=4, pady=4, sticky='w')
 
-        ttk.Label(frm, text="最大滚动次数：").grid(row=0, column=4, padx=6, pady=6, sticky='e')
+        ttk.Label(frm, text="最大滚动次数：").grid(row=0, column=4, padx=4, pady=4, sticky='e')
         self.var_max_scroll = tk.StringVar(value="20")
-        ttk.Entry(frm, textvariable=self.var_max_scroll, width=10).grid(row=0, column=5, padx=6, pady=6, sticky='w')
+        ttk.Entry(frm, textvariable=self.var_max_scroll, width=9).grid(row=0, column=5, padx=4, pady=4, sticky='w')
 
-        ttk.Label(frm, text="浏览器：").grid(row=0, column=6, padx=6, pady=6, sticky='e')
+        ttk.Label(frm, text="浏览器：").grid(row=0, column=6, padx=4, pady=4, sticky='e')
         self.var_browser = tk.StringVar(value="chrome")
         self.cb_browser = ttk.Combobox(
             frm,
             state='readonly',
-            width=10,
+            width=9,
             textvariable=self.var_browser,
             values=("chrome", "edge")
         )
-        self.cb_browser.grid(row=0, column=7, padx=6, pady=6, sticky='w')
+        self.cb_browser.grid(row=0, column=7, padx=4, pady=4, sticky='w')
 
         self.var_headless = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="无头模式(Headless)", variable=self.var_headless).grid(row=0, column=8, padx=6,
-                                                                                         pady=6)
+        ttk.Checkbutton(
+            frm, text="无头模式(Headless)", variable=self.var_headless, style="Compact.TCheckbutton"
+        ).grid(row=0, column=8, padx=4, pady=4)
+        self.var_background_mode = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frm, text="后台最小化运行", variable=self.var_background_mode, style="Compact.TCheckbutton"
+        ).grid(
+            row=0, column=9, padx=4, pady=4, sticky='w'
+        )
 
         type_frame = ttk.LabelFrame(master, text="采集对象")
-        type_frame.pack(fill='x', padx=10, pady=(0, 10))
+        type_frame.pack(fill='x', padx=8, pady=(0, 6))
         self.var_target_type = tk.StringVar(value=TargetType.BRAND)
         ttk.Radiobutton(
             type_frame, text="品牌（娃店 → spider_log）",
             value=TargetType.BRAND, variable=self.var_target_type,
-            command=lambda: self.on_target_type_change(TargetType.BRAND)
-        ).pack(side='left', padx=10, pady=6)
+            command=lambda: self.on_target_type_change(TargetType.BRAND),
+            style="Compact.TRadiobutton"
+        ).pack(side='left', padx=8, pady=4)
         ttk.Radiobutton(
             type_frame, text="艺术家（妆师/毛娘 → artist_spider_log）",
             value=TargetType.ARTIST, variable=self.var_target_type,
-            command=lambda: self.on_target_type_change(TargetType.ARTIST)
-        ).pack(side='left', padx=10, pady=6)
+            command=lambda: self.on_target_type_change(TargetType.ARTIST),
+            style="Compact.TRadiobutton"
+        ).pack(side='left', padx=8, pady=4)
 
         shutdown_frame = ttk.LabelFrame(master, text="自动关机")
-        shutdown_frame.pack(fill='x', padx=10, pady=(0, 10))
+        shutdown_frame.pack(fill='x', padx=8, pady=(0, 6))
 
-        ttk.Label(shutdown_frame, text="定时关机(分钟)：").grid(row=0, column=0, padx=6, pady=6, sticky='e')
+        ttk.Label(shutdown_frame, text="定时关机(分钟)：").grid(row=0, column=0, padx=4, pady=4, sticky='e')
         self.var_shutdown_timer_minutes = tk.StringVar(value="")
         ttk.Entry(shutdown_frame, textvariable=self.var_shutdown_timer_minutes, width=10).grid(
-            row=0, column=1, padx=6, pady=6, sticky='w'
+            row=0, column=1, padx=4, pady=4, sticky='w'
         )
 
         self.btn_schedule_shutdown = ttk.Button(
-            shutdown_frame, text="设置/重设定时关机", command=self.schedule_timed_shutdown
+            shutdown_frame, text="设置/重设定时关机", command=self.schedule_timed_shutdown, style="Compact.TButton"
         )
-        self.btn_schedule_shutdown.grid(row=0, column=2, padx=6, pady=6, sticky='w')
+        self.btn_schedule_shutdown.grid(row=0, column=2, padx=4, pady=4, sticky='w')
 
         self.btn_cancel_shutdown = ttk.Button(
-            shutdown_frame, text="取消关机计划", command=self.cancel_scheduled_shutdown, state='disabled'
+            shutdown_frame, text="取消关机计划", command=self.cancel_scheduled_shutdown, state='disabled',
+            style="Compact.TButton"
         )
-        self.btn_cancel_shutdown.grid(row=0, column=3, padx=6, pady=6, sticky='w')
+        self.btn_cancel_shutdown.grid(row=0, column=3, padx=4, pady=4, sticky='w')
 
         self.var_shutdown_after_finish = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             shutdown_frame,
             text="抓取完毕后自动关机（提前1分钟提醒）",
-            variable=self.var_shutdown_after_finish
-        ).grid(row=0, column=4, padx=6, pady=6, sticky='w')
+            variable=self.var_shutdown_after_finish,
+            style="Compact.TCheckbutton"
+        ).grid(row=0, column=4, padx=4, pady=4, sticky='w')
 
         self.var_shutdown_status = tk.StringVar(value="关机计划：未设置")
         ttk.Label(shutdown_frame, textvariable=self.var_shutdown_status).grid(
-            row=1, column=0, columnspan=5, padx=6, pady=(0, 6), sticky='w'
+            row=1, column=0, columnspan=5, padx=4, pady=(0, 4), sticky='w'
         )
 
         ctrl = ttk.Frame(master)
-        ctrl.pack(fill='x', padx=10)
+        ctrl.pack(fill='x', padx=8)
 
-        self.btn_start = ttk.Button(ctrl, text="开始采集", command=self.start)
-        self.btn_stop = ttk.Button(ctrl, text="停止采集", command=self.stop, state='disabled')
-        self.btn_resume = ttk.Button(ctrl, text="恢复运行", command=self.resume, state='disabled')
-        self.btn_skip = ttk.Button(ctrl, text="跳过当前等待", command=self.skip_current_wait, state='disabled')
+        self.btn_start = ttk.Button(ctrl, text="开始采集", command=self.start, style="Compact.TButton")
+        self.btn_stop = ttk.Button(ctrl, text="停止采集", command=self.stop, state='disabled', style="Compact.TButton")
+        self.btn_resume = ttk.Button(ctrl, text="恢复运行", command=self.resume, state='disabled', style="Compact.TButton")
+        self.btn_skip = ttk.Button(
+            ctrl, text="跳过当前等待", command=self.skip_current_wait, state='disabled', style="Compact.TButton"
+        )
         # 新增的维护按钮
-        self.btn_maintenance = ttk.Button(ctrl, text="数据维护", command=self.run_data_maintenance)
-        self.btn_upload_images = ttk.Button(ctrl, text="上传图片", command=self.run_spider_image_upload)
-        self.btn_stop_upload = ttk.Button(ctrl, text="停止上传", command=self.stop_spider_image_upload, state='disabled')
-        self.btn_open_detection_page = ttk.Button(ctrl, text="访问检测页", command=self.open_detection_page)
-        self.btn_open_sannysoft = ttk.Button(ctrl, text="访问 SannySoft", command=self.open_sannysoft_detection_page)
+        self.btn_maintenance = ttk.Button(ctrl, text="数据维护", command=self.run_data_maintenance, style="Compact.TButton")
+        self.btn_upload_images = ttk.Button(ctrl, text="上传图片", command=self.run_spider_image_upload, style="Compact.TButton")
+        self.btn_stop_upload = ttk.Button(
+            ctrl, text="停止上传", command=self.stop_spider_image_upload, state='disabled', style="Compact.TButton"
+        )
+        self.btn_open_detection_page = ttk.Button(
+            ctrl, text="访问检测页", command=self.open_detection_page, style="Compact.TButton"
+        )
+        self.btn_open_sannysoft = ttk.Button(
+            ctrl, text="访问 SannySoft", command=self.open_sannysoft_detection_page, style="Compact.TButton"
+        )
         self.btn_delete_failed_upload = ttk.Button(
             ctrl,
             text="删除传图失败记录",
-            command=self.delete_failed_upload_records
+            command=self.delete_failed_upload_records,
+            style="Compact.TButton"
         )
-        self.btn_auto_process = ttk.Button(ctrl, text="自动处理(每1分钟): 关", command=self.toggle_auto_process)
+        self.btn_auto_process = ttk.Button(
+            ctrl, text="自动处理(每1分钟): 关", command=self.toggle_auto_process, style="Compact.TButton"
+        )
 
-        self.btn_start.pack(side='left', padx=6, pady=4)
-        self.btn_stop.pack(side='left', padx=6, pady=4)
-        self.btn_resume.pack(side='left', padx=6, pady=4)
-        self.btn_skip.pack(side='left', padx=6, pady=4)
-        self.btn_maintenance.pack(side='left', padx=6, pady=4)
-        self.btn_upload_images.pack(side='left', padx=6, pady=4)
-        self.btn_stop_upload.pack(side='left', padx=6, pady=4)
-        self.btn_open_detection_page.pack(side='left', padx=6, pady=4)
-        self.btn_open_sannysoft.pack(side='left', padx=6, pady=4)
-        self.btn_delete_failed_upload.pack(side='left', padx=6, pady=4)
-        self.btn_auto_process.pack(side='left', padx=6, pady=4)
+        self.btn_start.pack(side='left', padx=3, pady=2)
+        self.btn_stop.pack(side='left', padx=3, pady=2)
+        self.btn_resume.pack(side='left', padx=3, pady=2)
+        self.btn_skip.pack(side='left', padx=3, pady=2)
+        self.btn_maintenance.pack(side='left', padx=3, pady=2)
+        self.btn_upload_images.pack(side='left', padx=3, pady=2)
+        self.btn_stop_upload.pack(side='left', padx=3, pady=2)
+        self.btn_open_detection_page.pack(side='left', padx=3, pady=2)
+        self.btn_open_sannysoft.pack(side='left', padx=3, pady=2)
+        self.btn_delete_failed_upload.pack(side='left', padx=3, pady=2)
+        self.btn_auto_process.pack(side='left', padx=3, pady=2)
 
         self.var_status = tk.StringVar(value="就绪")
-        ttk.Label(ctrl, textvariable=self.var_status).pack(side='left', padx=12)
+        ttk.Label(ctrl, textvariable=self.var_status).pack(side='left', padx=8)
 
         info = ttk.Frame(master)
-        info.pack(fill='x', padx=10, pady=(6, 8))
+        info.pack(fill='x', padx=8, pady=(4, 6))
         self.var_duration = tk.StringVar(value="已用时：00:00:00")
         self.var_progress_text = tk.StringVar(value="进度：0 / 0 (0.0%)")
-        ttk.Label(info, textvariable=self.var_duration).pack(side='left', padx=6)
-        ttk.Label(info, textvariable=self.var_progress_text).pack(side='left', padx=18)
+        ttk.Label(info, textvariable=self.var_duration).pack(side='left', padx=4)
+        ttk.Label(info, textvariable=self.var_progress_text).pack(side='left', padx=12)
 
-        self.progress = ttk.Progressbar(master, length=940, mode='determinate', maximum=100)
-        self.progress.pack(fill='x', padx=10, pady=(0, 8))
+        self.progress = ttk.Progressbar(master, length=860, mode='determinate', maximum=100)
+        self.progress.pack(fill='x', padx=8, pady=(0, 6))
 
         sleep_frame = ttk.LabelFrame(master, text="等待进度（Sleep 读条）")
-        sleep_frame.pack(fill='x', padx=10, pady=(0, 10))
+        sleep_frame.pack(fill='x', padx=8, pady=(0, 6))
         self.var_sleep_text = tk.StringVar(value="当前无等待")
-        ttk.Label(sleep_frame, textvariable=self.var_sleep_text).pack(anchor='w', padx=8, pady=(6, 2))
-        self.sleep_bar = ttk.Progressbar(sleep_frame, length=940, mode='determinate', maximum=100)
-        self.sleep_bar.pack(fill='x', padx=8, pady=(0, 8))
+        ttk.Label(sleep_frame, textvariable=self.var_sleep_text).pack(anchor='w', padx=6, pady=(4, 2))
+        self.sleep_bar = ttk.Progressbar(sleep_frame, length=860, mode='determinate', maximum=100)
+        self.sleep_bar.pack(fill='x', padx=6, pady=(0, 6))
 
-        log_frame = ttk.LabelFrame(master, text="采集日志")
-        log_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        self.txt_log = tk.Text(log_frame, height=15, state='disabled')
+        qr_frame = ttk.LabelFrame(master, text="登录二维码回显（Cookie 失效时）")
+        qr_frame.pack(fill='x', padx=8, pady=(0, 6))
+        self.var_login_qr_status = tk.StringVar(value="状态：暂未捕获二维码")
+        self.var_login_qr_offset_x = tk.StringVar(value="-80")
+        self.var_login_qr_offset_y = tk.StringVar(value="0")
+        self.lbl_login_qr = ttk.Label(qr_frame, text="暂无二维码")
+        self.lbl_login_qr.pack(side='left', padx=8, pady=6)
+        qr_right = ttk.Frame(qr_frame)
+        qr_right.pack(side='left', fill='x', expand=True, padx=4, pady=4)
+        ttk.Label(qr_right, textvariable=self.var_login_qr_status).pack(anchor='w')
+        qr_offset_row = ttk.Frame(qr_right)
+        qr_offset_row.pack(anchor='w', pady=(4, 0))
+        ttk.Label(qr_offset_row, text="捕获偏移 X：").pack(side='left')
+        ttk.Entry(qr_offset_row, textvariable=self.var_login_qr_offset_x, width=7).pack(side='left', padx=(2, 8))
+        ttk.Label(qr_offset_row, text="Y：").pack(side='left')
+        ttk.Entry(qr_offset_row, textvariable=self.var_login_qr_offset_y, width=7).pack(side='left', padx=(2, 8))
+        ttk.Button(
+            qr_offset_row, text="应用偏移", command=self.apply_login_qr_offset, style="Compact.TButton"
+        ).pack(side='left')
+        ttk.Button(
+            qr_offset_row, text="清空二维码", command=self.clear_login_qr_preview, style="Compact.TButton"
+        ).pack(side='left', padx=(8, 0))
+        self._login_qr_photo_ref = None
+
+        logs_notebook = ttk.Notebook(master)
+        logs_notebook.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+        crawl_log_tab = ttk.Frame(logs_notebook)
+        upload_log_tab = ttk.Frame(logs_notebook)
+        logs_notebook.add(crawl_log_tab, text="采集日志")
+        logs_notebook.add(upload_log_tab, text="图片上传日志")
+
+        self.txt_log = tk.Text(crawl_log_tab, height=12, state='disabled', font=("Consolas", 9))
         self.txt_log.pack(fill='both', expand=True, side='left')
-        scroll = ttk.Scrollbar(log_frame, command=self.txt_log.yview)
+        scroll = ttk.Scrollbar(crawl_log_tab, command=self.txt_log.yview)
         scroll.pack(side='right', fill='y')
         self.txt_log['yscrollcommand'] = scroll.set
 
-        upload_log_frame = ttk.LabelFrame(master, text="图片上传日志")
-        upload_log_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
-        self.txt_upload_log = tk.Text(upload_log_frame, height=10, state='disabled')
+        self.txt_upload_log = tk.Text(upload_log_tab, height=9, state='disabled', font=("Consolas", 9))
         self.txt_upload_log.pack(fill='both', expand=True, side='left')
-        upload_scroll = ttk.Scrollbar(upload_log_frame, command=self.txt_upload_log.yview)
+        upload_scroll = ttk.Scrollbar(upload_log_tab, command=self.txt_upload_log.yview)
         upload_scroll.pack(side='right', fill='y')
         self.txt_upload_log['yscrollcommand'] = upload_scroll.set
 
@@ -2280,6 +2780,95 @@ class App:
 
     def ui_set_status(self, text: str):
         self.ui(lambda: self.var_status.set(text))
+
+    def get_login_qr_offset(self) -> Tuple[int, int]:
+        try:
+            ox = int(float(self.var_login_qr_offset_x.get()))
+        except Exception:
+            ox = -80
+        try:
+            oy = int(float(self.var_login_qr_offset_y.get()))
+        except Exception:
+            oy = 0
+        ox = max(-800, min(800, ox))
+        oy = max(-800, min(800, oy))
+        return ox, oy
+
+    def apply_login_qr_offset(self):
+        ox, oy = self.get_login_qr_offset()
+        self.var_login_qr_offset_x.set(str(ox))
+        self.var_login_qr_offset_y.set(str(oy))
+        self.logger.info("二维码捕获偏移已更新：offset=(%d,%d)", ox, oy)
+
+    def clear_login_qr_preview(self):
+        def _apply():
+            self._login_qr_photo_ref = None
+            try:
+                self.lbl_login_qr.configure(image='', text="暂无二维码")
+            except Exception:
+                pass
+            try:
+                self.var_login_qr_status.set("状态：暂未捕获二维码")
+            except Exception:
+                pass
+        self.ui(_apply)
+
+    def on_login_qr_detected(self, payload: Dict):
+        def _apply():
+            if not isinstance(payload, dict):
+                return
+            if payload.get("cleared"):
+                self._login_qr_photo_ref = None
+                self.lbl_login_qr.configure(image='', text="暂无二维码")
+                reason = str(payload.get("reason") or "").strip()
+                if reason:
+                    self.var_login_qr_status.set(f"状态：二维码已清空（{reason}）")
+                else:
+                    self.var_login_qr_status.set("状态：二维码已清空")
+                return
+
+            b64 = payload.get("png_b64")
+            if not b64:
+                return
+
+            try:
+                img = tk.PhotoImage(data=b64)
+                max_w = 260
+                max_h = 260
+                sw = max(1, (img.width() + max_w - 1) // max_w)
+                sh = max(1, (img.height() + max_h - 1) // max_h)
+                scale = max(sw, sh)
+                if scale > 1:
+                    img = img.subsample(scale, scale)
+                self._login_qr_photo_ref = img
+                self.lbl_login_qr.configure(image=img, text="")
+            except Exception as e:
+                self.lbl_login_qr.configure(image='', text="二维码渲染失败")
+                self.var_login_qr_status.set(f"状态：二维码渲染失败（{e}）")
+                return
+
+            reason = str(payload.get("reason") or "").strip()
+            source = str(payload.get("source") or "").strip()
+            stage = str(payload.get("stage") or "").strip()
+            url = str(payload.get("url") or "").strip()
+            x = payload.get("x")
+            y = payload.get("y")
+            w = payload.get("width")
+            h = payload.get("height")
+            ox = payload.get("offset_x")
+            oy = payload.get("offset_y")
+            rect_info = "-"
+            if all(v is not None for v in (x, y, w, h)):
+                rect_info = f"{x},{y},{w}x{h}"
+            offset_info = "-"
+            if ox is not None and oy is not None:
+                offset_info = f"{ox},{oy}"
+            self.var_login_qr_status.set(
+                f"状态：已捕获二维码 | 阶段={stage or '-'} | 来源={source or '-'} | 偏移={offset_info} | 区域={rect_info} | 原因={reason or '-'} | 页面={url or '-'}"
+            )
+            self.logger.warning("已捕获登录二维码并回显到 GUI（stage=%s, source=%s, reason=%s）", stage, source, reason)
+
+        self.ui(_apply)
 
     def _is_input_widget(self, widget) -> bool:
         current = widget
@@ -2395,7 +2984,9 @@ class App:
                     account_name=detector_account,
                     headless=False,
                     browser=self.var_browser.get(),
-                    logger=self.logger
+                    logger=self.logger,
+                    get_login_qr_offset=self.get_login_qr_offset,
+                    on_login_qr_detected=self.on_login_qr_detected
                 )
                 self.detector_crawler.driver.get(target_url)
                 self.logger.info("已打开%s：%s", page_name, target_url)
@@ -2507,6 +3098,7 @@ class App:
             "max_scroll": "20",
             "browser": "chrome",
             "headless": False,
+            "background_mode": True,
             "target_type": TargetType.BRAND,
             "shutdown_after_finish": False,
             "shutdown_timer_minutes": "",
@@ -2535,6 +3127,12 @@ class App:
         else:
             normalized["headless"] = bool(headless)
 
+        background_mode = normalized.get("background_mode")
+        if isinstance(background_mode, str):
+            normalized["background_mode"] = background_mode.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            normalized["background_mode"] = bool(background_mode)
+
         shutdown_after_finish = normalized.get("shutdown_after_finish")
         if isinstance(shutdown_after_finish, str):
             normalized["shutdown_after_finish"] = shutdown_after_finish.strip().lower() in ("1", "true", "yes", "on")
@@ -2551,6 +3149,7 @@ class App:
             "max_scroll": (self.var_max_scroll.get() or "").strip() or "20",
             "browser": (self.var_browser.get() or "").strip() or "chrome",
             "headless": bool(self.var_headless.get()),
+            "background_mode": bool(self.var_background_mode.get()),
             "target_type": (self.var_target_type.get() or "").strip() or TargetType.BRAND,
             "shutdown_after_finish": bool(self.var_shutdown_after_finish.get()),
             "shutdown_timer_minutes": (self.var_shutdown_timer_minutes.get() or "").strip(),
@@ -2563,6 +3162,7 @@ class App:
         self.var_max_scroll.set(str(settings.get("max_scroll") or "20"))
         self.var_browser.set(str(settings.get("browser") or "chrome"))
         self.var_headless.set(bool(settings.get("headless")))
+        self.var_background_mode.set(bool(settings.get("background_mode")))
         self.var_shutdown_after_finish.set(bool(settings.get("shutdown_after_finish")))
         self.var_shutdown_timer_minutes.set(str(settings.get("shutdown_timer_minutes") or "").strip())
         target_type = str(settings.get("target_type") or TargetType.BRAND)
@@ -2907,6 +3507,7 @@ class App:
 
         self.ui_set_buttons(start='disabled', add_acc='disabled', remove_acc='disabled')
         self.ui_set_status("正在启动浏览器录入账号...")
+        self.clear_login_qr_preview()
         self.logger.info("开始新增账号流程：%s", account_name)
 
         def _run_add():
@@ -2921,7 +3522,9 @@ class App:
                     account_name=account_name,
                     logger=self.logger,
                     headless=False,
-                    browser=self.var_browser.get()
+                    browser=self.var_browser.get(),
+                    get_login_qr_offset=self.get_login_qr_offset,
+                    on_login_qr_detected=self.on_login_qr_detected
                 )
                 self.logger.info(f"浏览器已启动（账号: {account_name}），请在弹出的浏览器中扫码登录...")
 
@@ -3357,6 +3960,7 @@ class App:
 
         self.current_account_name = selected_acc_name
         selected_cookies = self.account_map[selected_acc_name]
+        self.clear_login_qr_preview()
 
         try:
             max_scroll = int(self.var_max_scroll.get())
@@ -3400,6 +4004,9 @@ class App:
                 else:
                     url_checker = self.db.is_url_exists_artist
                     insert_cb = self.db.insert_artist_log
+                background_mode = bool(self.var_background_mode.get())
+                if background_mode and bool(self.var_headless.get()):
+                    self.logger.info("已启用无头模式，后台最小化设置将被自动忽略。")
 
                 self.crawler = XHSCrawler(
                     target_type=target_type,
@@ -3408,13 +4015,16 @@ class App:
                     insert_callback=insert_cb,
                     get_scroll_sleep=self.get_scroll_sleep,
                     get_detail_sleep=self.get_detail_sleep,
+                    get_login_qr_offset=self.get_login_qr_offset,
                     on_sleep=self.on_sleep,
                     on_captcha_detected=self.on_captcha_detected,
                     skip_event=self.skip_event,
                     max_scroll_default=max_scroll,
                     headless=self.var_headless.get(),
+                    run_in_background=background_mode,
                     browser=self.var_browser.get(),
-                    logger=self.logger
+                    logger=self.logger,
+                    on_login_qr_detected=self.on_login_qr_detected
                 )
 
                 self.logger.info(f"使用账号 [{selected_acc_name}] 登录...")
