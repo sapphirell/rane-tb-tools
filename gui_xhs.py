@@ -210,6 +210,63 @@ class DatabaseManager:
                     cursor.execute(sql, params or ())
                 return cursor, cursor.rowcount
 
+    @staticmethod
+    def _normalize_url_for_md5(url: str) -> str:
+        text = str(url or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = urllib.parse.urlsplit(text)
+            scheme = (parsed.scheme or "").lower()
+            netloc = (parsed.netloc or "").lower()
+            path = parsed.path or ""
+            if path != "/" and path.endswith("/"):
+                path = path.rstrip("/")
+            normalized = urllib.parse.urlunsplit((scheme, netloc, path, "", ""))
+            return normalized or text.split("?", 1)[0].split("#", 1)[0].strip()
+        except Exception:
+            return text.split("?", 1)[0].split("#", 1)[0].strip()
+
+    def _calc_url_md5(self, url: str) -> str:
+        normalized = self._normalize_url_for_md5(url)
+        if not normalized:
+            return ""
+        return hashlib.md5(normalized.encode("utf-8")).hexdigest()
+
+    def _insert_with_url_md5_dedup(
+            self,
+            *,
+            table_name: str,
+            lock_name: str,
+            cols: List[str],
+            vals: List,
+            url_md5: str
+    ) -> bool:
+        logger = logging.getLogger(__name__)
+        lock_acquired = False
+        try:
+            cur, _ = self._exec("SELECT GET_LOCK(%s, 8) AS locked", (lock_name,))
+            row = cur.fetchone() or {}
+            lock_acquired = int(row.get("locked") or 0) == 1
+        except Exception:
+            lock_acquired = False
+        if not lock_acquired:
+            logger.warning("获取 MySQL 命名锁失败，将执行无锁去重写入（table=%s）", table_name)
+
+        try:
+            cur, _ = self._exec(f"SELECT 1 FROM {table_name} WHERE url_md5 = %s LIMIT 1", (url_md5,))
+            if cur.fetchone():
+                return False
+            sql = f"INSERT INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['%s'] * len(cols))})"
+            _, affected = self._exec(sql, tuple(vals))
+            return int(affected or 0) > 0
+        finally:
+            if lock_acquired:
+                try:
+                    self._exec("SELECT RELEASE_LOCK(%s)", (lock_name,))
+                except Exception:
+                    pass
+
     # --- Cookie 管理 ---
     def fetch_cookies(self) -> List[Dict]:
         """获取所有可用账号"""
@@ -359,10 +416,18 @@ class DatabaseManager:
         return cur.fetchall()
 
     def is_url_exists_brand(self, url: str) -> bool:
-        cur, _ = self._exec("SELECT 1 FROM spider_log WHERE url = %s LIMIT 1", (url,))
+        url_md5 = self._calc_url_md5(url)
+        if not url_md5:
+            return False
+        cur, _ = self._exec("SELECT 1 FROM spider_log WHERE url_md5 = %s LIMIT 1", (url_md5,))
         return bool(cur.fetchone())
 
-    def insert_brand_log(self, data: Dict):
+    def insert_brand_log(self, data: Dict) -> bool:
+        raw_url = str(data.get('url') or '').strip()
+        url = self._normalize_url_for_md5(raw_url)
+        if not url:
+            return False
+        url_md5 = self._calc_url_md5(url)
         title = (data.get('title') or '')[:255]
         content = (data.get('content') or '')[:2000]
         images = ','.join(data.get('images') or [])[:2000]
@@ -373,15 +438,25 @@ class DatabaseManager:
         # 构建 SQL
         cols = ["msg_type", "status", "origin_type", "title", "content", "url", "images", "brand_id", "brand_name",
                 "auth_time", "created_at", "updated_at"]
-        vals = [0, 0, 'xhs', title, content, data['url'], images, data['brand_id'], data['brand_name'],
+        vals = [0, 0, 'xhs', title, content, url, images, data['brand_id'], data['brand_name'],
                 int(data.get('auth_time', 0)), now, now]
+        cols.append("url_md5")
+        vals.append(url_md5)
 
         if has_likes:
             cols.append("likes")
             vals.append(like_count)
 
-        sql = f"INSERT INTO spider_log ({','.join(cols)}) VALUES ({','.join(['%s'] * len(cols))})"
-        self._exec(sql, tuple(vals))
+        inserted = self._insert_with_url_md5_dedup(
+            table_name="spider_log",
+            lock_name="xhs_spider_log_url_md5_lock",
+            cols=cols,
+            vals=vals,
+            url_md5=url_md5,
+        )
+        if not inserted:
+            logging.getLogger(__name__).info("spider_log 重复跳过（url_md5=%s, url=%s）", url_md5, url)
+        return inserted
 
     # --- 艺术家 ---
     def fetch_artists(self) -> list:
@@ -398,10 +473,18 @@ class DatabaseManager:
         return cur.fetchall()
 
     def is_url_exists_artist(self, url: str) -> bool:
-        cur, _ = self._exec("SELECT 1 FROM artist_spider_log WHERE url = %s LIMIT 1", (url,))
+        url_md5 = self._calc_url_md5(url)
+        if not url_md5:
+            return False
+        cur, _ = self._exec("SELECT 1 FROM artist_spider_log WHERE url_md5 = %s LIMIT 1", (url_md5,))
         return bool(cur.fetchone())
 
-    def insert_artist_log(self, data: Dict):
+    def insert_artist_log(self, data: Dict) -> bool:
+        raw_url = str(data.get('url') or '').strip()
+        url = self._normalize_url_for_md5(raw_url)
+        if not url:
+            return False
+        url_md5 = self._calc_url_md5(url)
         title = (data.get('title') or '')[:600]
         content = (data.get('content') or '')[:2000]
         images = ','.join(data.get('images') or [])[:2000]
@@ -412,7 +495,7 @@ class DatabaseManager:
         cols = ["msg_type", "status", "origin_type", "title", "content", "url", "images", "brand_id", "brand_name",
                 "created_at", "updated_at", "full_get", "auth_time", "likes"]
         vals = [
-            0, 0, 'xhs', title, content, data.get('url', ''),
+            0, 0, 'xhs', title, content, url,
             images,
             data.get('artist_id', data.get('brand_id', 0)),
             data.get('artist_name', data.get('brand_name', '')),
@@ -421,9 +504,19 @@ class DatabaseManager:
             int(data.get('auth_time', 0)),
             likes if has_likes else 0
         ]
+        cols.append("url_md5")
+        vals.append(url_md5)
 
-        sql = f"INSERT INTO artist_spider_log ({','.join(cols)}) VALUES ({','.join(['%s'] * len(cols))})"
-        self._exec(sql, tuple(vals))
+        inserted = self._insert_with_url_md5_dedup(
+            table_name="artist_spider_log",
+            lock_name="xhs_artist_spider_log_url_md5_lock",
+            cols=cols,
+            vals=vals,
+            url_md5=url_md5,
+        )
+        if not inserted:
+            logging.getLogger(__name__).info("artist_spider_log 重复跳过（url_md5=%s, url=%s）", url_md5, url)
+        return inserted
 
     def update_last_gather_time(self, brand_id: int):
         self._exec("UPDATE brand SET last_gather_time = NOW() WHERE id = %s", (brand_id,))
@@ -2452,8 +2545,11 @@ class XHSCrawler:
                                 detail.update(
                                     {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'full_get': 0})
                             if self.insert_callback:
-                                self.insert_callback(detail)
-                                self._inc_stat(current_stats, "inserted_urls")
+                                inserted = self.insert_callback(detail)
+                                if inserted is not False:
+                                    self._inc_stat(current_stats, "inserted_urls")
+                                else:
+                                    self._inc_stat(current_stats, "skipped_existing_urls")
 
                 elif spd_setting == 2:
                     for quick_data in self.collected_quick_data:
@@ -2466,8 +2562,11 @@ class XHSCrawler:
                                 {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'auth_time': 0,
                                  'full_get': 0})
                         if self.insert_callback:
-                            self.insert_callback(quick_data)
-                            self._inc_stat(current_stats, "inserted_urls")
+                            inserted = self.insert_callback(quick_data)
+                            if inserted is not False:
+                                self._inc_stat(current_stats, "inserted_urls")
+                            else:
+                                self._inc_stat(current_stats, "skipped_existing_urls")
                     self.logger.info(f"快速采集数据入库成功: {len(self.collected_quick_data)} 条")
 
                 self.all_links.clear()
