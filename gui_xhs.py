@@ -875,6 +875,9 @@ class XHSCrawler:
         self.logger = logger or logging.getLogger(__name__)
         self.stop_requested = False
         self.run_in_background = bool(run_in_background) and (not bool(headless))
+        self._background_window_applied = False
+        self._background_window_warned = False
+        self._last_background_apply_ts = 0.0
         self.browser_name = self._normalize_browser_name(browser)
         self.accept_language = "zh-CN,zh;q=0.9,en;q=0.8"
         self.locale = "zh-CN"
@@ -967,6 +970,7 @@ class XHSCrawler:
         # 再补一层运行期反检测脚本，重点清理 cdc_* 与 webdriver 暴露。
         self._inject_runtime_stealth_overrides()
         self._apply_cdp_anti_detection(headless=headless)
+        self._enforce_background_window_state(force=True)
 
         self.all_links = set()
         self.collected_quick_data = []
@@ -1229,7 +1233,11 @@ class XHSCrawler:
         if headless:
             options.add_argument("--headless=new")
         else:
-            options.add_argument("--start-maximized")
+            if self.run_in_background:
+                options.add_argument("--window-size=1366,864")
+                options.add_argument("--window-position=-32000,-32000")
+            else:
+                options.add_argument("--start-maximized")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
         options.add_experimental_option("useAutomationExtension", False)
         options.add_experimental_option("prefs", {
@@ -1256,7 +1264,11 @@ class XHSCrawler:
         if headless:
             options.add_argument("--headless=new")
         else:
-            options.add_argument("--start-maximized")
+            if self.run_in_background:
+                options.add_argument("--window-size=1366,864")
+                options.add_argument("--window-position=-32000,-32000")
+            else:
+                options.add_argument("--start-maximized")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
         options.add_experimental_option("useAutomationExtension", False)
         options.add_experimental_option("prefs", {
@@ -1528,6 +1540,64 @@ class XHSCrawler:
         if removed:
             self.logger.info(f"已清理 profile 锁文件: {len(removed)} 个")
 
+    def _enforce_background_window_state(self, *, force: bool = False):
+        if not self.run_in_background:
+            return
+        now = time.time()
+        if not force and (now - self._last_background_apply_ts) < 0.8:
+            return
+        self._last_background_apply_ts = now
+
+        try:
+            win = self.driver.execute_cdp_cmd("Browser.getWindowForTarget", {}) or {}
+            window_id = win.get("windowId")
+            bounds = win.get("bounds") or {}
+            if window_id is None:
+                return
+            current_state = str(bounds.get("windowState") or "").lower()
+            current_left = int(bounds.get("left") or 0)
+            current_top = int(bounds.get("top") or 0)
+            current_width = int(bounds.get("width") or 0)
+            current_height = int(bounds.get("height") or 0)
+
+            # 不使用“最小化”状态：最小化会导致页面在部分环境下停止活跃渲染，
+            # 扫码二维码和关键DOM更新会滞后，直到手动点回浏览器才恢复。
+            needs_move = (
+                current_state != "normal"
+                or current_left > -30000
+                or current_width <= 0
+                or current_height <= 0
+            )
+            if needs_move:
+                self.driver.execute_cdp_cmd(
+                    "Browser.setWindowBounds",
+                    {
+                        "windowId": int(window_id),
+                        "bounds": {
+                            "windowState": "normal",
+                            "left": -32000,
+                            "top": current_top if current_top != 0 else 0,
+                            "width": current_width if current_width > 0 else 1366,
+                            "height": current_height if current_height > 0 else 864,
+                        },
+                    }
+                )
+            if not self._background_window_applied:
+                self.logger.info("离屏运行已生效：浏览器窗口将离屏隐藏，不再抢占前台。")
+                self._background_window_applied = True
+        except Exception as e:
+            if not self._background_window_warned:
+                self.logger.warning(f"离屏运行设置失败，将继续运行：{e}")
+                self._background_window_warned = True
+
+    def _driver_get(self, url: str):
+        self.driver.get(url)
+        self._enforce_background_window_state()
+
+    def _driver_refresh(self):
+        self.driver.refresh()
+        self._enforce_background_window_state()
+
     # ---- stop / pause ----
     def request_stop(self):
         self.stop_requested = True
@@ -1588,7 +1658,7 @@ class XHSCrawler:
                     self.request_pause(f"{captcha_type}@{where}")
                     self._wait_until_resumed()
                     try:
-                        self.driver.refresh()
+                        self._driver_refresh()
                     except Exception:
                         pass
                 else:
@@ -2010,16 +2080,6 @@ class XHSCrawler:
         top_score, top_source, top_selector, top_elem, top_rect = candidates[0]
 
         try:
-            self.logger.info(
-                "二维码候选已选中: score=%.1f, source=%s, rect=(x=%.1f,y=%.1f,w=%.1f,h=%.1f), offset=(%d,%d), reason=%s",
-                top_score, top_source,
-                top_rect["x"], top_rect["y"], top_rect["width"], top_rect["height"],
-                offset_x, offset_y, reason
-            )
-        except Exception:
-            pass
-
-        try:
             png_bytes = top_elem.screenshot_as_png
             if not png_bytes or len(png_bytes) < 300:
                 return False
@@ -2032,6 +2092,15 @@ class XHSCrawler:
 
         self._last_login_qr_fingerprint = fp
         self._last_login_qr_emit_ts = now
+        try:
+            self.logger.info(
+                "二维码候选已选中: score=%.1f, source=%s, rect=(x=%.1f,y=%.1f,w=%.1f,h=%.1f), offset=(%d,%d), reason=%s",
+                top_score, top_source,
+                top_rect["x"], top_rect["y"], top_rect["width"], top_rect["height"],
+                offset_x, offset_y, reason
+            )
+        except Exception:
+            pass
 
         payload = {
             "cleared": False,
@@ -2101,7 +2170,7 @@ class XHSCrawler:
             ("search", "https://www.xiaohongshu.com/search_result?keyword=BJD"),
         ]
         for where, url in check_pages:
-            self.driver.get(url)
+            self._driver_get(url)
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
@@ -2121,10 +2190,13 @@ class XHSCrawler:
             timeout_sec: int,
             stage: str,
             *,
-            allow_cookie_fallback: bool = True
+            allow_cookie_fallback: bool = True,
+            cross_page_validation: bool = True
     ) -> Tuple[bool, str]:
         deadline = time.time() + max(1, int(timeout_sec))
         last_reason = "会话尚未就绪"
+        last_qr_capture_ts = 0.0
+        login_marker_hits = 0
 
         while time.time() < deadline:
             if self.stop_requested:
@@ -2132,8 +2204,22 @@ class XHSCrawler:
 
             try:
                 if not self._has_login_marker(allow_cookie_fallback=allow_cookie_fallback):
+                    login_marker_hits = 0
                     last_reason = "未检测到登录态标记"
-                    self._try_capture_login_qr(stage=stage, reason=last_reason)
+                    now = time.time()
+                    if (now - last_qr_capture_ts) >= 3.0:
+                        self._try_capture_login_qr(stage=stage, reason=last_reason)
+                        last_qr_capture_ts = now
+                    time.sleep(1.0)
+                    continue
+
+                if not cross_page_validation:
+                    # 手动扫码阶段避免跨页跳转导致二维码被重置；连续命中登录态后直接判稳。
+                    login_marker_hits += 1
+                    if login_marker_hits >= 2:
+                        self._notify_login_qr_cleared(stage=stage, reason="检测到登录态标记")
+                        return True, ""
+                    last_reason = "检测到登录态标记，等待稳定确认"
                     time.sleep(1.0)
                     continue
 
@@ -2143,9 +2229,13 @@ class XHSCrawler:
                     return True, ""
                 last_reason = reason or "跨页验证未通过"
                 if ("登录" in last_reason) or ("未检测到登录态" in last_reason):
-                    self._try_capture_login_qr(stage=stage, reason=last_reason)
+                    now = time.time()
+                    if (now - last_qr_capture_ts) >= 3.0:
+                        self._try_capture_login_qr(stage=stage, reason=last_reason)
+                        last_qr_capture_ts = now
                 self.logger.info(f"{stage} 会话未稳定：{last_reason}，等待重试...")
             except Exception as exc:
+                login_marker_hits = 0
                 last_reason = str(exc)
                 self.logger.info(f"{stage} 会话校验异常：{last_reason}，等待重试...")
 
@@ -2159,7 +2249,7 @@ class XHSCrawler:
         :param cookie_list: 如果提供了 cookie_list，则注入 Cookie；否则等待扫码
         :return: 登录成功后返回最新 Cookie 列表
         """
-        self.driver.get('https://www.xiaohongshu.com/')
+        self._driver_get('https://www.xiaohongshu.com/')
         self._detect_and_handle_captcha("explore")
 
         if cookie_list:
@@ -2179,11 +2269,12 @@ class XHSCrawler:
                     injected += 1
 
                 self.logger.info(f"Cookie 注入完成：{injected} 条")
-                self.driver.refresh()
+                self._driver_refresh()
                 ok, reason = self._wait_for_session_ready(
                     timeout_sec=30,
                     stage="Cookie登录",
-                    allow_cookie_fallback=False
+                    allow_cookie_fallback=False,
+                    cross_page_validation=True
                 )
                 if ok:
                     self.logger.info("Cookie 登录成功（已通过跨页会话校验）")
@@ -2199,7 +2290,8 @@ class XHSCrawler:
         ok, reason = self._wait_for_session_ready(
             timeout_sec=180,
             stage="扫码登录",
-            allow_cookie_fallback=False
+            allow_cookie_fallback=False,
+            cross_page_validation=False
         )
         if not ok:
             raise RuntimeError(f"扫码后会话仍未稳定：{reason}")
@@ -2281,7 +2373,7 @@ class XHSCrawler:
         img_urls = []
 
         try:
-            self.driver.get(note_url)
+            self._driver_get(note_url)
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
             )
@@ -2462,7 +2554,7 @@ class XHSCrawler:
 
             for target_url in target_urls:
                 self.check_stop()
-                self.driver.get(target_url)
+                self._driver_get(target_url)
                 self._detect_and_handle_captcha("scroll")
                 self.smart_scroll(spd_setting, max_scroll, stats=current_stats)
 
@@ -2615,7 +2707,7 @@ class App:
         ).grid(row=0, column=8, padx=4, pady=4)
         self.var_background_mode = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            frm, text="后台最小化运行", variable=self.var_background_mode, style="Compact.TCheckbutton"
+            frm, text="离屏运行", variable=self.var_background_mode, style="Compact.TCheckbutton"
         ).grid(
             row=0, column=9, padx=4, pady=4, sticky='w'
         )
@@ -3602,6 +3694,7 @@ class App:
         self.ui_set_status("正在启动浏览器录入账号...")
         self.clear_login_qr_preview()
         self.logger.info("开始新增账号流程：%s", account_name)
+        background_mode = bool(self.var_background_mode.get())
 
         def _run_add():
             temp_crawler = None
@@ -3615,11 +3708,18 @@ class App:
                     account_name=account_name,
                     logger=self.logger,
                     headless=False,
+                    run_in_background=background_mode,
                     browser=self.var_browser.get(),
                     get_login_qr_offset=self.get_login_qr_offset,
                     on_login_qr_detected=self.on_login_qr_detected
                 )
-                self.logger.info(f"浏览器已启动（账号: {account_name}），请在弹出的浏览器中扫码登录...")
+                if background_mode:
+                    self.logger.info(
+                        "浏览器已启动（账号: %s），已按离屏运行；请直接使用 GUI 二维码回显完成扫码登录。",
+                        account_name
+                    )
+                else:
+                    self.logger.info(f"浏览器已启动（账号: {account_name}），请在弹出的浏览器中扫码登录...")
 
                 # 调用 login 不传 cookie，触发扫码逻辑
                 new_cookies = temp_crawler.login(cookie_list=None)
@@ -4099,7 +4199,7 @@ class App:
                     insert_cb = self.db.insert_artist_log
                 background_mode = bool(self.var_background_mode.get())
                 if background_mode and bool(self.var_headless.get()):
-                    self.logger.info("已启用无头模式，后台最小化设置将被自动忽略。")
+                    self.logger.info("已启用无头模式，离屏运行设置将被自动忽略。")
 
                 self.crawler = XHSCrawler(
                     target_type=target_type,
