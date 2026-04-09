@@ -967,11 +967,6 @@ class XHSCrawler:
         # 再补一层运行期反检测脚本，重点清理 cdc_* 与 webdriver 暴露。
         self._inject_runtime_stealth_overrides()
         self._apply_cdp_anti_detection(headless=headless)
-        if self.run_in_background:
-            if self._minimize_browser_window():
-                self.logger.info("后台模式已启用：浏览器已最小化")
-            else:
-                self.logger.warning("后台模式已启用，但最小化浏览器失败，请手动最小化窗口")
 
         self.all_links = set()
         self.collected_quick_data = []
@@ -1233,8 +1228,6 @@ class XHSCrawler:
         options = ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
-        elif self.run_in_background:
-            options.add_argument("--start-minimized")
         else:
             options.add_argument("--start-maximized")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
@@ -1262,8 +1255,6 @@ class XHSCrawler:
         options = EdgeOptions()
         if headless:
             options.add_argument("--headless=new")
-        elif self.run_in_background:
-            options.add_argument("--start-minimized")
         else:
             options.add_argument("--start-maximized")
         options.add_experimental_option("excludeSwitches", ['enable-automation'])
@@ -1505,49 +1496,6 @@ class XHSCrawler:
             return self._start_edge_with_profile(profile_dir, headless=headless)
         return self._start_chrome_with_profile(profile_dir, headless=headless)
 
-    def _set_window_state_via_cdp(self, state: str) -> bool:
-        if state not in {"normal", "minimized", "maximized", "fullscreen"}:
-            return False
-        try:
-            info = self.driver.execute_cdp_cmd("Browser.getWindowForTarget", {})
-            window_id = info.get("windowId")
-            if window_id is None:
-                return False
-            self.driver.execute_cdp_cmd(
-                "Browser.setWindowBounds",
-                {"windowId": window_id, "bounds": {"windowState": state}}
-            )
-            return True
-        except Exception:
-            return False
-
-    def _minimize_browser_window(self) -> bool:
-        try:
-            if self._set_window_state_via_cdp("minimized"):
-                return True
-            self.driver.minimize_window()
-            return True
-        except Exception:
-            return False
-
-    def _restore_browser_window_for_verify(self) -> bool:
-        try:
-            restored = self._set_window_state_via_cdp("normal")
-            if not restored:
-                try:
-                    self.driver.maximize_window()
-                    restored = True
-                except Exception:
-                    restored = False
-            if restored:
-                try:
-                    self.driver.switch_to.window(self.driver.current_window_handle)
-                except Exception:
-                    pass
-            return restored
-        except Exception:
-            return False
-
     def _clean_profile_runtime_locks(self, profile_dir: str):
         targets = [
             os.path.join(profile_dir, "SingletonLock"),
@@ -1618,11 +1566,6 @@ class XHSCrawler:
 
             def _handle_detected(captcha_type: str, reason: str):
                 self.logger.warning(reason)
-                if self.run_in_background:
-                    if self._restore_browser_window_for_verify():
-                        self.logger.warning("检测到验证码：已恢复浏览器窗口，等待人工处理")
-                    else:
-                        self.logger.warning("检测到验证码：尝试恢复浏览器窗口失败，请手动切换浏览器处理")
                 try:
                     captured = self._try_capture_login_qr(
                         stage=f"{where}-captcha",
@@ -1648,9 +1591,6 @@ class XHSCrawler:
                         self.driver.refresh()
                     except Exception:
                         pass
-                    if self.run_in_background:
-                        if self._minimize_browser_window():
-                            self.logger.info("恢复运行后已重新最小化窗口")
                 else:
                     self.logger.warning("当前无暂停回调，需在浏览器中手动完成验证后继续。")
                     time.sleep(2.0)
