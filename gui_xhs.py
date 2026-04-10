@@ -871,6 +871,7 @@ class XHSCrawler:
         self._pause_logged = False
         self._last_login_qr_fingerprint = ""
         self._last_login_qr_emit_ts = 0.0
+        self._last_login_qr_rect: Optional[Dict[str, float]] = None
         self.max_scroll_default = int(max_scroll_default)
         self.logger = logger or logging.getLogger(__name__)
         self.stop_requested = False
@@ -1820,6 +1821,7 @@ class XHSCrawler:
     def _notify_login_qr_cleared(self, stage: str, reason: str = ""):
         self._last_login_qr_fingerprint = ""
         self._last_login_qr_emit_ts = 0.0
+        self._last_login_qr_rect = None
         self._emit_login_qr_event({
             "cleared": True,
             "stage": stage,
@@ -1935,6 +1937,74 @@ class XHSCrawler:
                 uniq.append(r)
         return uniq
 
+    def _dispatch_click_at_rect(self, rect: Dict[str, float]) -> bool:
+        try:
+            x = float(rect.get("x") or 0.0) + float(rect.get("width") or 0.0) / 2.0
+            y = float(rect.get("y") or 0.0) + float(rect.get("height") or 0.0) / 2.0
+            script = """
+const x = arguments[0];
+const y = arguments[1];
+const el = document.elementFromPoint(x, y);
+if (!el) return {ok: false, reason: 'no-element'};
+const opts = {view: window, bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0};
+['mousemove', 'mousedown', 'mouseup', 'click'].forEach((type) => {
+  el.dispatchEvent(new MouseEvent(type, opts));
+});
+return {ok: true, tag: el.tagName || '', cls: el.className || ''};
+"""
+            result = self.driver.execute_script(script, x, y) or {}
+            return bool(result.get("ok"))
+        except Exception:
+            return False
+
+    def refresh_login_qr(self, *, wait_after_click: float = 0.9) -> bool:
+        rect = dict(self._last_login_qr_rect or {})
+        if not rect:
+            self.logger.warning("刷新二维码失败：没有可用的二维码坐标")
+            return False
+
+        self.logger.info(
+            "开始刷新二维码：rect=(x=%.1f,y=%.1f,w=%.1f,h=%.1f)",
+            float(rect.get("x") or 0.0),
+            float(rect.get("y") or 0.0),
+            float(rect.get("width") or 0.0),
+            float(rect.get("height") or 0.0),
+        )
+
+        clicked = self._dispatch_click_at_rect(rect)
+        if not clicked:
+            try:
+                self._driver_refresh()
+            except Exception:
+                pass
+
+        time.sleep(max(0.2, float(wait_after_click)))
+
+        captured = self._try_capture_login_qr(
+            stage="扫码登录",
+            reason="手动刷新二维码",
+            force_center=True,
+            container_selectors=["#captcha-div", "#red-captcha", ".captcha-modal-content"],
+            override_offset=(0, 0),
+            force_emit=True,
+        )
+        if captured:
+            return True
+
+        try:
+            self._driver_refresh()
+        except Exception:
+            pass
+        time.sleep(max(0.2, float(wait_after_click)))
+        return self._try_capture_login_qr(
+            stage="扫码登录",
+            reason="手动刷新二维码(回退刷新)",
+            force_center=True,
+            container_selectors=["#captcha-div", "#red-captcha", ".captcha-modal-content"],
+            override_offset=(0, 0),
+            force_emit=True,
+        )
+
     def _try_capture_login_qr(
             self,
             *,
@@ -1942,7 +2012,8 @@ class XHSCrawler:
             reason: str,
             force_center: bool = False,
             container_selectors: Optional[List[str]] = None,
-            override_offset: Optional[Tuple[int, int]] = None
+            override_offset: Optional[Tuple[int, int]] = None,
+            force_emit: bool = False
     ) -> bool:
         selectors = []
         if container_selectors:
@@ -2087,11 +2158,12 @@ class XHSCrawler:
             return False
 
         fp = hashlib.sha1(png_bytes).hexdigest()
-        if fp == self._last_login_qr_fingerprint and (now - self._last_login_qr_emit_ts) < 8.0:
+        if not force_emit and fp == self._last_login_qr_fingerprint and (now - self._last_login_qr_emit_ts) < 8.0:
             return False
 
         self._last_login_qr_fingerprint = fp
         self._last_login_qr_emit_ts = now
+        self._last_login_qr_rect = dict(top_rect)
         try:
             self.logger.info(
                 "二维码候选已选中: score=%.1f, source=%s, rect=(x=%.1f,y=%.1f,w=%.1f,h=%.1f), offset=(%d,%d), reason=%s",
@@ -2846,7 +2918,13 @@ class App:
         ttk.Button(
             qr_offset_row, text="清空二维码", command=self.clear_login_qr_preview, style="Compact.TButton"
         ).pack(side='left', padx=(8, 0))
+        self.btn_refresh_login_qr = ttk.Button(
+            qr_offset_row, text="刷新二维码", command=self.refresh_login_qr_preview, style="Compact.TButton"
+        )
+        self.btn_refresh_login_qr.pack(side='left', padx=(8, 0))
+        self.btn_refresh_login_qr.config(state='disabled')
         self._login_qr_photo_ref = None
+        self._last_login_qr_payload = None
 
         logs_notebook = ttk.Notebook(master)
         logs_notebook.pack(fill='both', expand=True, padx=8, pady=(0, 8))
@@ -2998,23 +3076,64 @@ class App:
                 pass
         self.ui(_apply)
 
+    def _set_refresh_login_qr_button_state(self, enabled: bool):
+        def _apply():
+            try:
+                self.btn_refresh_login_qr.config(state='normal' if enabled else 'disabled')
+            except Exception:
+                pass
+        self.ui(_apply)
+
+    def refresh_login_qr_preview(self):
+        crawler = self.crawler
+        if not crawler or not getattr(crawler, "driver", None):
+            messagebox.showwarning("提示", "当前没有可用的浏览器会话，无法刷新二维码")
+            return
+
+        if not self._captcha_prompt_active:
+            self.logger.info("当前未处于验证码暂停状态，仍然尝试刷新二维码")
+
+        self._set_refresh_login_qr_button_state(False)
+        self.ui(lambda: self.var_login_qr_status.set("状态：正在刷新二维码..."))
+        self.logger.info("收到手动刷新二维码请求")
+
+        def _run():
+            try:
+                ok = crawler.refresh_login_qr()
+                if ok:
+                    self.logger.info("二维码已刷新并重新捕获")
+                else:
+                    self.logger.warning("刷新二维码后未重新捕获到新二维码")
+                    self.ui(lambda: self.var_login_qr_status.set("状态：刷新后未捕获到新二维码"))
+            except Exception as e:
+                self.logger.error(f"刷新二维码失败: {e}")
+                self.ui(lambda: self.var_login_qr_status.set(f"状态：刷新二维码失败（{e}）"))
+            finally:
+                self._set_refresh_login_qr_button_state(self._captcha_prompt_active)
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def on_login_qr_detected(self, payload: Dict):
         def _apply():
             if not isinstance(payload, dict):
                 return
             if payload.get("cleared"):
                 self._login_qr_photo_ref = None
+                self._last_login_qr_payload = None
                 self.lbl_login_qr.configure(image='', text="暂无二维码")
                 reason = str(payload.get("reason") or "").strip()
                 if reason:
                     self.var_login_qr_status.set(f"状态：二维码已清空（{reason}）")
                 else:
                     self.var_login_qr_status.set("状态：二维码已清空")
+                self._set_refresh_login_qr_button_state(False)
                 return
 
             b64 = payload.get("png_b64")
             if not b64:
                 return
+
+            self._last_login_qr_payload = dict(payload)
 
             try:
                 img = tk.PhotoImage(data=b64)
@@ -3052,6 +3171,7 @@ class App:
                 f"状态：已捕获二维码 | 阶段={stage or '-'} | 来源={source or '-'} | 偏移={offset_info} | 区域={rect_info} | 原因={reason or '-'} | 页面={url or '-'}"
             )
             self.logger.warning("已捕获登录二维码并回显到 GUI（stage=%s, source=%s, reason=%s）", stage, source, reason)
+            self._set_refresh_login_qr_button_state(True)
 
         self.ui(_apply)
 
@@ -4127,6 +4247,7 @@ class App:
                 "验证码提醒",
                 f"检测到小红书验证码拦截！\n\n位置: {where}\n类型: {captcha_type}\n\n请前往浏览器手动完成验证，\n完成后点击 GUI 上的【恢复运行】按钮。"
             )
+            self._set_refresh_login_qr_button_state(self._last_login_qr_payload is not None)
 
         self.ui(_apply)
 
@@ -4154,6 +4275,7 @@ class App:
         self.current_account_name = selected_acc_name
         selected_cookies = self.account_map[selected_acc_name]
         self.clear_login_qr_preview()
+        self._set_refresh_login_qr_button_state(False)
 
         try:
             max_scroll = int(self.var_max_scroll.get())
@@ -4330,6 +4452,7 @@ class App:
 
             self.ui_set_status("运行中…")
             self._clear_sleep_bar()
+            self._set_refresh_login_qr_button_state(False)
             self.logger.info("已点击“恢复运行”，采集将继续执行")
 
         self.ui(_apply_restore)
