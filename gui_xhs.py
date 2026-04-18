@@ -25,6 +25,7 @@ import logging
 import threading
 import queue
 import subprocess
+from logging.handlers import RotatingFileHandler
 from time import sleep
 from typing import Dict, Optional, Callable, List, Tuple
 from pathlib import Path
@@ -59,6 +60,11 @@ def get_runtime_base_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+LOG_ROTATE_MAX_BYTES = 5 * 1024 * 1024
+LOG_ROTATE_BACKUP_COUNT = 4
+LOG_SIZE_REFRESH_INTERVAL_MS = 5000
 
 
 def convert_xhs_url(original_url: str) -> str:
@@ -2709,12 +2715,78 @@ class TextHandler(logging.Handler):
         self.text_widget.configure(state='disabled')
 
 
+class ManagedRotatingFileHandler(RotatingFileHandler):
+    def managed_log_paths(self) -> List[Path]:
+        paths: List[Path] = []
+        base_filename = self.baseFilename
+        backup_pattern = re.compile(rf"^{re.escape(base_filename)}\.(\d+)$")
+        for candidate in glob.glob(f"{base_filename}*"):
+            if candidate == base_filename or backup_pattern.match(candidate):
+                paths.append(Path(candidate))
+        if not paths:
+            paths.append(Path(base_filename))
+        return sorted(paths, key=lambda item: (str(item) != base_filename, str(item)))
+
+    def total_size_bytes(self) -> int:
+        total = 0
+        for path in self.managed_log_paths():
+            try:
+                total += path.stat().st_size
+            except FileNotFoundError:
+                continue
+        return total
+
+    def prune_backup_files(self):
+        if self.backupCount < 0:
+            return
+        backup_pattern = re.compile(rf"^{re.escape(self.baseFilename)}\.(\d+)$")
+        for path in self.managed_log_paths():
+            match = backup_pattern.match(str(path))
+            if match and int(match.group(1)) > self.backupCount:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+
+    def rollover_if_needed(self):
+        if self.maxBytes <= 0:
+            return
+        self.acquire()
+        try:
+            self.prune_backup_files()
+            if os.path.exists(self.baseFilename) and os.path.getsize(self.baseFilename) >= self.maxBytes:
+                if self.stream:
+                    self.stream.close()
+                    self.stream = None
+                self.doRollover()
+        finally:
+            self.release()
+
+    def clear_all_files(self):
+        self.acquire()
+        try:
+            if self.stream:
+                self.stream.flush()
+                self.stream.close()
+                self.stream = None
+            for path in self.managed_log_paths():
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+            if not self.delay:
+                self.stream = self._open()
+        finally:
+            self.release()
+
+
 class App:
     def __init__(self, master: tk.Tk):
         self.master = master
         self._input_focus_classes = {"Entry", "TEntry", "Text", "Spinbox", "TCombobox"}
         self._ui_queue: "queue.Queue[Callable]" = queue.Queue()
         self._ui_pump_after_id = None
+        self._log_size_after_id = None
         self._captcha_prompt_active = False
         self.master.title("小红书爬虫 · 采集控制台（数据库Cookie管理版）")
         self.master.geometry("920x820")
@@ -2926,6 +2998,24 @@ class App:
         self._login_qr_photo_ref = None
         self._last_login_qr_payload = None
 
+        log_manage_frame = ttk.LabelFrame(master, text="日志管理")
+        log_manage_frame.pack(fill='x', padx=8, pady=(0, 6))
+        self.var_crawl_log_size = tk.StringVar(value="采集日志占用：0 B")
+        self.var_upload_log_size = tk.StringVar(value="图片上传日志占用：0 B")
+        self.var_log_total_size = tk.StringVar(value="日志总占用：0 B")
+        ttk.Label(log_manage_frame, textvariable=self.var_crawl_log_size).pack(side='left', padx=(8, 6), pady=6)
+        ttk.Button(
+            log_manage_frame, text="清空采集日志", command=self.clear_crawl_logs, style="Compact.TButton"
+        ).pack(side='left', padx=(0, 10))
+        ttk.Label(log_manage_frame, textvariable=self.var_upload_log_size).pack(side='left', padx=(0, 6), pady=6)
+        ttk.Button(
+            log_manage_frame, text="清空上传日志", command=self.clear_upload_logs, style="Compact.TButton"
+        ).pack(side='left', padx=(0, 10))
+        ttk.Label(log_manage_frame, textvariable=self.var_log_total_size).pack(side='left', padx=(0, 6), pady=6)
+        ttk.Button(
+            log_manage_frame, text="全部清空", command=self.clear_all_logs, style="Compact.TButton"
+        ).pack(side='left')
+
         logs_notebook = ttk.Notebook(master)
         logs_notebook.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         crawl_log_tab = ttk.Frame(logs_notebook)
@@ -2951,12 +3041,20 @@ class App:
         if self.logger.handlers:
             self.logger.handlers.clear()
         fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        self.crawl_log_path = os.path.join(get_runtime_base_dir(), 'xhs_crawler.log')
+        self.upload_log_path = os.path.join(get_runtime_base_dir(), 'xhs_upload.log')
         self.gui_handler = TextHandler(self.txt_log, self.ui)
         self.gui_handler.setFormatter(fmt)
         self.logger.addHandler(self.gui_handler)
-        file_handler = logging.FileHandler(os.path.join(get_runtime_base_dir(), 'xhs_crawler.log'), encoding='utf-8')
-        file_handler.setFormatter(fmt)
-        self.logger.addHandler(file_handler)
+        self.log_file_handler = ManagedRotatingFileHandler(
+            self.crawl_log_path,
+            maxBytes=LOG_ROTATE_MAX_BYTES,
+            backupCount=LOG_ROTATE_BACKUP_COUNT,
+            encoding='utf-8'
+        )
+        self.log_file_handler.rollover_if_needed()
+        self.log_file_handler.setFormatter(fmt)
+        self.logger.addHandler(self.log_file_handler)
 
         self.upload_logger = logging.getLogger("XHS_UPLOAD")
         self.upload_logger.setLevel(logging.INFO)
@@ -2966,9 +3064,15 @@ class App:
         self.upload_gui_handler = TextHandler(self.txt_upload_log, self.ui)
         self.upload_gui_handler.setFormatter(fmt)
         self.upload_logger.addHandler(self.upload_gui_handler)
-        upload_file_handler = logging.FileHandler(os.path.join(get_runtime_base_dir(), 'xhs_upload.log'), encoding='utf-8')
-        upload_file_handler.setFormatter(fmt)
-        self.upload_logger.addHandler(upload_file_handler)
+        self.upload_log_file_handler = ManagedRotatingFileHandler(
+            self.upload_log_path,
+            maxBytes=LOG_ROTATE_MAX_BYTES,
+            backupCount=LOG_ROTATE_BACKUP_COUNT,
+            encoding='utf-8'
+        )
+        self.upload_log_file_handler.rollover_if_needed()
+        self.upload_log_file_handler.setFormatter(fmt)
+        self.upload_logger.addHandler(self.upload_log_file_handler)
 
         self.running_thread: Optional[threading.Thread] = None
         self.maintenance_thread: Optional[threading.Thread] = None
@@ -3003,6 +3107,8 @@ class App:
         self.master.bind_all("<Button-1>", self._blur_input_on_outside_click, add="+")
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
         self._schedule_ui_pump()
+        self._refresh_log_size_labels()
+        self._schedule_log_size_refresh()
 
         # 初始化加载账号
         self.load_accounts()
@@ -3043,6 +3149,86 @@ class App:
 
     def ui_set_status(self, text: str):
         self.ui(lambda: self.var_status.set(text))
+
+    @staticmethod
+    def _format_size_text(size_bytes: int) -> str:
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = float(max(0, size_bytes))
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(value)} {unit}"
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return "0 B"
+
+    def _clear_text_widget(self, widget: tk.Text):
+        widget.configure(state='normal')
+        widget.delete("1.0", "end")
+        widget.configure(state='disabled')
+
+    def _refresh_log_size_labels(self):
+        crawl_size = self.log_file_handler.total_size_bytes() if hasattr(self, "log_file_handler") else 0
+        upload_size = self.upload_log_file_handler.total_size_bytes() if hasattr(self, "upload_log_file_handler") else 0
+        total_size = crawl_size + upload_size
+        self.var_crawl_log_size.set(f"采集日志占用：{self._format_size_text(crawl_size)}")
+        self.var_upload_log_size.set(f"图片上传日志占用：{self._format_size_text(upload_size)}")
+        self.var_log_total_size.set(f"日志总占用：{self._format_size_text(total_size)}")
+
+    def _schedule_log_size_refresh(self):
+        try:
+            self._refresh_log_size_labels()
+            if self.master.winfo_exists():
+                self._log_size_after_id = self.master.after(LOG_SIZE_REFRESH_INTERVAL_MS, self._schedule_log_size_refresh)
+        except Exception:
+            self._log_size_after_id = None
+
+    def _clear_logs(self, target: str):
+        options = {
+            "crawl": {
+                "name": "采集日志",
+                "handler": self.log_file_handler,
+                "widget": self.txt_log,
+            },
+            "upload": {
+                "name": "图片上传日志",
+                "handler": self.upload_log_file_handler,
+                "widget": self.txt_upload_log,
+            },
+        }
+        if target == "all":
+            confirm_text = "这会清空采集日志和图片上传日志，包括历史轮转文件。确定继续吗？"
+        else:
+            current = options[target]
+            confirm_text = f"这会清空{current['name']}，包括历史轮转文件。确定继续吗？"
+
+        if not messagebox.askyesno("清理日志", confirm_text):
+            return
+
+        try:
+            if target == "all":
+                for current in options.values():
+                    current["handler"].clear_all_files()
+                    self._clear_text_widget(current["widget"])
+            else:
+                current = options[target]
+                current["handler"].clear_all_files()
+                self._clear_text_widget(current["widget"])
+            self._refresh_log_size_labels()
+        except Exception as e:
+            messagebox.showerror("清理失败", f"日志清理失败：{e}")
+            return
+
+        messagebox.showinfo("清理完成", "日志已经清空完成。")
+
+    def clear_crawl_logs(self):
+        self._clear_logs("crawl")
+
+    def clear_upload_logs(self):
+        self._clear_logs("upload")
+
+    def clear_all_logs(self):
+        self._clear_logs("all")
 
     def get_login_qr_offset(self) -> Tuple[int, int]:
         try:
@@ -4499,6 +4685,12 @@ class App:
             except Exception:
                 pass
             self._ui_pump_after_id = None
+        if self._log_size_after_id is not None:
+            try:
+                self.master.after_cancel(self._log_size_after_id)
+            except Exception:
+                pass
+            self._log_size_after_id = None
         self.master.after(200, self.master.destroy)
 
 
