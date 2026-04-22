@@ -2,6 +2,7 @@ import os
 import pickle
 import sys
 import time
+import random
 import urllib
 import urllib.parse
 import pymysql
@@ -34,6 +35,11 @@ def convert_xhs_url(original_url):
         query=new_query
     )
     return urllib.parse.urlunparse(new_parsed)
+
+
+def normalize_xhs_note_url_for_dedup(original_url: str) -> str:
+    """返回用于数据库去重的小红书笔记地址，统一为不带 query 的 explore 地址。"""
+    return convert_xhs_url(original_url).split('?', 1)[0].split('#', 1)[0]
 
 
 def get_rednote_urls(row: Dict):
@@ -135,6 +141,11 @@ class XHSCrawler:
         self.collected_quick_data = []  # 快速模式数据缓存
         self.wait_rate = 5
 
+    def get_random_detail_sleep(self) -> float:
+        """按原详情等待秒数增加随机抖动，避免每次打开笔记间隔固定。"""
+        base_sleep = max(0.0, float(2 * self.wait_rate))
+        return max(0.0, base_sleep + random.uniform(-3.0, 3.0))
+
     def login(self):
         """优化登录流程"""
         self.driver.get('https://www.xiaohongshu.com/explore')
@@ -203,8 +214,12 @@ class XHSCrawler:
         try:
             # 新标签页操作逻辑
             self.driver.switch_to.window(self.main_window)
-            self.driver.execute_script(f"window.open('{note_url}');")
-            new_window = [w for w in self.driver.window_handles if w != self.main_window][0]
+            before_handles = set(self.driver.window_handles)
+            self.driver.execute_script("window.open(arguments[0], '_blank');", note_url)
+            WebDriverWait(self.driver, 10).until(
+                lambda d: len(set(d.window_handles) - before_handles) > 0
+            )
+            new_window = list(set(self.driver.window_handles) - before_handles)[0]
             self.driver.switch_to.window(new_window)
             print("等待网页加载")
 
@@ -213,7 +228,9 @@ class XHSCrawler:
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
             )
             print("网页已加载")
-            time.sleep(2 * self.wait_rate)
+            detail_sleep = self.get_random_detail_sleep()
+            print(f"详情页停留随机等待：{detail_sleep:.1f} 秒")
+            time.sleep(detail_sleep)
 
             try:
                 # 时间提取
@@ -322,9 +339,10 @@ class XHSCrawler:
             except Exception as close_e:
                 logging.warning(f"窗口关闭异常: {str(close_e)}")
 
-    def extract_current_links(self):
-        """实时提取当前可见的笔记链接（精确版）"""
-        current_links = set()
+    def extract_current_link_list(self):
+        """按页面卡片顺序提取当前虚拟列表中可见的笔记链接。"""
+        current_links = []
+        seen_links = set()
         try:
             items = self.driver.find_elements(By.CSS_SELECTOR, '.note-item')
             for item in items:
@@ -339,14 +357,20 @@ class XHSCrawler:
                     # 方案二：完全原始 URL（不推荐）
                     clean_url = raw_url.replace('&amp;', '&')  # 转换 HTML 实体
 
-                    current_links.add(clean_url)
+                    if clean_url and clean_url not in seen_links:
+                        current_links.append(clean_url)
+                        seen_links.add(clean_url)
                 except Exception as e:
                     continue
         except Exception as e:
             logging.warning(f"提取链接时遇到异常: {str(e)}")
         return current_links
 
-    def smart_scroll(self, spd_setting=1, max_scroll=20):
+    def extract_current_links(self):
+        """实时提取当前可见的笔记链接（兼容旧调用）"""
+        return set(self.extract_current_link_list())
+
+    def smart_scroll(self, spd_setting=1, max_scroll=20, full_collect_handler: Optional[Callable] = None):
         """智能滚动采集（动态保存链接）"""
         total_scroll = 0
         no_new_count = 0
@@ -357,23 +381,36 @@ class XHSCrawler:
         logging.info(f"智能滚动设置: 最大滚动次数={max_scroll}")
 
 
-        while no_new_count < max_no_new and total_scroll < max_scroll:
-            # 获取当前屏幕可见链接
-            current_links = self.extract_current_links()
-            # 关键修复：逐个转换链接
-            converted_new_links = {
-                convert_xhs_url(link).split('?')[0]
-                for link in (current_links - self.all_links)
+        def handle_visible_links():
+            current_link_list = self.extract_current_link_list()
+            current_links = set(current_link_list)
+            seen_base_urls = {
+                normalize_xhs_note_url_for_dedup(link)
+                for link in self.all_links
+                if link
             }
-            new_links = converted_new_links - self.all_links
+            new_note_urls = []
+            new_links = set()
+            for link in current_link_list:
+                base_url = normalize_xhs_note_url_for_dedup(link)
+                if not base_url or base_url in seen_base_urls or base_url in new_links:
+                    continue
+                new_note_urls.append(link)
+                new_links.add(base_url)
 
-            # 快速模式即时处理
-            if spd_setting == 2 and new_links:
+            if spd_setting == 1 and full_collect_handler and new_note_urls:
+                logging.info(f"发现 {len(new_note_urls)} 条新卡片，开始逐条访问详情")
+                full_collect_handler(new_note_urls)
+            elif spd_setting == 2 and new_links:
                 self.process_quick_data(new_links)  # 直接传递已转换的链接集合
 
             # 更新全局链接集合（使用原始链接）
             self.all_links.update(current_links)
             logging.info(f"当前总链接数：{len(self.all_links)} 新增：{len(new_links)}")
+
+        while no_new_count < max_no_new and total_scroll < max_scroll:
+            # 获取当前屏幕可见链接并即时处理，避免虚拟列表滚完后再集中访问
+            handle_visible_links()
 
             # 执行滚动
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -413,30 +450,33 @@ class XHSCrawler:
 
             for target_url in target_urls:
                 self.driver.get(target_url)
-                self.smart_scroll(spd_setting, max_scroll)  # 传入采集模式参数
 
                 # 全量采集模式处理
                 if spd_setting == 1:
-                    for note_url in self.all_links:
-                        base_url = convert_xhs_url(note_url).split('?')[0]
-                        if self.url_checker and self.url_checker(base_url):
-                            logging.info(f"已处理过，跳过: {base_url}")
-                            continue
+                    def handle_full_collect(note_urls):
+                        for note_url in note_urls:
+                            base_url = normalize_xhs_note_url_for_dedup(note_url)
+                            if self.url_checker and self.url_checker(base_url):
+                                logging.info(f"已处理过，跳过: {base_url}")
+                                continue
 
-                        detail = self.process_single_note(note_url)
-                        if detail:
-                            detail.update({
-                                'brand_id': brand['id'],
-                                'brand_name': brand['brand_name']
-                            })
-                            if self.insert_callback:
-                                try:
-                                    self.insert_callback(detail)
-                                except Exception as e:
-                                    logging.error(f"数据库插入失败: {str(e)}")
+                            detail = self.process_single_note(note_url)
+                            if detail:
+                                detail.update({
+                                    'brand_id': brand['id'],
+                                    'brand_name': brand['brand_name']
+                                })
+                                if self.insert_callback:
+                                    try:
+                                        self.insert_callback(detail)
+                                    except Exception as e:
+                                        logging.error(f"数据库插入失败: {str(e)}")
+
+                    self.smart_scroll(spd_setting, max_scroll, full_collect_handler=handle_full_collect)
 
                 # 快速采集模式数据提交
                 elif spd_setting == 2:
+                    self.smart_scroll(spd_setting, max_scroll)
                     for quick_data in self.collected_quick_data:
                         logging.info(f"写入快速采集数据: {quick_data}")
                         quick_data.update({
@@ -639,7 +679,8 @@ def main():
         print("准备登录")
         crawler.login()
 
-        for brand in db.fetch_brand_urls():
+        brands = db.fetch_brand_urls()
+        for idx, brand in enumerate(brands, start=1):
             try:
                 logging.info(f"处理品牌: {brand['brand_name']}")
 
@@ -662,6 +703,12 @@ def main():
             except Exception as e:
                 logging.error(f"品牌处理异常 {brand['brand_name']}: {str(e)}")
                 continue
+            finally:
+                if idx < len(brands):
+                    next_sleep = max(0.0, float(1.5 * crawler.wait_rate))
+                    if next_sleep > 0:
+                        logging.info(f"切换下一个主页前等待：{next_sleep:.1f} 秒")
+                        time.sleep(next_sleep)
 
     finally:
         crawler.driver.quit()

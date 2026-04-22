@@ -82,6 +82,11 @@ def convert_xhs_url(original_url: str) -> str:
     return urllib.parse.urlunparse(new_parsed)
 
 
+def normalize_xhs_note_url_for_dedup(original_url: str) -> str:
+    """返回用于数据库去重的小红书笔记地址，统一为不带 query 的 explore 地址。"""
+    return convert_xhs_url(original_url).split('?', 1)[0].split('#', 1)[0]
+
+
 def get_rednote_urls(row: Dict) -> List[str]:
     urls: List[str] = []
     for key in ("rednote_url", "rednote_url2"):
@@ -995,6 +1000,11 @@ class XHSCrawler:
     def _inc_stat(stats: Dict[str, int], key: str, step: int = 1):
         """对采集统计中的指定字段做自增。"""
         stats[key] = int(stats.get(key, 0)) + int(step)
+
+    def _get_random_detail_sleep(self) -> float:
+        """按配置的详情等待秒数增加随机抖动，避免每次打开笔记间隔固定。"""
+        base_sleep = max(0.0, float(self.get_detail_sleep()))
+        return max(0.0, base_sleep + random.uniform(-3.0, 3.0))
 
     def _inject_runtime_stealth_overrides(self):
         """注入补充反检测脚本，尽量降低 webdriver/cdc_* 暴露特征。"""
@@ -2377,8 +2387,10 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
         self._notify_login_qr_cleared(stage="扫码登录", reason="扫码登录成功")
         return self.driver.get_cookies()
 
-    def extract_current_links(self):
-        current_links = set()
+    def extract_current_link_list(self) -> List[str]:
+        """按页面卡片顺序提取当前虚拟列表中可见的笔记链接。"""
+        current_links: List[str] = []
+        seen_links = set()
         try:
             items = self.driver.find_elements(By.CSS_SELECTOR, '.note-item')
             for item in items:
@@ -2386,14 +2398,26 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
                     link_element = item.find_element(By.CSS_SELECTOR, 'a.cover.mask.ld[href^="/user/profile/"]')
                     raw_url = link_element.get_attribute('href')
                     clean_url = raw_url.replace('&amp;', '&')
-                    current_links.add(clean_url)
+                    if clean_url and clean_url not in seen_links:
+                        current_links.append(clean_url)
+                        seen_links.add(clean_url)
                 except Exception:
                     continue
         except Exception as e:
             self.logger.warning(f"提取链接异常: {e}")
         return current_links
 
-    def smart_scroll(self, spd_setting=1, max_scroll=None, stats: Optional[Dict[str, int]] = None):
+    def extract_current_links(self):
+        """提取当前虚拟列表中可见的笔记链接，兼容旧调用。"""
+        return set(self.extract_current_link_list())
+
+    def smart_scroll(
+            self,
+            spd_setting=1,
+            max_scroll=None,
+            stats: Optional[Dict[str, int]] = None,
+            full_collect_handler: Optional[Callable[[List[str]], None]] = None
+    ):
         total_scroll = 0
         no_new_count = 0
         max_no_new = 6
@@ -2402,17 +2426,35 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
 
         self.logger.info(f"智能滚动设置: 最大滚动次数={max_scroll}（滚动等待将实时读取 GUI 配置）")
 
+        def handle_visible_links(stage: str):
+            current_link_list = self.extract_current_link_list()
+            current_links = set(current_link_list)
+            seen_base_urls = {
+                normalize_xhs_note_url_for_dedup(link)
+                for link in self.all_links
+                if link
+            }
+            new_note_urls: List[str] = []
+            new_base_urls = set()
+            for link in current_link_list:
+                base_url = normalize_xhs_note_url_for_dedup(link)
+                if not base_url or base_url in seen_base_urls or base_url in new_base_urls:
+                    continue
+                new_note_urls.append(link)
+                new_base_urls.add(base_url)
+
+            if spd_setting == 1 and full_collect_handler and new_note_urls:
+                self.logger.info(f"{stage}发现 {len(new_note_urls)} 条新卡片，开始逐条访问详情")
+                full_collect_handler(new_note_urls)
+            elif spd_setting == 2 and new_base_urls:
+                self.process_quick_data(new_base_urls, stats=stats)
+
+            self.all_links.update(current_links)
+            self.logger.info(f"{stage}当前总链接数：{len(self.all_links)} 新增：{len(new_base_urls)}")
+
         self.check_stop()
         self._detect_and_handle_captcha("scroll")
-        current_links = self.extract_current_links()
-        converted_new_links = {convert_xhs_url(link).split('?')[0] for link in (current_links - self.all_links)}
-        new_links = converted_new_links - {convert_xhs_url(x).split('?')[0] for x in self.all_links}
-
-        if spd_setting == 2 and new_links:
-            self.process_quick_data(new_links, stats=stats)
-
-        self.all_links.update(current_links)
-        self.logger.info(f"[首屏] 当前总链接数：{len(self.all_links)} 新增：{len(new_links)}")
+        handle_visible_links("[首屏] ")
 
         if max_scroll <= 0:
             return
@@ -2420,16 +2462,7 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
         while no_new_count < max_no_new and total_scroll < max_scroll:
             self.check_stop()
             self._detect_and_handle_captcha("scroll")
-
-            current_links = self.extract_current_links()
-            converted_new_links = {convert_xhs_url(link).split('?')[0] for link in (current_links - self.all_links)}
-            new_links = converted_new_links - {convert_xhs_url(x).split('?')[0] for x in self.all_links}
-
-            if spd_setting == 2 and new_links:
-                self.process_quick_data(new_links, stats=stats)
-
-            self.all_links.update(current_links)
-            self.logger.info(f"当前总链接数：{len(self.all_links)} 新增：{len(new_links)}")
+            handle_visible_links("")
 
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
 
@@ -2445,91 +2478,123 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
 
             total_scroll += 1
 
-    def process_single_note(self, origin_note_url: str) -> Optional[Dict]:
+    def process_single_note(self, origin_note_url: str, keep_current_window: bool = False) -> Optional[Dict]:
         note_url = convert_xhs_url(origin_note_url)
+        if keep_current_window:
+            self.logger.info(f"打开URL(新标签保留列表): {origin_note_url} -> {note_url}")
+            feed_window = self.driver.current_window_handle
+            before_handles = set(self.driver.window_handles)
+            try:
+                self.driver.execute_script("window.open(arguments[0], '_blank');", note_url)
+                WebDriverWait(self.driver, 10).until(
+                    lambda d: len(set(d.window_handles) - before_handles) > 0
+                )
+                new_handles = list(set(self.driver.window_handles) - before_handles)
+                detail_window = new_handles[0]
+                self.driver.switch_to.window(detail_window)
+                return self._extract_note_detail_from_current_page(note_url)
+            except Exception as e:
+                self.logger.error(f"笔记处理失败 {note_url}: {e}", exc_info=True)
+                return None
+            finally:
+                try:
+                    if self.driver.current_window_handle != feed_window:
+                        self.driver.close()
+                except Exception as close_err:
+                    self.logger.warning(f"关闭详情标签页失败: {close_err}")
+                try:
+                    self.driver.switch_to.window(feed_window)
+                except Exception as switch_err:
+                    self.logger.warning(f"切回列表页失败: {switch_err}")
+
         self.logger.info(f"打开URL(单窗口复用): {origin_note_url} -> {note_url}")
-        img_urls = []
 
         try:
             self._driver_get(note_url)
-            WebDriverWait(self.driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
-            )
-
-            self._detect_and_handle_captcha("detail")
-
-            detail_sleep = max(0.0, float(self.get_detail_sleep()))
-            self._sleep_with_progress("detail", detail_sleep)
-
-            try:
-                time_element = self.driver.find_element(By.CSS_SELECTOR, '.bottom-container .date')
-                raw_time = time_element.text.strip()
-                auth_time = parse_xhs_time(raw_time)
-            except Exception as te:
-                self.logger.warning(f"时间提取失败: {te}")
-                auth_time = 0
-
-            try:
-                like_count = 0
-                like_element = self.driver.find_element(By.CSS_SELECTOR, '.interact-container .like-active .count')
-                like_text = like_element.text.strip()
-                if '万' in like_text:
-                    like_count = int(float(like_text.replace('万', '')) * 10000)
-                elif 'k' in like_text.lower():
-                    like_count = int(float(like_text.lower().replace('k', '')) * 1000)
-                else:
-                    like_count = int(like_text) if like_text.isdigit() else 0
-            except Exception as le:
-                self.logger.warning(f"点赞数提取失败: {le}")
-                like_count = 0
-
-            try:
-                video_element = self.driver.find_element(By.CSS_SELECTOR, '.player-container')
-                if video_element:
-                    try:
-                        poster = self.driver.find_element(By.CSS_SELECTOR, 'xg-poster.xgplayer-poster')
-                        style = poster.get_attribute('style')
-                        cover_url = style.split('url("')[1].split('")')[0].replace('&quot;', '')
-                        img_urls = [cover_url]
-                    except Exception as ve2:
-                        self.logger.warning(f"视频封面提取失败: {ve2}")
-            except Exception:
-                try:
-                    swiper = self.driver.find_element(By.CLASS_NAME, 'swiper-wrapper')
-                    for img in swiper.find_elements(By.TAG_NAME, 'img'):
-                        src = img.get_attribute('src')
-                        if src and src.startswith('http') and src not in img_urls:
-                            img_urls.append(src)
-                except Exception as ie:
-                    self.logger.warning(f"图片提取失败: {ie}")
-
-            content = ''
-            try:
-                text_element = self.driver.find_element(By.CSS_SELECTOR, '.note-content .desc')
-                content = text_element.text.replace('\n', ' ').strip()[:2000]
-            except Exception as te:
-                self.logger.warning(f"内容提取失败: {te}")
-
-            title = ''
-            try:
-                title_element = self.driver.find_element(By.ID, 'detail-title')
-                title = title_element.text.strip()
-            except Exception as title_e:
-                self.logger.warning(f"标题提取失败: {title_e}")
-
-            baseUrl = note_url.split('?')[0]
-            return {
-                'images': img_urls,
-                'content': content,
-                'url': baseUrl,
-                'title': title,
-                'auth_time': auth_time,
-                'like_count': like_count,
-            }
-
+            return self._extract_note_detail_from_current_page(note_url)
         except Exception as e:
             self.logger.error(f"笔记处理失败 {note_url}: {e}", exc_info=True)
             return None
+
+    def _extract_note_detail_from_current_page(self, note_url: str) -> Dict:
+        """从当前已打开的笔记详情页提取内容。"""
+        img_urls = []
+
+        WebDriverWait(self.driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".note-container"))
+        )
+
+        self._detect_and_handle_captcha("detail")
+
+        detail_sleep = self._get_random_detail_sleep()
+        self.logger.info(f"详情页停留随机等待：{detail_sleep:.1f} 秒")
+        self._sleep_with_progress("detail", detail_sleep)
+
+        try:
+            time_element = self.driver.find_element(By.CSS_SELECTOR, '.bottom-container .date')
+            raw_time = time_element.text.strip()
+            auth_time = parse_xhs_time(raw_time)
+        except Exception as te:
+            self.logger.warning(f"时间提取失败: {te}")
+            auth_time = 0
+
+        try:
+            like_count = 0
+            like_element = self.driver.find_element(By.CSS_SELECTOR, '.interact-container .like-active .count')
+            like_text = like_element.text.strip()
+            if '万' in like_text:
+                like_count = int(float(like_text.replace('万', '')) * 10000)
+            elif 'k' in like_text.lower():
+                like_count = int(float(like_text.lower().replace('k', '')) * 1000)
+            else:
+                like_count = int(like_text) if like_text.isdigit() else 0
+        except Exception as le:
+            self.logger.warning(f"点赞数提取失败: {le}")
+            like_count = 0
+
+        try:
+            video_element = self.driver.find_element(By.CSS_SELECTOR, '.player-container')
+            if video_element:
+                try:
+                    poster = self.driver.find_element(By.CSS_SELECTOR, 'xg-poster.xgplayer-poster')
+                    style = poster.get_attribute('style')
+                    cover_url = style.split('url("')[1].split('")')[0].replace('&quot;', '')
+                    img_urls = [cover_url]
+                except Exception as ve2:
+                    self.logger.warning(f"视频封面提取失败: {ve2}")
+        except Exception:
+            try:
+                swiper = self.driver.find_element(By.CLASS_NAME, 'swiper-wrapper')
+                for img in swiper.find_elements(By.TAG_NAME, 'img'):
+                    src = img.get_attribute('src')
+                    if src and src.startswith('http') and src not in img_urls:
+                        img_urls.append(src)
+            except Exception as ie:
+                self.logger.warning(f"图片提取失败: {ie}")
+
+        content = ''
+        try:
+            text_element = self.driver.find_element(By.CSS_SELECTOR, '.note-content .desc')
+            content = text_element.text.replace('\n', ' ').strip()[:2000]
+        except Exception as te:
+            self.logger.warning(f"内容提取失败: {te}")
+
+        title = ''
+        try:
+            title_element = self.driver.find_element(By.ID, 'detail-title')
+            title = title_element.text.strip()
+        except Exception as title_e:
+            self.logger.warning(f"标题提取失败: {title_e}")
+
+        baseUrl = note_url.split('?', 1)[0]
+        return {
+            'images': img_urls,
+            'content': content,
+            'url': baseUrl,
+            'title': title,
+            'auth_time': auth_time,
+            'like_count': like_count,
+        }
 
     def process_quick_data(self, new_links: set, stats: Optional[Dict[str, int]] = None):
         current_items = self.driver.find_elements(By.CSS_SELECTOR, '.note-item')
@@ -2634,34 +2699,44 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
                 self.check_stop()
                 self._driver_get(target_url)
                 self._detect_and_handle_captcha("scroll")
-                self.smart_scroll(spd_setting, max_scroll, stats=current_stats)
 
                 if spd_setting == 1:
-                    for note_url in list(self.all_links):
-                        self.check_stop()
-                        base_url = convert_xhs_url(note_url).split('?')[0]
-                        if self.url_checker and self.url_checker(base_url):
-                            self._inc_stat(current_stats, "skipped_existing_urls")
-                            continue
-                        self._inc_stat(current_stats, "opened_urls")
-                        detail = self.process_single_note(note_url)
-                        detail_sleep = max(0.0, float(self.get_detail_sleep()))
-                        self._sleep_with_progress("detail", detail_sleep)
+                    def handle_full_collect(note_urls: List[str]):
+                        for note_url in note_urls:
+                            self.check_stop()
+                            base_url = normalize_xhs_note_url_for_dedup(note_url)
+                            if self.url_checker and self.url_checker(base_url):
+                                self._inc_stat(current_stats, "skipped_existing_urls")
+                                self.logger.info(f"已存在，跳过详情访问: {base_url}")
+                                continue
+                            self._inc_stat(current_stats, "opened_urls")
+                            detail = self.process_single_note(note_url, keep_current_window=True)
 
-                        if detail:
-                            if self.target_type == TargetType.BRAND:
-                                detail.update({'brand_id': row['id'], 'brand_name': row.get('brand_name', '')})
-                            else:
-                                detail.update(
-                                    {'artist_id': row['id'], 'artist_name': row.get('brand_name', ''), 'full_get': 0})
-                            if self.insert_callback:
-                                inserted = self.insert_callback(detail)
-                                if inserted is not False:
-                                    self._inc_stat(current_stats, "inserted_urls")
+                            if detail:
+                                if self.target_type == TargetType.BRAND:
+                                    detail.update({'brand_id': row['id'], 'brand_name': row.get('brand_name', '')})
                                 else:
-                                    self._inc_stat(current_stats, "skipped_existing_urls")
+                                    detail.update({
+                                        'artist_id': row['id'],
+                                        'artist_name': row.get('brand_name', ''),
+                                        'full_get': 0
+                                    })
+                                if self.insert_callback:
+                                    inserted = self.insert_callback(detail)
+                                    if inserted is not False:
+                                        self._inc_stat(current_stats, "inserted_urls")
+                                    else:
+                                        self._inc_stat(current_stats, "skipped_existing_urls")
+
+                    self.smart_scroll(
+                        spd_setting,
+                        max_scroll,
+                        stats=current_stats,
+                        full_collect_handler=handle_full_collect
+                    )
 
                 elif spd_setting == 2:
+                    self.smart_scroll(spd_setting, max_scroll, stats=current_stats)
                     for quick_data in self.collected_quick_data:
                         self.check_stop()
                         if self.target_type == TargetType.BRAND:
@@ -4580,6 +4655,20 @@ class App:
                     finally:
                         self.done_rows = idx
                         self.ui_update_progress()
+                        if (
+                                idx < self.total_rows
+                                and self.crawler
+                                and not self.crawler.stop_requested
+                        ):
+                            try:
+                                next_sleep = max(0.0, float(self.get_scroll_sleep()))
+                                if next_sleep > 0:
+                                    self.logger.info(f"切换下一个主页前等待：{next_sleep:.1f} 秒")
+                                    self.crawler._sleep_with_progress("scroll", next_sleep)
+                            except KeyboardInterrupt:
+                                raise
+                            except Exception as wait_err:
+                                self.logger.warning(f"切换主页等待异常，将继续执行：{wait_err}")
 
                 if self.crawler and self.crawler.stop_requested:
                     self.logger.info("任务被用户停止")
