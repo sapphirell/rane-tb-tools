@@ -65,6 +65,10 @@ def get_runtime_base_dir() -> str:
 LOG_ROTATE_MAX_BYTES = 5 * 1024 * 1024
 LOG_ROTATE_BACKUP_COUNT = 4
 LOG_SIZE_REFRESH_INTERVAL_MS = 5000
+BRAND_DAILY_ACCOUNT_LIMIT = 500
+BRAND_ACCOUNT_ROTATE_EVERY = 10
+LOGIN_QR_CAPTURE_INTERVAL_SEC = 10.0
+LOGIN_QR_REEMIT_INTERVAL_SEC = 25.0
 
 
 def convert_xhs_url(original_url: str) -> str:
@@ -178,6 +182,12 @@ class TargetType:
     ARTIST = 'artist'  # 写 artist_spider_log
 
 
+class CrawlMode:
+    HOT = 'hot'
+    REVERSE = 'reverse'
+    FULL = 'full'
+
+
 class DatabaseManager:
     def __init__(self):
         self._conn_args = dict(
@@ -196,6 +206,7 @@ class DatabaseManager:
         self.connection = pymysql.connect(**self._conn_args)
         self._has_likes_col_spider = None
         self._has_likes_col_artist = None
+        self._ensure_xhs_cookie_quota_columns()
 
     def _ensure_conn(self):
         try:
@@ -220,6 +231,21 @@ class DatabaseManager:
                 else:
                     cursor.execute(sql, params or ())
                 return cursor, cursor.rowcount
+
+    def _ensure_xhs_cookie_quota_columns(self):
+        """确保现有采集账号表具备每日品牌打开额度字段。"""
+        try:
+            cur, _ = self._exec("SHOW COLUMNS FROM xhs_cookies")
+            existing = {str(row.get("Field") or "") for row in (cur.fetchall() or [])}
+            alters = []
+            if "brand_daily_open_date" not in existing:
+                alters.append("ADD COLUMN brand_daily_open_date DATE NULL COMMENT '品牌采集每日额度日期'")
+            if "brand_daily_open_count" not in existing:
+                alters.append("ADD COLUMN brand_daily_open_count INT NOT NULL DEFAULT 0 COMMENT '品牌采集当日已打开品牌数'")
+            if alters:
+                self._exec("ALTER TABLE xhs_cookies " + ", ".join(alters))
+        except Exception as e:
+            logging.getLogger(__name__).warning("确保账号每日额度字段失败: %s", e)
 
     @staticmethod
     def _normalize_url_for_md5(url: str) -> str:
@@ -310,6 +336,59 @@ class DatabaseManager:
         """更新最后使用时间"""
         now = int(time.time())
         self._exec("UPDATE xhs_cookies SET last_used_at = %s WHERE account_name = %s", (now, account_name))
+
+    def fetch_brand_daily_usage(self, account_names: List[str]) -> Dict[str, int]:
+        """获取账号今日已打开品牌数。"""
+        names = [str(name or "").strip() for name in account_names if str(name or "").strip()]
+        if not names:
+            return {}
+        placeholders = ",".join(["%s"] * len(names))
+        sql = f"""
+            SELECT
+                account_name,
+                CASE
+                    WHEN brand_daily_open_date = CURDATE() THEN brand_daily_open_count
+                    ELSE 0
+                END AS used_count
+            FROM xhs_cookies
+            WHERE account_name IN ({placeholders})
+        """
+        cur, _ = self._exec(sql, tuple(names))
+        return {
+            str(row.get("account_name") or ""): int(row.get("used_count") or 0)
+            for row in (cur.fetchall() or [])
+        }
+
+    def reserve_brand_daily_quota(self, account_name: str, limit: int = BRAND_DAILY_ACCOUNT_LIMIT) -> bool:
+        """为账号原子占用一个品牌打开额度。"""
+        account_name = str(account_name or "").strip()
+        if not account_name:
+            return False
+        _, affected = self._exec(
+            """
+            UPDATE xhs_cookies
+            SET
+                brand_daily_open_date = CURDATE(),
+                brand_daily_open_count = CASE
+                    WHEN brand_daily_open_date = CURDATE() THEN brand_daily_open_count + 1
+                    ELSE 1
+                END,
+                last_used_at = UNIX_TIMESTAMP()
+            WHERE account_name = %s
+              AND (
+                brand_daily_open_date IS NULL
+                OR brand_daily_open_date <> CURDATE()
+                OR brand_daily_open_count < %s
+              )
+            """,
+            (account_name, int(limit))
+        )
+        return int(affected or 0) > 0
+
+    def get_brand_daily_used_count(self, account_name: str) -> int:
+        """获取单个账号今日已打开品牌数。"""
+        usage = self.fetch_brand_daily_usage([account_name])
+        return int(usage.get(account_name, 0))
 
     def delete_xhs_cookie(self, account_name: str) -> int:
         """删除指定账号Cookie，返回影响行数"""
@@ -414,15 +493,47 @@ class DatabaseManager:
         return self._has_likes_col_artist
 
     # --- 品牌 ---
-    def fetch_brand_urls(self) -> list:
-        sql = """
-            SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting 
-            FROM brand 
-            WHERE (rednote_url != '' OR rednote_url2 != '')
-              AND is_delete = 0
-              AND is_brand = 1
-            ORDER BY spider_index DESC, last_gather_time ASC
-        """
+    def fetch_brand_urls(self, crawl_mode: str = CrawlMode.FULL) -> list:
+        if crawl_mode == CrawlMode.HOT:
+            sql = """
+                SELECT
+                    b.id,
+                    b.brand_name,
+                    b.rednote_url,
+                    b.rednote_url2,
+                    b.rednote_spd_setting,
+                    COUNT(sl.id) AS recent_post_count
+                FROM brand b
+                JOIN spider_log sl
+                  ON sl.brand_id = b.id
+                 AND sl.created_at >= UNIX_TIMESTAMP(DATE_SUB(NOW(), INTERVAL 7 DAY))
+                 AND sl.status >= 0
+                WHERE (b.rednote_url != '' OR b.rednote_url2 != '')
+                  AND b.is_delete = 0
+                  AND b.is_brand = 1
+                GROUP BY b.id, b.brand_name, b.rednote_url, b.rednote_url2, b.rednote_spd_setting
+                HAVING recent_post_count >= 2
+                ORDER BY recent_post_count DESC, b.last_gather_time ASC
+            """
+        elif crawl_mode == CrawlMode.REVERSE:
+            sql = """
+                SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting
+                FROM brand
+                WHERE (rednote_url != '' OR rednote_url2 != '')
+                  AND is_delete = 0
+                  AND is_brand = 1
+                  AND (last_gather_time IS NULL OR last_gather_time < DATE_SUB(NOW(), INTERVAL 36 HOUR))
+                ORDER BY last_gather_time DESC, id DESC
+            """
+        else:
+            sql = """
+                SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting
+                FROM brand
+                WHERE (rednote_url != '' OR rednote_url2 != '')
+                  AND is_delete = 0
+                  AND is_brand = 1
+                ORDER BY last_gather_time DESC, id DESC
+            """
         cur, _ = self._exec(sql)
         return cur.fetchall()
 
@@ -887,6 +998,7 @@ class XHSCrawler:
         self.logger = logger or logging.getLogger(__name__)
         self.stop_requested = False
         self.run_in_background = bool(run_in_background) and (not bool(headless))
+        self.headless = bool(headless)
         self._background_window_applied = False
         self._background_window_warned = False
         self._last_background_apply_ts = 0.0
@@ -967,6 +1079,13 @@ class XHSCrawler:
                 f"并查看 spiders/tmp/*driver_*.log。"
             ) from e
 
+        self._setup_started_browser(headless=headless)
+
+        self.all_links = set()
+        self.collected_quick_data = []
+
+    def _setup_started_browser(self, *, headless: bool):
+        """浏览器启动后统一注入反检测脚本与基础指纹配置。"""
         stealth_path = os.path.join(get_resource_base_dir(), 'stealth.min.js')
         if os.path.exists(stealth_path):
             try:
@@ -983,9 +1102,6 @@ class XHSCrawler:
         self._inject_runtime_stealth_overrides()
         self._apply_cdp_anti_detection(headless=headless)
         self._enforce_background_window_state(force=True)
-
-        self.all_links = set()
-        self.collected_quick_data = []
 
     @staticmethod
     def _new_crawl_stats() -> Dict[str, int]:
@@ -1609,11 +1725,109 @@ class XHSCrawler:
 
     def _driver_get(self, url: str):
         self.driver.get(url)
-        self._enforce_background_window_state()
+        if "xiaohongshu.com" in str(url or ""):
+            # 每次打开小红书页面后补打一遍运行期反检测脚本，避免只在新文档注入时生效。
+            self._inject_runtime_stealth_overrides()
 
     def _driver_refresh(self):
         self.driver.refresh()
-        self._enforce_background_window_state()
+        try:
+            if "xiaohongshu.com" in str(self.driver.current_url or ""):
+                self._inject_runtime_stealth_overrides()
+        except Exception:
+            pass
+
+    def _restart_browser_session_after_captcha(self, resume_url: str = "") -> bool:
+        """风控扫码后重启当前浏览器会话，重新挂载账号 profile。"""
+        resume_url = str(resume_url or "").strip()
+        cookie_snapshot = []
+        try:
+            cookie_snapshot = self.driver.get_cookies() or []
+        except Exception:
+            cookie_snapshot = []
+        if cookie_snapshot and self.account_name:
+            try:
+                db = DatabaseManager()
+                try:
+                    db.upsert_xhs_cookie(self.account_name, cookie_snapshot)
+                    self.logger.info(
+                        "风控扫码后已保存账号 [%s] 最新 Cookie（%d条）",
+                        self.account_name,
+                        len(cookie_snapshot)
+                    )
+                finally:
+                    try:
+                        db.connection.close()
+                    except Exception:
+                        pass
+            except Exception as save_err:
+                self.logger.warning("风控扫码后保存 Cookie 失败: %s", save_err)
+
+        self.logger.info("风控恢复后重启当前浏览器会话，以重新挂载登录态（账号: %s）", self.account_name or "-")
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:
+            pass
+
+        try:
+            self._clean_profile_runtime_locks(self.account_profile_dir)
+            self.driver = self._start_browser_with_profile(self.account_profile_dir, headless=self.headless)
+            self._setup_started_browser(headless=self.headless)
+            self._driver_get(resume_url or 'https://www.xiaohongshu.com/')
+
+            if cookie_snapshot:
+                injected = 0
+                for cookie in cookie_snapshot:
+                    c = self._sanitize_cookie_for_injection(cookie)
+                    if not c:
+                        continue
+                    try:
+                        self.driver.add_cookie(c)
+                        injected += 1
+                    except Exception:
+                        continue
+                if injected:
+                    self.logger.info("风控恢复后已重新注入 Cookie：%d 条", injected)
+                    self._driver_refresh()
+
+            ok, reason = self._wait_for_session_ready(
+                timeout_sec=30,
+                stage="风控恢复",
+                allow_cookie_fallback=True,
+                cross_page_validation=False
+            )
+            if not ok:
+                self.logger.warning("风控恢复后重启浏览器仍未确认登录态：%s", reason)
+                return False
+            try:
+                latest_snapshot = self.driver.get_cookies() or []
+                if latest_snapshot and self.account_name:
+                    db = DatabaseManager()
+                    try:
+                        db.upsert_xhs_cookie(self.account_name, latest_snapshot)
+                        self.logger.info(
+                            "风控恢复后已回写账号 [%s] Cookie（%d条）",
+                            self.account_name,
+                            len(latest_snapshot)
+                        )
+                    finally:
+                        try:
+                            db.connection.close()
+                        except Exception:
+                            pass
+            except Exception as save_latest_err:
+                self.logger.warning("风控恢复后回写 Cookie 失败: %s", save_latest_err)
+
+            if resume_url:
+                try:
+                    self._driver_get(resume_url)
+                except Exception as open_err:
+                    self.logger.warning("风控恢复后返回原页面失败，将继续当前页: %s", open_err)
+            return True
+        except Exception as e:
+            self.logger.exception("风控恢复后重启浏览器会话失败: %s", e)
+            return False
 
     # ---- stop / pause ----
     def request_stop(self):
@@ -1653,20 +1867,32 @@ class XHSCrawler:
 
             def _handle_detected(captcha_type: str, reason: str):
                 self.logger.warning(reason)
+                resume_url = ""
                 try:
-                    captured = self._try_capture_login_qr(
-                        stage=f"{where}-captcha",
-                        reason=f"{captcha_type}:{where}",
-                        force_center=True,
-                        container_selectors=["#captcha-div", "#red-captcha", ".captcha-modal-content"],
-                        override_offset=(0, 0)
-                    )
-                    if captured:
-                        self.logger.info("已自动捕获风控二维码并回显到 GUI（captcha_type=%s, where=%s）", captcha_type, where)
+                    resume_url = str(self.driver.current_url or "").strip()
+                except Exception:
+                    resume_url = ""
+                try:
+                    if captcha_type == "login-required":
+                        captured = self._try_capture_login_qr(
+                            stage=f"{where}-login",
+                            reason=f"{captcha_type}:{where}",
+                            force_emit=True
+                        )
                     else:
-                        self.logger.info("未捕获到风控二维码（captcha_type=%s, where=%s），请在浏览器手动处理", captcha_type, where)
+                        captured = self._try_capture_login_qr(
+                            stage=f"{where}-captcha",
+                            reason=f"{captcha_type}:{where}",
+                            force_center=True,
+                            container_selectors=["#captcha-div", "#red-captcha", ".captcha-modal-content"],
+                            override_offset=(0, 0)
+                        )
+                    if captured:
+                        self.logger.info("已自动捕获二维码并回显到 GUI（type=%s, where=%s）", captcha_type, where)
+                    else:
+                        self.logger.info("未捕获到二维码（type=%s, where=%s），请在浏览器手动处理", captcha_type, where)
                 except Exception as cap_err:
-                    self.logger.warning("风控二维码捕获异常: %s", cap_err)
+                    self.logger.warning("二维码捕获异常: %s", cap_err)
                 if can_pause:
                     try:
                         self.on_captcha_detected(where, captcha_type)
@@ -1674,10 +1900,7 @@ class XHSCrawler:
                         self.on_captcha_detected(where)
                     self.request_pause(f"{captcha_type}@{where}")
                     self._wait_until_resumed()
-                    try:
-                        self._driver_refresh()
-                    except Exception:
-                        pass
+                    self._restart_browser_session_after_captcha(resume_url)
                 else:
                     self.logger.warning("当前无暂停回调，需在浏览器中手动完成验证后继续。")
                     time.sleep(2.0)
@@ -1708,6 +1931,13 @@ class XHSCrawler:
                 return _handle_detected(
                     "red-captcha",
                     f"检测到验证码 #red-captcha（{where}），将暂停采集并等待你处理验证码。"
+                )
+            # 4. 普通掉线/登录页：也进入扫码恢复流程
+            logged_out_reason = self._detect_logged_out_reason()
+            if logged_out_reason:
+                return _handle_detected(
+                    "login-required",
+                    f"检测到登录态丢失（{where}）：{logged_out_reason}，将暂停采集并等待扫码登录。"
                 )
         except Exception:
             pass
@@ -1745,6 +1975,32 @@ class XHSCrawler:
             out["sameSite"] = same_site
 
         return out
+
+    def _persist_current_cookies(self, stage: str) -> List[Dict]:
+        """保存当前浏览器 Cookie 到采集账号表。"""
+        try:
+            cookies = self.driver.get_cookies() or []
+        except Exception as e:
+            self.logger.warning("%s 获取当前 Cookie 失败: %s", stage, e)
+            return []
+        if not cookies:
+            self.logger.warning("%s 当前浏览器没有可保存的 Cookie", stage)
+            return []
+        if not self.account_name:
+            return cookies
+        try:
+            db = DatabaseManager()
+            try:
+                db.upsert_xhs_cookie(self.account_name, cookies)
+                self.logger.info("%s 已保存账号 [%s] Cookie（%d条）", stage, self.account_name, len(cookies))
+            finally:
+                try:
+                    db.connection.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.warning("%s 保存账号 [%s] Cookie 失败: %s", stage, self.account_name, e)
+        return cookies
 
     def _has_login_marker(self, *, allow_cookie_fallback: bool = True) -> bool:
         # 若页面明确出现“登录”入口，优先判定为未登录，避免误把公共页面元素当作登录态
@@ -2049,6 +2305,12 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
         now = time.time()
         if self._last_login_qr_emit_ts > 0 and now - self._last_login_qr_emit_ts < 1.2:
             return False
+        if (
+                not force_emit
+                and self._last_login_qr_emit_ts > 0
+                and now - self._last_login_qr_emit_ts < LOGIN_QR_REEMIT_INTERVAL_SEC
+        ):
+            return False
 
         anchor_rects, modal_rects = self._find_login_context_rects()
         container_rects = self._find_visible_rects_by_selectors(container_selectors or []) if container_selectors else []
@@ -2285,6 +2547,7 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
         last_reason = "会话尚未就绪"
         last_qr_capture_ts = 0.0
         login_marker_hits = 0
+        qr_capture_interval = LOGIN_QR_CAPTURE_INTERVAL_SEC if stage == "扫码登录" else 3.0
 
         while time.time() < deadline:
             if self.stop_requested:
@@ -2295,7 +2558,7 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
                     login_marker_hits = 0
                     last_reason = "未检测到登录态标记"
                     now = time.time()
-                    if (now - last_qr_capture_ts) >= 3.0:
+                    if (now - last_qr_capture_ts) >= qr_capture_interval:
                         self._try_capture_login_qr(stage=stage, reason=last_reason)
                         last_qr_capture_ts = now
                     time.sleep(1.0)
@@ -2318,7 +2581,7 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
                 last_reason = reason or "跨页验证未通过"
                 if ("登录" in last_reason) or ("未检测到登录态" in last_reason):
                     now = time.time()
-                    if (now - last_qr_capture_ts) >= 3.0:
+                    if (now - last_qr_capture_ts) >= qr_capture_interval:
                         self._try_capture_login_qr(stage=stage, reason=last_reason)
                         last_qr_capture_ts = now
                 self.logger.info(f"{stage} 会话未稳定：{last_reason}，等待重试...")
@@ -2368,7 +2631,7 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
                     self.logger.info("Cookie 登录成功（已通过跨页会话校验）")
                     self._notify_login_qr_cleared(stage="Cookie登录", reason="Cookie 登录成功")
                     sleep(1)
-                    return self.driver.get_cookies()
+                    return self._persist_current_cookies("Cookie登录")
                 self.logger.warning(f"Cookie 登录会话不稳定：{reason}，将转为手动登录")
             except Exception as e:
                 self.logger.warning(f"Cookie 登录失败或失效: {e}，将转为手动登录")
@@ -2385,7 +2648,7 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
             raise RuntimeError(f"扫码后会话仍未稳定：{reason}")
         self.logger.info('扫码登录成功（会话稳定）')
         self._notify_login_qr_cleared(stage="扫码登录", reason="扫码登录成功")
-        return self.driver.get_cookies()
+        return self._persist_current_cookies("扫码登录")
 
     def extract_current_link_list(self) -> List[str]:
         """按页面卡片顺序提取当前虚拟列表中可见的笔记链接。"""
@@ -2481,31 +2744,34 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
     def process_single_note(self, origin_note_url: str, keep_current_window: bool = False) -> Optional[Dict]:
         note_url = convert_xhs_url(origin_note_url)
         if keep_current_window:
-            self.logger.info(f"打开URL(新标签保留列表): {origin_note_url} -> {note_url}")
-            feed_window = self.driver.current_window_handle
-            before_handles = set(self.driver.window_handles)
+            self.logger.info(f"打开URL(当前标签保留列表上下文): {origin_note_url} -> {note_url}")
             try:
-                self.driver.execute_script("window.open(arguments[0], '_blank');", note_url)
-                WebDriverWait(self.driver, 10).until(
-                    lambda d: len(set(d.window_handles) - before_handles) > 0
-                )
-                new_handles = list(set(self.driver.window_handles) - before_handles)
-                detail_window = new_handles[0]
-                self.driver.switch_to.window(detail_window)
+                feed_url = str(self.driver.current_url or "").strip()
+            except Exception:
+                feed_url = ""
+            try:
+                self._driver_get(note_url)
                 return self._extract_note_detail_from_current_page(note_url)
             except Exception as e:
                 self.logger.error(f"笔记处理失败 {note_url}: {e}", exc_info=True)
                 return None
             finally:
+                if self.stop_requested:
+                    return
+                restored = False
                 try:
-                    if self.driver.current_window_handle != feed_window:
-                        self.driver.close()
-                except Exception as close_err:
-                    self.logger.warning(f"关闭详情标签页失败: {close_err}")
-                try:
-                    self.driver.switch_to.window(feed_window)
-                except Exception as switch_err:
-                    self.logger.warning(f"切回列表页失败: {switch_err}")
+                    self.driver.back()
+                    WebDriverWait(self.driver, 8).until(
+                        EC.presence_of_element_located((By.TAG_NAME, "body"))
+                    )
+                    restored = True
+                except Exception as back_err:
+                    self.logger.warning(f"返回列表页失败，将重新打开原主页: {back_err}")
+                if not restored and feed_url:
+                    try:
+                        self._driver_get(feed_url)
+                    except Exception as open_err:
+                        self.logger.warning(f"重新打开原主页失败: {open_err}")
 
         self.logger.info(f"打开URL(单窗口复用): {origin_note_url} -> {note_url}")
 
@@ -4008,6 +4274,173 @@ class App:
 
         threading.Thread(target=_load, daemon=True).start()
 
+    def _get_ordered_account_names(self) -> List[str]:
+        """按界面顺序返回当前可用账号名称。"""
+        try:
+            values = list(self.cb_account.cget("values") or [])
+        except Exception:
+            values = []
+        names = [str(name or "").strip() for name in values if self._is_valid_account_name(str(name or "").strip())]
+        if names:
+            return names
+        return list(self.account_map.keys())
+
+    def choose_run_accounts(self, target_type: str) -> Optional[List[str]]:
+        """启动采集前选择本次参与账号。"""
+        account_names = self._get_ordered_account_names()
+        if not account_names:
+            messagebox.showwarning("提示", "当前没有可用账号，请先新增账号")
+            return None
+
+        usage_map: Dict[str, int] = {}
+        if target_type == TargetType.BRAND:
+            db = None
+            try:
+                db = DatabaseManager()
+                usage_map = db.fetch_brand_daily_usage(account_names)
+            except Exception as e:
+                self.logger.warning(f"读取账号每日额度失败，将按未知额度展示: {e}")
+            finally:
+                try:
+                    if db:
+                        db.connection.close()
+                except Exception:
+                    pass
+
+        result = {"accounts": None}
+        win = tk.Toplevel(self.master)
+        win.title("选择本次参与采集的账号")
+        win.transient(self.master)
+        win.grab_set()
+        win.resizable(False, False)
+
+        header_text = "请选择本次参与采集的账号"
+        if target_type == TargetType.BRAND:
+            header_text += f"（每账号每日最多打开 {BRAND_DAILY_ACCOUNT_LIMIT} 个品牌）"
+        ttk.Label(win, text=header_text).pack(anchor="w", padx=16, pady=(14, 8))
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", padx=16, pady=(0, 8))
+        check_vars: Dict[str, tk.BooleanVar] = {}
+        for idx, name in enumerate(account_names):
+            used = int(usage_map.get(name, 0))
+            remaining = max(0, BRAND_DAILY_ACCOUNT_LIMIT - used)
+            disabled = target_type == TargetType.BRAND and remaining <= 0
+            var = tk.BooleanVar(value=not disabled)
+            check_vars[name] = var
+            row = ttk.Frame(body)
+            row.grid(row=idx, column=0, sticky="ew", pady=2)
+            cb = ttk.Checkbutton(row, variable=var, state="disabled" if disabled else "normal")
+            cb.pack(side="left")
+            label = name
+            if target_type == TargetType.BRAND:
+                label = f"{name}  今日 {used}/{BRAND_DAILY_ACCOUNT_LIMIT}，剩余 {remaining}"
+            ttk.Label(row, text=label).pack(side="left", padx=(4, 0))
+
+        actions = ttk.Frame(win)
+        actions.pack(fill="x", padx=16, pady=(4, 14))
+
+        def select_available():
+            for acc_name, var in check_vars.items():
+                if target_type == TargetType.BRAND and int(usage_map.get(acc_name, 0)) >= BRAND_DAILY_ACCOUNT_LIMIT:
+                    var.set(False)
+                else:
+                    var.set(True)
+
+        def clear_all():
+            for var in check_vars.values():
+                var.set(False)
+
+        def confirm():
+            selected = [name for name, var in check_vars.items() if var.get()]
+            if not selected:
+                messagebox.showwarning("提示", "请至少勾选一个可用账号", parent=win)
+                return
+            result["accounts"] = selected
+            win.destroy()
+
+        def cancel():
+            result["accounts"] = None
+            win.destroy()
+
+        ttk.Button(actions, text="全选可用", command=select_available, style="Compact.TButton").pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="清空", command=clear_all, style="Compact.TButton").pack(side="left", padx=6)
+        ttk.Button(actions, text="开始本次采集", command=confirm, style="Compact.TButton").pack(side="right", padx=(6, 0))
+        ttk.Button(actions, text="取消", command=cancel, style="Compact.TButton").pack(side="right", padx=6)
+
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        try:
+            win.update_idletasks()
+            x = self.master.winfo_rootx() + max(0, (self.master.winfo_width() - win.winfo_width()) // 2)
+            y = self.master.winfo_rooty() + 120
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        self.master.wait_window(win)
+        return result["accounts"]
+
+    def choose_crawl_mode(self) -> Optional[str]:
+        """启动品牌采集前选择采集模式。"""
+        result = {"mode": None}
+        win = tk.Toplevel(self.master)
+        win.title("选择采集模式")
+        win.transient(self.master)
+        win.grab_set()
+        win.resizable(False, False)
+
+        ttk.Label(win, text="请选择本次品牌采集模式").pack(anchor="w", padx=16, pady=(14, 8))
+        mode_var = tk.StringVar(value=CrawlMode.HOT)
+
+        options = [
+            (
+                CrawlMode.HOT,
+                "采集热门",
+                "只采集最近 7 天发帖数 ≥ 2 的品牌，发帖多的排前面"
+            ),
+            (
+                CrawlMode.REVERSE,
+                "倒序采集",
+                "按最后采集时间倒序，仅采集 36 小时未采集过的品牌"
+            ),
+            (
+                CrawlMode.FULL,
+                "全量采集",
+                "按最后采集时间倒序采集所有品牌"
+            ),
+        ]
+        for mode, title, desc in options:
+            row = ttk.Frame(win)
+            row.pack(fill="x", padx=16, pady=4)
+            ttk.Radiobutton(row, value=mode, variable=mode_var, style="Compact.TRadiobutton").pack(side="left")
+            text_box = ttk.Frame(row)
+            text_box.pack(side="left", fill="x", expand=True)
+            ttk.Label(text_box, text=title).pack(anchor="w")
+            ttk.Label(text_box, text=desc).pack(anchor="w")
+
+        actions = ttk.Frame(win)
+        actions.pack(fill="x", padx=16, pady=(8, 14))
+
+        def confirm():
+            result["mode"] = mode_var.get()
+            win.destroy()
+
+        def cancel():
+            result["mode"] = None
+            win.destroy()
+
+        ttk.Button(actions, text="开始", command=confirm, style="Compact.TButton").pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text="取消", command=cancel, style="Compact.TButton").pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        try:
+            win.update_idletasks()
+            x = self.master.winfo_rootx() + max(0, (self.master.winfo_width() - win.winfo_width()) // 2)
+            y = self.master.winfo_rooty() + 150
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        self.master.wait_window(win)
+        return result["mode"]
+
     def _purge_account_profile_dirs(self, account_name: str) -> int:
         """清理账号本地浏览器会话目录，确保新增账号时进入扫码流程。"""
         profile_key = _safe_profile_key(account_name)
@@ -4528,13 +4961,19 @@ class App:
             messagebox.showinfo("提示", "采集已在进行中")
             return
 
-        selected_acc_name = self.cb_account.get()
-        if not selected_acc_name or selected_acc_name not in self.account_map:
-            messagebox.showwarning("提示", "请先选择一个有效的登录账号（或点击新增录入）")
+        target_type = self.var_target_type.get()
+        crawl_mode = CrawlMode.FULL
+        if target_type == TargetType.BRAND:
+            selected_mode = self.choose_crawl_mode()
+            if not selected_mode:
+                return
+            crawl_mode = selected_mode
+        selected_accounts = self.choose_run_accounts(target_type)
+        if not selected_accounts:
             return
 
+        selected_acc_name = selected_accounts[0]
         self.current_account_name = selected_acc_name
-        selected_cookies = self.account_map[selected_acc_name]
         self.clear_login_qr_preview()
         self._set_refresh_login_qr_button_state(False)
 
@@ -4544,7 +4983,7 @@ class App:
             messagebox.showerror("错误", "最大滚动次数需为整数")
             return
 
-        self.save_account_settings(selected_acc_name)
+        self.save_account_settings(self.cb_account.get() if self._is_valid_account_name(self.cb_account.get()) else selected_acc_name)
 
         self.btn_start.config(state='disabled')
         self.btn_add_acc.config(state='disabled')  # 运行时不可新增
@@ -4562,16 +5001,16 @@ class App:
         if self._tick_after_id is None:
             self._tick()
 
-        target_type = self.var_target_type.get()
-
         def run():
             completed_normally = False
+            quota_exhausted = False
+            current_account_name = None
+            quota_full_accounts = set()
+            account_cursor = 0
+            current_account_processed = 0
             try:
                 self.logger.info("初始化DB")
                 self.db = DatabaseManager()
-
-                # 更新账号使用时间
-                self.db.update_cookie_usage(selected_acc_name)
 
                 self.logger.info("初始化爬虫（速度参数将实时读取 GUI 输入框）")
                 if target_type == TargetType.BRAND:
@@ -4584,46 +5023,138 @@ class App:
                 if background_mode and bool(self.var_headless.get()):
                     self.logger.info("已启用无头模式，离屏运行设置将被自动忽略。")
 
-                self.crawler = XHSCrawler(
-                    target_type=target_type,
-                    account_name=selected_acc_name,
-                    url_checker=url_checker,
-                    insert_callback=insert_cb,
-                    get_scroll_sleep=self.get_scroll_sleep,
-                    get_detail_sleep=self.get_detail_sleep,
-                    get_login_qr_offset=self.get_login_qr_offset,
-                    on_sleep=self.on_sleep,
-                    on_captcha_detected=self.on_captcha_detected,
-                    skip_event=self.skip_event,
-                    max_scroll_default=max_scroll,
-                    headless=self.var_headless.get(),
-                    run_in_background=background_mode,
-                    browser=self.var_browser.get(),
-                    logger=self.logger,
-                    on_login_qr_detected=self.on_login_qr_detected
-                )
+                def close_current_crawler():
+                    try:
+                        if self.crawler and self.crawler.driver:
+                            self.crawler.driver.quit()
+                    except Exception:
+                        pass
+                    self.crawler = None
 
-                self.logger.info(f"使用账号 [{selected_acc_name}] 登录...")
-                # 注入 Cookie 登录
-                latest_cookies = self.crawler.login(cookie_list=selected_cookies)
-                try:
-                    snapshot = latest_cookies if latest_cookies else self.crawler.driver.get_cookies()
-                    if snapshot:
-                        self.db.upsert_xhs_cookie(selected_acc_name, snapshot)
-                        self.logger.info(f"账号 [{selected_acc_name}] Cookie 已刷新回写（{len(snapshot)}条）")
-                except Exception as refresh_err:
-                    self.logger.warning(f"回写最新 Cookie 失败: {refresh_err}")
+                def switch_to_account(account_name: str):
+                    nonlocal current_account_name
+                    if current_account_name == account_name and self.crawler:
+                        return
+                    close_current_crawler()
+                    self.db.update_cookie_usage(account_name)
+                    selected_cookies = self.account_map.get(account_name) or []
+                    self.logger.info(f"切换并登录账号 [{account_name}]...")
+                    self.ui_set_status(f"切换账号：{account_name}")
+                    self.current_account_name = account_name
+                    current_account_name = account_name
+                    self.crawler = XHSCrawler(
+                        target_type=target_type,
+                        account_name=account_name,
+                        url_checker=url_checker,
+                        insert_callback=insert_cb,
+                        get_scroll_sleep=self.get_scroll_sleep,
+                        get_detail_sleep=self.get_detail_sleep,
+                        get_login_qr_offset=self.get_login_qr_offset,
+                        on_sleep=self.on_sleep,
+                        on_captcha_detected=self.on_captcha_detected,
+                        skip_event=self.skip_event,
+                        max_scroll_default=max_scroll,
+                        headless=self.var_headless.get(),
+                        run_in_background=background_mode,
+                        browser=self.var_browser.get(),
+                        logger=self.logger,
+                        on_login_qr_detected=self.on_login_qr_detected
+                    )
+                    latest_cookies = self.crawler.login(cookie_list=selected_cookies)
+                    try:
+                        snapshot = latest_cookies if latest_cookies else self.crawler.driver.get_cookies()
+                        if snapshot:
+                            self.db.upsert_xhs_cookie(account_name, snapshot)
+                            self.account_map[account_name] = snapshot
+                            self.logger.info(f"账号 [{account_name}] Cookie 已刷新回写（{len(snapshot)}条）")
+                    except Exception as refresh_err:
+                        self.logger.warning(f"回写最新 Cookie 失败 [{account_name}]: {refresh_err}")
 
-                rows = self.db.fetch_brand_urls() if target_type == TargetType.BRAND else self.db.fetch_artists()
+                def pick_available_account(*, force_next: bool = False) -> Optional[str]:
+                    nonlocal account_cursor, current_account_processed
+                    if force_next and selected_accounts:
+                        account_cursor = (account_cursor + 1) % len(selected_accounts)
+                    total_accounts = len(selected_accounts)
+                    for offset in range(total_accounts):
+                        idx = (account_cursor + offset) % total_accounts
+                        account_name = selected_accounts[idx]
+                        if account_name in quota_full_accounts:
+                            continue
+                        if target_type == TargetType.BRAND:
+                            used = self.db.get_brand_daily_used_count(account_name)
+                            if used >= BRAND_DAILY_ACCOUNT_LIMIT:
+                                quota_full_accounts.add(account_name)
+                                self.logger.info(
+                                    "账号 [%s] 今日品牌打开额度已满：%d/%d",
+                                    account_name, used, BRAND_DAILY_ACCOUNT_LIMIT
+                                )
+                                continue
+                        if idx != account_cursor:
+                            current_account_processed = 0
+                        account_cursor = idx
+                        return account_name
+                    return None
+
+                rows = self.db.fetch_brand_urls(crawl_mode) if target_type == TargetType.BRAND else self.db.fetch_artists()
                 self.total_rows = len(rows)
                 self.ui_update_progress()
+                if target_type == TargetType.BRAND:
+                    mode_text = {
+                        CrawlMode.HOT: "采集热门",
+                        CrawlMode.REVERSE: "倒序采集",
+                        CrawlMode.FULL: "全量采集",
+                    }.get(crawl_mode, crawl_mode)
+                    self.logger.info(f"品牌采集模式：{mode_text}")
                 self.logger.info(f"待处理数量：{self.total_rows}")
 
                 for idx, row in enumerate(rows, start=1):
-                    if self.crawler.stop_requested:
+                    if self.crawler and self.crawler.stop_requested:
                         break
                     try:
                         name = row.get('brand_name', f"id={row.get('id')}")
+                        if target_type == TargetType.BRAND:
+                            account_for_row = None
+                            while not account_for_row:
+                                rotate_now = (
+                                        current_account_name is not None
+                                        and current_account_processed >= BRAND_ACCOUNT_ROTATE_EVERY
+                                        and len(selected_accounts) > 1
+                                )
+                                candidate = pick_available_account(force_next=rotate_now)
+                                if not candidate:
+                                    self.logger.info(
+                                        "本次参与账号今日品牌打开额度均已用完（%d/账号），采集提前结束",
+                                        BRAND_DAILY_ACCOUNT_LIMIT
+                                    )
+                                    self.ui_set_status("已停止：参与账号今日额度已用完")
+                                    raise StopIteration
+                                if rotate_now:
+                                    self.logger.info(
+                                        "账号 [%s] 已连续采集 %d 个品牌，按轮转规则切换到 [%s]",
+                                        current_account_name, current_account_processed, candidate
+                                    )
+                                    current_account_processed = 0
+                                switch_to_account(candidate)
+                                if self.db.reserve_brand_daily_quota(candidate, BRAND_DAILY_ACCOUNT_LIMIT):
+                                    account_for_row = candidate
+                                    used_after = self.db.get_brand_daily_used_count(candidate)
+                                    self.logger.info(
+                                        "账号 [%s] 已占用品牌额度：%d/%d（即将打开品牌：%s）",
+                                        candidate, used_after, BRAND_DAILY_ACCOUNT_LIMIT, name
+                                    )
+                                else:
+                                    quota_full_accounts.add(candidate)
+                                    self.logger.info(
+                                        "账号 [%s] 今日品牌打开额度已满，自动切换下一个账号",
+                                        candidate
+                                    )
+                                    current_account_processed = 0
+                                    account_cursor = (account_cursor + 1) % len(selected_accounts)
+                                    continue
+                        else:
+                            if not self.crawler:
+                                switch_to_account(selected_accounts[0])
+
                         self.ui_set_status(f"运行中：{name} ({idx}/{self.total_rows})")
                         self.logger.info(f"处理：{name}")
 
@@ -4634,6 +5165,8 @@ class App:
 
                         ok = self.crawler.crawl_target(row)
                         if ok:
+                            if target_type == TargetType.BRAND:
+                                current_account_processed += 1
                             self.db.update_last_gather_time(row['id'])
                             self.logger.info(f"已更新采集时间: {name}")
                         target_stats = dict(self.crawler.last_target_stats or {})
@@ -4650,6 +5183,9 @@ class App:
                         )
 
                         self.crawler.all_links.clear()
+                    except StopIteration:
+                        quota_exhausted = True
+                        break
                     except Exception as e:
                         self.logger.error(f"处理异常 {row.get('brand_name')}: {e}")
                     finally:
@@ -4657,6 +5193,7 @@ class App:
                         self.ui_update_progress()
                         if (
                                 idx < self.total_rows
+                                and not quota_exhausted
                                 and self.crawler
                                 and not self.crawler.stop_requested
                         ):
@@ -4670,7 +5207,10 @@ class App:
                             except Exception as wait_err:
                                 self.logger.warning(f"切换主页等待异常，将继续执行：{wait_err}")
 
-                if self.crawler and self.crawler.stop_requested:
+                if quota_exhausted:
+                    self.logger.info("本次采集因参与账号今日额度用完而结束")
+                    self.ui_set_status("已停止：参与账号今日额度已用完")
+                elif self.crawler and self.crawler.stop_requested:
                     self.logger.info("任务被用户停止")
                     self.ui_set_status("已停止")
                 else:
@@ -4717,21 +5257,15 @@ class App:
         """扫码/风控完成后，手动恢复采集"""
         if not self.crawler:
             return
-
-        def _apply_restore():
-            try:
-                self.btn_resume.config(state='disabled')
-            except Exception:
-                pass
-            self._captcha_prompt_active = False
-
-            self.ui_set_status("运行中…")
-            self._clear_sleep_bar()
-            self._set_refresh_login_qr_button_state(False)
-            self.logger.info("已点击“恢复运行”，采集将继续执行")
-
-        self.ui(_apply_restore)
-
+        try:
+            self.btn_resume.config(state='disabled')
+        except Exception:
+            pass
+        self._captcha_prompt_active = False
+        self.ui_set_status("正在恢复浏览器会话…")
+        self.var_sleep_text.set("正在恢复浏览器会话，请稍候")
+        self._set_refresh_login_qr_button_state(False)
+        self.logger.info("已点击“恢复运行”，将重启当前浏览器会话后继续采集")
         try:
             self.crawler.resume()
         except Exception:
