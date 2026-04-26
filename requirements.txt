@@ -3,3 +3,5 @@ urllib3
 requests
 pymysql
 selenium
+lxml
+aiohttp

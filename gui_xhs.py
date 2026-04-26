@@ -65,7 +65,7 @@ def get_runtime_base_dir() -> str:
 LOG_ROTATE_MAX_BYTES = 5 * 1024 * 1024
 LOG_ROTATE_BACKUP_COUNT = 4
 LOG_SIZE_REFRESH_INTERVAL_MS = 5000
-BRAND_DAILY_ACCOUNT_LIMIT = 500
+BRAND_DAILY_ACCOUNT_LIMIT = 200
 BRAND_ACCOUNT_ROTATE_EVERY = 10
 LOGIN_QR_CAPTURE_INTERVAL_SEC = 10.0
 LOGIN_QR_REEMIT_INTERVAL_SEC = 25.0
@@ -186,6 +186,25 @@ class CrawlMode:
     HOT = 'hot'
     REVERSE = 'reverse'
     FULL = 'full'
+
+
+CRAWL_MODE_ORDER = [CrawlMode.HOT, CrawlMode.REVERSE, CrawlMode.FULL]
+CRAWL_MODE_TITLES = {
+    CrawlMode.HOT: "采集热门",
+    CrawlMode.REVERSE: "倒序采集",
+    CrawlMode.FULL: "全量采集",
+}
+CRAWL_MODE_DESCRIPTIONS = {
+    CrawlMode.HOT: "优先采集最近 7 天发帖数 ≥ 2 的品牌，发帖多的排前面",
+    CrawlMode.REVERSE: "按最后采集时间倒序补抓，适合先处理更久没跑过的品牌",
+    CrawlMode.FULL: "补齐全部品牌列表，避免漏抓",
+}
+BRAND_RECENT_GATHER_FILTER_OPTIONS = [
+    ("8小时内未采集", 8),
+    ("16小时内未采集", 16),
+    ("24小时内未采集", 24),
+    ("不限制", 0),
+]
 
 
 class DatabaseManager:
@@ -337,23 +356,29 @@ class DatabaseManager:
         now = int(time.time())
         self._exec("UPDATE xhs_cookies SET last_used_at = %s WHERE account_name = %s", (now, account_name))
 
+    @staticmethod
+    def _get_brand_daily_quota_date() -> str:
+        """返回当前运行环境下的品牌采集额度日期，避免依赖数据库时区。"""
+        return time.strftime("%Y-%m-%d", time.localtime())
+
     def fetch_brand_daily_usage(self, account_names: List[str]) -> Dict[str, int]:
         """获取账号今日已打开品牌数。"""
         names = [str(name or "").strip() for name in account_names if str(name or "").strip()]
         if not names:
             return {}
+        quota_date = self._get_brand_daily_quota_date()
         placeholders = ",".join(["%s"] * len(names))
         sql = f"""
             SELECT
                 account_name,
                 CASE
-                    WHEN brand_daily_open_date = CURDATE() THEN brand_daily_open_count
+                    WHEN brand_daily_open_date = %s THEN brand_daily_open_count
                     ELSE 0
                 END AS used_count
             FROM xhs_cookies
             WHERE account_name IN ({placeholders})
         """
-        cur, _ = self._exec(sql, tuple(names))
+        cur, _ = self._exec(sql, tuple([quota_date] + names))
         return {
             str(row.get("account_name") or ""): int(row.get("used_count") or 0)
             for row in (cur.fetchall() or [])
@@ -364,24 +389,26 @@ class DatabaseManager:
         account_name = str(account_name or "").strip()
         if not account_name:
             return False
+        quota_date = self._get_brand_daily_quota_date()
+        now = int(time.time())
         _, affected = self._exec(
             """
             UPDATE xhs_cookies
             SET
-                brand_daily_open_date = CURDATE(),
+                brand_daily_open_date = %s,
                 brand_daily_open_count = CASE
-                    WHEN brand_daily_open_date = CURDATE() THEN brand_daily_open_count + 1
+                    WHEN brand_daily_open_date = %s THEN brand_daily_open_count + 1
                     ELSE 1
                 END,
-                last_used_at = UNIX_TIMESTAMP()
+                last_used_at = %s
             WHERE account_name = %s
               AND (
                 brand_daily_open_date IS NULL
-                OR brand_daily_open_date <> CURDATE()
+                OR brand_daily_open_date <> %s
                 OR brand_daily_open_count < %s
               )
             """,
-            (account_name, int(limit))
+            (quota_date, quota_date, now, account_name, quota_date, int(limit))
         )
         return int(affected or 0) > 0
 
@@ -493,9 +520,33 @@ class DatabaseManager:
         return self._has_likes_col_artist
 
     # --- 品牌 ---
-    def fetch_brand_urls(self, crawl_mode: str = CrawlMode.FULL) -> list:
+    def _normalize_crawl_modes(self, crawl_modes) -> List[str]:
+        if isinstance(crawl_modes, str):
+            modes = [crawl_modes]
+        elif isinstance(crawl_modes, (list, tuple, set)):
+            modes = [str(mode or "").strip() for mode in crawl_modes]
+        else:
+            modes = [CrawlMode.FULL]
+
+        normalized: List[str] = []
+        for mode in CRAWL_MODE_ORDER:
+            if mode in modes and mode not in normalized:
+                normalized.append(mode)
+        if not normalized:
+            normalized.append(CrawlMode.FULL)
+        return normalized
+
+    @staticmethod
+    def _build_brand_recent_gather_filter(hours_limit: int) -> Tuple[str, List[int]]:
+        hours = int(hours_limit or 0)
+        if hours <= 0:
+            return "", []
+        return " AND (b.last_gather_time IS NULL OR b.last_gather_time < DATE_SUB(NOW(), INTERVAL %s HOUR))", [hours]
+
+    def _fetch_brand_urls_for_mode(self, crawl_mode: str, recent_gather_hours: int = 0) -> List[Dict]:
+        recent_filter_sql, recent_filter_params = self._build_brand_recent_gather_filter(recent_gather_hours)
         if crawl_mode == CrawlMode.HOT:
-            sql = """
+            sql = f"""
                 SELECT
                     b.id,
                     b.brand_name,
@@ -506,36 +557,65 @@ class DatabaseManager:
                 FROM brand b
                 JOIN spider_log sl
                   ON sl.brand_id = b.id
+                 AND sl.origin_type = 'xhs'
                  AND sl.created_at >= UNIX_TIMESTAMP(DATE_SUB(NOW(), INTERVAL 7 DAY))
                  AND sl.status >= 0
                 WHERE (b.rednote_url != '' OR b.rednote_url2 != '')
                   AND b.is_delete = 0
                   AND b.is_brand = 1
+                  {recent_filter_sql}
                 GROUP BY b.id, b.brand_name, b.rednote_url, b.rednote_url2, b.rednote_spd_setting
                 HAVING recent_post_count >= 2
-                ORDER BY recent_post_count DESC, b.last_gather_time ASC
+                ORDER BY recent_post_count DESC, b.last_gather_time ASC, b.id DESC
             """
+            params = tuple(recent_filter_params)
         elif crawl_mode == CrawlMode.REVERSE:
-            sql = """
-                SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting
-                FROM brand
-                WHERE (rednote_url != '' OR rednote_url2 != '')
-                  AND is_delete = 0
-                  AND is_brand = 1
-                  AND (last_gather_time IS NULL OR last_gather_time < DATE_SUB(NOW(), INTERVAL 36 HOUR))
-                ORDER BY last_gather_time DESC, id DESC
+            sql = f"""
+                SELECT
+                    b.id,
+                    b.brand_name,
+                    b.rednote_url,
+                    b.rednote_url2,
+                    b.rednote_spd_setting
+                FROM brand b
+                WHERE (b.rednote_url != '' OR b.rednote_url2 != '')
+                  AND b.is_delete = 0
+                  AND b.is_brand = 1
+                  {recent_filter_sql}
+                ORDER BY b.last_gather_time DESC, b.id DESC
             """
+            params = tuple(recent_filter_params)
         else:
-            sql = """
-                SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting
-                FROM brand
-                WHERE (rednote_url != '' OR rednote_url2 != '')
-                  AND is_delete = 0
-                  AND is_brand = 1
-                ORDER BY last_gather_time DESC, id DESC
+            sql = f"""
+                SELECT
+                    b.id,
+                    b.brand_name,
+                    b.rednote_url,
+                    b.rednote_url2,
+                    b.rednote_spd_setting
+                FROM brand b
+                WHERE (b.rednote_url != '' OR b.rednote_url2 != '')
+                  AND b.is_delete = 0
+                  AND b.is_brand = 1
+                  {recent_filter_sql}
+                ORDER BY b.last_gather_time DESC, b.id DESC
             """
-        cur, _ = self._exec(sql)
-        return cur.fetchall()
+            params = tuple(recent_filter_params)
+        cur, _ = self._exec(sql, params)
+        return cur.fetchall() or []
+
+    def fetch_brand_urls(self, crawl_modes=None, recent_gather_hours: int = 0) -> list:
+        normalized_modes = self._normalize_crawl_modes(crawl_modes)
+        rows: List[Dict] = []
+        seen_ids = set()
+        for crawl_mode in normalized_modes:
+            for row in self._fetch_brand_urls_for_mode(crawl_mode, recent_gather_hours=recent_gather_hours):
+                brand_id = int(row.get("id") or 0)
+                if brand_id <= 0 or brand_id in seen_ids:
+                    continue
+                seen_ids.add(brand_id)
+                rows.append(row)
+        return rows
 
     def is_url_exists_brand(self, url: str) -> bool:
         url_md5 = self._calc_url_md5(url)
@@ -1792,10 +1872,10 @@ class XHSCrawler:
                     self._driver_refresh()
 
             ok, reason = self._wait_for_session_ready(
-                timeout_sec=30,
+                timeout_sec=45,
                 stage="风控恢复",
-                allow_cookie_fallback=True,
-                cross_page_validation=False
+                allow_cookie_fallback=False,
+                cross_page_validation=True
             )
             if not ok:
                 self.logger.warning("风控恢复后重启浏览器仍未确认登录态：%s", reason)
@@ -1899,8 +1979,38 @@ class XHSCrawler:
                     except TypeError:
                         self.on_captcha_detected(where)
                     self.request_pause(f"{captcha_type}@{where}")
-                    self._wait_until_resumed()
-                    self._restart_browser_session_after_captcha(resume_url)
+                    while True:
+                        self._wait_until_resumed()
+                        recovered = self._restart_browser_session_after_captcha(resume_url)
+                        if recovered:
+                            break
+                        self.logger.warning(
+                            "点击恢复运行后仍未恢复有效登录态（type=%s, where=%s），将继续暂停并等待重新扫码。",
+                            captcha_type, where
+                        )
+                        try:
+                            if captcha_type == "login-required":
+                                self._try_capture_login_qr(
+                                    stage=f"{where}-login-retry",
+                                    reason=f"resume-failed:{captcha_type}:{where}",
+                                    force_emit=True
+                                )
+                            else:
+                                self._try_capture_login_qr(
+                                    stage=f"{where}-captcha-retry",
+                                    reason=f"resume-failed:{captcha_type}:{where}",
+                                    force_emit=True,
+                                    force_center=True,
+                                    container_selectors=["#captcha-div", "#red-captcha", ".captcha-modal-content"],
+                                    override_offset=(0, 0)
+                                )
+                        except Exception as retry_cap_err:
+                            self.logger.warning("恢复失败后的二维码重新捕获异常: %s", retry_cap_err)
+                        try:
+                            self.on_captcha_detected(where, captcha_type)
+                        except TypeError:
+                            self.on_captcha_detected(where)
+                        self.request_pause(f"resume-failed:{captcha_type}@{where}")
                 else:
                     self.logger.warning("当前无暂停回调，需在浏览器中手动完成验证后继续。")
                     time.sleep(2.0)
@@ -2601,7 +2711,6 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
         :return: 登录成功后返回最新 Cookie 列表
         """
         self._driver_get('https://www.xiaohongshu.com/')
-        self._detect_and_handle_captcha("explore")
 
         if cookie_list:
             self.logger.info("正在注入选定的 Cookie...")
@@ -4379,54 +4488,113 @@ class App:
         self.master.wait_window(win)
         return result["accounts"]
 
-    def choose_crawl_mode(self) -> Optional[str]:
-        """启动品牌采集前选择采集模式。"""
-        result = {"mode": None}
+    def choose_crawl_mode(self) -> Optional[Dict]:
+        """启动品牌采集前选择采集策略。"""
+        result = {"modes": None, "recent_gather_hours": 0, "brand_count": 0}
         win = tk.Toplevel(self.master)
-        win.title("选择采集模式")
+        win.title("选择采集策略")
         win.transient(self.master)
         win.grab_set()
         win.resizable(False, False)
 
-        ttk.Label(win, text="请选择本次品牌采集模式").pack(anchor="w", padx=16, pady=(14, 8))
-        mode_var = tk.StringVar(value=CrawlMode.HOT)
+        ttk.Label(win, text="请选择本次品牌采集策略").pack(anchor="w", padx=16, pady=(14, 8))
 
-        options = [
-            (
-                CrawlMode.HOT,
-                "采集热门",
-                "只采集最近 7 天发帖数 ≥ 2 的品牌，发帖多的排前面"
-            ),
-            (
-                CrawlMode.REVERSE,
-                "倒序采集",
-                "按最后采集时间倒序，仅采集 36 小时未采集过的品牌"
-            ),
-            (
-                CrawlMode.FULL,
-                "全量采集",
-                "按最后采集时间倒序采集所有品牌"
-            ),
-        ]
-        for mode, title, desc in options:
+        mode_vars: Dict[str, tk.BooleanVar] = {
+            CrawlMode.HOT: tk.BooleanVar(value=True),
+            CrawlMode.REVERSE: tk.BooleanVar(value=False),
+            CrawlMode.FULL: tk.BooleanVar(value=False),
+        }
+        count_var = tk.StringVar(value="需要采集的品牌数量：计算中…")
+        recent_filter_var = tk.StringVar(value=BRAND_RECENT_GATHER_FILTER_OPTIONS[-1][0])
+        strategy_hint_var = tk.StringVar(value="")
+        count_label = ttk.Label(win, textvariable=count_var)
+
+        for mode in CRAWL_MODE_ORDER:
             row = ttk.Frame(win)
             row.pack(fill="x", padx=16, pady=4)
-            ttk.Radiobutton(row, value=mode, variable=mode_var, style="Compact.TRadiobutton").pack(side="left")
+            ttk.Checkbutton(row, variable=mode_vars[mode], style="Compact.TCheckbutton").pack(side="left")
             text_box = ttk.Frame(row)
             text_box.pack(side="left", fill="x", expand=True)
-            ttk.Label(text_box, text=title).pack(anchor="w")
-            ttk.Label(text_box, text=desc).pack(anchor="w")
+            ttk.Label(text_box, text=CRAWL_MODE_TITLES[mode]).pack(anchor="w")
+            ttk.Label(text_box, text=CRAWL_MODE_DESCRIPTIONS[mode]).pack(anchor="w")
+
+        filter_frame = ttk.Frame(win)
+        filter_frame.pack(fill="x", padx=16, pady=(10, 2))
+        ttk.Label(filter_frame, text="仅采集多久未采集过的品牌：").pack(side="left")
+        recent_filter_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=recent_filter_var,
+            values=[label for label, _ in BRAND_RECENT_GATHER_FILTER_OPTIONS],
+            width=18,
+            state="readonly"
+        )
+        recent_filter_combo.pack(side="left", padx=(6, 0))
+
+        ttk.Label(win, textvariable=strategy_hint_var).pack(anchor="w", padx=16, pady=(0, 4))
+        count_label.pack(anchor="w", padx=16, pady=(0, 8))
 
         actions = ttk.Frame(win)
         actions.pack(fill="x", padx=16, pady=(8, 14))
 
+        preview_db = None
+        try:
+            preview_db = DatabaseManager()
+        except Exception as e:
+            self.logger.warning(f"初始化采集策略预览数据库失败: {e}")
+            count_var.set("需要采集的品牌数量：读取失败")
+
+        def collect_selected_modes() -> List[str]:
+            selected = [mode for mode in CRAWL_MODE_ORDER if mode_vars[mode].get()]
+            return selected
+
+        def get_recent_gather_hours() -> int:
+            label = str(recent_filter_var.get() or "").strip()
+            for option_label, hours in BRAND_RECENT_GATHER_FILTER_OPTIONS:
+                if label == option_label:
+                    return int(hours)
+            return 0
+
+        def refresh_preview(*_args):
+            selected_modes = collect_selected_modes()
+            if not selected_modes:
+                strategy_hint_var.set("请至少勾选一种采集策略。")
+                count_var.set("需要采集的品牌数量：0 个")
+                return
+
+            mode_text = " + ".join(CRAWL_MODE_TITLES.get(mode, mode) for mode in selected_modes)
+            hours = get_recent_gather_hours()
+            hours_text = "不限制采集间隔" if hours <= 0 else f"仅采集最近 {hours} 小时未采集过的品牌"
+            strategy_hint_var.set(f"本次策略：{mode_text}；{hours_text}")
+
+            if not preview_db:
+                count_var.set("需要采集的品牌数量：读取失败")
+                return
+
+            try:
+                brand_rows = preview_db.fetch_brand_urls(selected_modes, recent_gather_hours=hours)
+                count_var.set(f"需要采集的品牌数量：{len(brand_rows)} 个")
+                result["brand_count"] = len(brand_rows)
+            except Exception as e:
+                self.logger.warning(f"预览采集品牌数量失败: {e}")
+                count_var.set("需要采集的品牌数量：读取失败")
+
         def confirm():
-            result["mode"] = mode_var.get()
+            selected_modes = collect_selected_modes()
+            if not selected_modes:
+                messagebox.showwarning("提示", "请至少勾选一种采集策略", parent=win)
+                return
+            result["modes"] = selected_modes
+            result["recent_gather_hours"] = get_recent_gather_hours()
             win.destroy()
 
         def cancel():
-            result["mode"] = None
+            result["modes"] = None
             win.destroy()
+
+        for var in mode_vars.values():
+            var.trace_add("write", refresh_preview)
+        recent_filter_combo.bind("<<ComboboxSelected>>", refresh_preview)
+        refresh_preview()
 
         ttk.Button(actions, text="开始", command=confirm, style="Compact.TButton").pack(side="right", padx=(8, 0))
         ttk.Button(actions, text="取消", command=cancel, style="Compact.TButton").pack(side="right")
@@ -4439,7 +4607,12 @@ class App:
         except Exception:
             pass
         self.master.wait_window(win)
-        return result["mode"]
+        try:
+            if preview_db:
+                preview_db.connection.close()
+        except Exception:
+            pass
+        return result if result["modes"] else None
 
     def _purge_account_profile_dirs(self, account_name: str) -> int:
         """清理账号本地浏览器会话目录，确保新增账号时进入扫码流程。"""
@@ -4962,12 +5135,16 @@ class App:
             return
 
         target_type = self.var_target_type.get()
-        crawl_mode = CrawlMode.FULL
+        crawl_strategy = {
+            "modes": [CrawlMode.FULL],
+            "recent_gather_hours": 0,
+            "brand_count": 0,
+        }
         if target_type == TargetType.BRAND:
-            selected_mode = self.choose_crawl_mode()
-            if not selected_mode:
+            selected_strategy = self.choose_crawl_mode()
+            if not selected_strategy:
                 return
-            crawl_mode = selected_mode
+            crawl_strategy = selected_strategy
         selected_accounts = self.choose_run_accounts(target_type)
         if not selected_accounts:
             return
@@ -5095,16 +5272,31 @@ class App:
                         return account_name
                     return None
 
-                rows = self.db.fetch_brand_urls(crawl_mode) if target_type == TargetType.BRAND else self.db.fetch_artists()
+                if target_type == TargetType.BRAND:
+                    rows = self.db.fetch_brand_urls(
+                        crawl_strategy.get("modes"),
+                        recent_gather_hours=int(crawl_strategy.get("recent_gather_hours") or 0)
+                    )
+                else:
+                    rows = self.db.fetch_artists()
                 self.total_rows = len(rows)
                 self.ui_update_progress()
                 if target_type == TargetType.BRAND:
-                    mode_text = {
-                        CrawlMode.HOT: "采集热门",
-                        CrawlMode.REVERSE: "倒序采集",
-                        CrawlMode.FULL: "全量采集",
-                    }.get(crawl_mode, crawl_mode)
-                    self.logger.info(f"品牌采集模式：{mode_text}")
+                    selected_modes = [
+                        CRAWL_MODE_TITLES.get(mode, mode)
+                        for mode in (crawl_strategy.get("modes") or [])
+                    ]
+                    recent_gather_hours = int(crawl_strategy.get("recent_gather_hours") or 0)
+                    recent_hours_text = (
+                        "不限制采集间隔"
+                        if recent_gather_hours <= 0
+                        else f"仅采集最近 {recent_gather_hours} 小时未采集过的品牌"
+                    )
+                    self.logger.info(
+                        "品牌采集策略：%s；%s",
+                        " + ".join(selected_modes) if selected_modes else "未选择",
+                        recent_hours_text
+                    )
                 self.logger.info(f"待处理数量：{self.total_rows}")
 
                 for idx, row in enumerate(rows, start=1):
