@@ -66,6 +66,7 @@ LOG_ROTATE_MAX_BYTES = 5 * 1024 * 1024
 LOG_ROTATE_BACKUP_COUNT = 4
 LOG_SIZE_REFRESH_INTERVAL_MS = 5000
 BRAND_DAILY_ACCOUNT_LIMIT = 200
+BRAND_DAILY_ACCOUNT_WINDOW_SEC = 24 * 3600
 BRAND_ACCOUNT_ROTATE_EVERY = 10
 LOGIN_QR_CAPTURE_INTERVAL_SEC = 10.0
 LOGIN_QR_REEMIT_INTERVAL_SEC = 25.0
@@ -226,6 +227,7 @@ class DatabaseManager:
         self._has_likes_col_spider = None
         self._has_likes_col_artist = None
         self._ensure_xhs_cookie_quota_columns()
+        self._ensure_xhs_brand_crawl_quota_table()
 
     def _ensure_conn(self):
         try:
@@ -252,19 +254,72 @@ class DatabaseManager:
                 return cursor, cursor.rowcount
 
     def _ensure_xhs_cookie_quota_columns(self):
-        """确保现有采集账号表具备每日品牌打开额度字段。"""
+        """确保现有采集账号表具备品牌采集额度字段，并清理过期额度。"""
         try:
             cur, _ = self._exec("SHOW COLUMNS FROM xhs_cookies")
             existing = {str(row.get("Field") or "") for row in (cur.fetchall() or [])}
             alters = []
             if "brand_daily_open_date" not in existing:
-                alters.append("ADD COLUMN brand_daily_open_date DATE NULL COMMENT '品牌采集每日额度日期'")
+                alters.append("ADD COLUMN brand_daily_open_date DATE NULL COMMENT '品牌采集额度最近一次命中日期'")
             if "brand_daily_open_count" not in existing:
-                alters.append("ADD COLUMN brand_daily_open_count INT NOT NULL DEFAULT 0 COMMENT '品牌采集当日已打开品牌数'")
+                alters.append("ADD COLUMN brand_daily_open_count INT NOT NULL DEFAULT 0 COMMENT '品牌采集近24小时已打开品牌数'")
+            if "brand_daily_open_last_at" not in existing:
+                alters.append("ADD COLUMN brand_daily_open_last_at BIGINT NOT NULL DEFAULT 0 COMMENT '品牌采集额度最后命中时间(Unix秒)'")
             if alters:
                 self._exec("ALTER TABLE xhs_cookies " + ", ".join(alters))
+            self._backfill_brand_daily_quota_last_at()
+            self._expire_brand_daily_quota_windows()
         except Exception as e:
-            logging.getLogger(__name__).warning("确保账号每日额度字段失败: %s", e)
+            logging.getLogger(__name__).warning("确保账号近24小时额度字段失败: %s", e)
+
+    def _backfill_brand_daily_quota_last_at(self):
+        """为旧数据补齐品牌采集额度最后命中时间。"""
+        self._exec(
+            """
+            UPDATE xhs_cookies
+            SET brand_daily_open_last_at = CASE
+                WHEN last_used_at > 0 THEN last_used_at
+                ELSE UNIX_TIMESTAMP(CONCAT(brand_daily_open_date, ' 00:00:00'))
+            END
+            WHERE brand_daily_open_count > 0
+              AND (brand_daily_open_last_at IS NULL OR brand_daily_open_last_at = 0)
+              AND brand_daily_open_date IS NOT NULL
+            """
+        )
+
+    def _expire_brand_daily_quota_windows(self):
+        """清理已超过 24 小时的品牌采集额度窗口。"""
+        cutoff = int(time.time()) - BRAND_DAILY_ACCOUNT_WINDOW_SEC
+        self._exec(
+            """
+            UPDATE xhs_cookies
+            SET
+                brand_daily_open_date = NULL,
+                brand_daily_open_count = 0,
+                brand_daily_open_last_at = 0
+            WHERE brand_daily_open_count > 0
+              AND brand_daily_open_last_at > 0
+              AND brand_daily_open_last_at < %s
+            """,
+            (cutoff,)
+        )
+
+    def _ensure_xhs_brand_crawl_quota_table(self):
+        """确保账号品牌采集记录表存在。"""
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS xhs_account_brand_crawl_log (
+                id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                account_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '采集账号备注名',
+                brand_id INT NOT NULL DEFAULT 0 COMMENT '品牌ID',
+                brand_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '品牌名称',
+                created_at BIGINT NOT NULL DEFAULT 0 COMMENT '采集完成时间(Unix秒)',
+                PRIMARY KEY (id),
+                KEY idx_account_created_at (account_name, created_at),
+                KEY idx_brand_created_at (brand_id, created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='小红书采集账号品牌额度记录表'
+            """
+        )
 
     @staticmethod
     def _normalize_url_for_md5(url: str) -> str:
@@ -358,64 +413,63 @@ class DatabaseManager:
 
     @staticmethod
     def _get_brand_daily_quota_date() -> str:
-        """返回当前运行环境下的品牌采集额度日期，避免依赖数据库时区。"""
+        """返回当前运行环境下的品牌采集额度日期，仅用于展示最近一次命中日期。"""
         return time.strftime("%Y-%m-%d", time.localtime())
 
     def fetch_brand_daily_usage(self, account_names: List[str]) -> Dict[str, int]:
-        """获取账号今日已打开品牌数。"""
+        """获取账号近 24 小时内已完成采集的品牌数。"""
         names = [str(name or "").strip() for name in account_names if str(name or "").strip()]
         if not names:
             return {}
-        quota_date = self._get_brand_daily_quota_date()
+        cutoff = int(time.time()) - BRAND_DAILY_ACCOUNT_WINDOW_SEC
         placeholders = ",".join(["%s"] * len(names))
         sql = f"""
             SELECT
                 account_name,
-                CASE
-                    WHEN brand_daily_open_date = %s THEN brand_daily_open_count
-                    ELSE 0
-                END AS used_count
-            FROM xhs_cookies
-            WHERE account_name IN ({placeholders})
+                COUNT(*) AS used_count
+            FROM xhs_account_brand_crawl_log
+            WHERE created_at >= %s
+              AND account_name IN ({placeholders})
+            GROUP BY account_name
         """
-        cur, _ = self._exec(sql, tuple([quota_date] + names))
-        return {
+        cur, _ = self._exec(sql, tuple([cutoff] + names))
+        usage_map = {
             str(row.get("account_name") or ""): int(row.get("used_count") or 0)
             for row in (cur.fetchall() or [])
         }
+        for name in names:
+            usage_map.setdefault(name, 0)
+        return usage_map
 
     def reserve_brand_daily_quota(self, account_name: str, limit: int = BRAND_DAILY_ACCOUNT_LIMIT) -> bool:
-        """为账号原子占用一个品牌打开额度。"""
+        """兼容旧接口：判断账号近 24 小时内是否仍可继续采集品牌。"""
+        return self.get_brand_daily_used_count(account_name) < int(limit)
+
+    def get_brand_daily_used_count(self, account_name: str) -> int:
+        """获取单个账号近 24 小时内已完成采集的品牌数。"""
+        usage = self.fetch_brand_daily_usage([account_name])
+        return int(usage.get(account_name, 0))
+
+    def record_brand_crawl_usage(self, account_name: str, brand_id: int, brand_name: str) -> bool:
+        """记录某账号完成了一次品牌采集。"""
         account_name = str(account_name or "").strip()
-        if not account_name:
+        brand_id = int(brand_id or 0)
+        brand_name = str(brand_name or "").strip()
+        if not account_name or brand_id <= 0:
             return False
-        quota_date = self._get_brand_daily_quota_date()
         now = int(time.time())
         _, affected = self._exec(
             """
-            UPDATE xhs_cookies
-            SET
-                brand_daily_open_date = %s,
-                brand_daily_open_count = CASE
-                    WHEN brand_daily_open_date = %s THEN brand_daily_open_count + 1
-                    ELSE 1
-                END,
-                last_used_at = %s
-            WHERE account_name = %s
-              AND (
-                brand_daily_open_date IS NULL
-                OR brand_daily_open_date <> %s
-                OR brand_daily_open_count < %s
-              )
+            INSERT INTO xhs_account_brand_crawl_log (
+                account_name,
+                brand_id,
+                brand_name,
+                created_at
+            ) VALUES (%s, %s, %s, %s)
             """,
-            (quota_date, quota_date, now, account_name, quota_date, int(limit))
+            (account_name, brand_id, brand_name, now)
         )
         return int(affected or 0) > 0
-
-    def get_brand_daily_used_count(self, account_name: str) -> int:
-        """获取单个账号今日已打开品牌数。"""
-        usage = self.fetch_brand_daily_usage([account_name])
-        return int(usage.get(account_name, 0))
 
     def delete_xhs_cookie(self, account_name: str) -> int:
         """删除指定账号Cookie，返回影响行数"""
@@ -4408,7 +4462,7 @@ class App:
                 db = DatabaseManager()
                 usage_map = db.fetch_brand_daily_usage(account_names)
             except Exception as e:
-                self.logger.warning(f"读取账号每日额度失败，将按未知额度展示: {e}")
+                self.logger.warning(f"读取账号近24小时额度失败，将按未知额度展示: {e}")
             finally:
                 try:
                     if db:
@@ -4425,7 +4479,7 @@ class App:
 
         header_text = "请选择本次参与采集的账号"
         if target_type == TargetType.BRAND:
-            header_text += f"（每账号每日最多打开 {BRAND_DAILY_ACCOUNT_LIMIT} 个品牌）"
+            header_text += f"（每账号近24小时最多打开 {BRAND_DAILY_ACCOUNT_LIMIT} 个品牌）"
         ttk.Label(win, text=header_text).pack(anchor="w", padx=16, pady=(14, 8))
 
         body = ttk.Frame(win)
@@ -4443,7 +4497,7 @@ class App:
             cb.pack(side="left")
             label = name
             if target_type == TargetType.BRAND:
-                label = f"{name}  今日 {used}/{BRAND_DAILY_ACCOUNT_LIMIT}，剩余 {remaining}"
+                label = f"{name}  近24小时 {used}/{BRAND_DAILY_ACCOUNT_LIMIT}，剩余 {remaining}"
             ttk.Label(row, text=label).pack(side="left", padx=(4, 0))
 
         actions = ttk.Frame(win)
@@ -5262,7 +5316,7 @@ class App:
                             if used >= BRAND_DAILY_ACCOUNT_LIMIT:
                                 quota_full_accounts.add(account_name)
                                 self.logger.info(
-                                    "账号 [%s] 今日品牌打开额度已满：%d/%d",
+                                    "账号 [%s] 近24小时品牌打开额度已满：%d/%d",
                                     account_name, used, BRAND_DAILY_ACCOUNT_LIMIT
                                 )
                                 continue
@@ -5315,10 +5369,10 @@ class App:
                                 candidate = pick_available_account(force_next=rotate_now)
                                 if not candidate:
                                     self.logger.info(
-                                        "本次参与账号今日品牌打开额度均已用完（%d/账号），采集提前结束",
+                                        "本次参与账号近24小时品牌打开额度均已用完（%d/账号），采集提前结束",
                                         BRAND_DAILY_ACCOUNT_LIMIT
                                     )
-                                    self.ui_set_status("已停止：参与账号今日额度已用完")
+                                    self.ui_set_status("已停止：参与账号近24小时额度已用完")
                                     raise StopIteration
                                 if rotate_now:
                                     self.logger.info(
@@ -5327,22 +5381,12 @@ class App:
                                     )
                                     current_account_processed = 0
                                 switch_to_account(candidate)
-                                if self.db.reserve_brand_daily_quota(candidate, BRAND_DAILY_ACCOUNT_LIMIT):
-                                    account_for_row = candidate
-                                    used_after = self.db.get_brand_daily_used_count(candidate)
-                                    self.logger.info(
-                                        "账号 [%s] 已占用品牌额度：%d/%d（即将打开品牌：%s）",
-                                        candidate, used_after, BRAND_DAILY_ACCOUNT_LIMIT, name
-                                    )
-                                else:
-                                    quota_full_accounts.add(candidate)
-                                    self.logger.info(
-                                        "账号 [%s] 今日品牌打开额度已满，自动切换下一个账号",
-                                        candidate
-                                    )
-                                    current_account_processed = 0
-                                    account_cursor = (account_cursor + 1) % len(selected_accounts)
-                                    continue
+                                account_for_row = candidate
+                                used_before = self.db.get_brand_daily_used_count(candidate)
+                                self.logger.info(
+                                    "账号 [%s] 当前近24小时已采集品牌：%d/%d（即将采集品牌：%s）",
+                                    candidate, used_before, BRAND_DAILY_ACCOUNT_LIMIT, name
+                                )
                         else:
                             if not self.crawler:
                                 switch_to_account(selected_accounts[0])
@@ -5359,6 +5403,24 @@ class App:
                         if ok:
                             if target_type == TargetType.BRAND:
                                 current_account_processed += 1
+                                spd_setting = int(row.get('rednote_spd_setting', 1) or 1)
+                                if current_account_name and spd_setting != 3:
+                                    recorded = self.db.record_brand_crawl_usage(
+                                        current_account_name,
+                                        int(row.get('id') or 0),
+                                        name
+                                    )
+                                    if recorded:
+                                        used_after = self.db.get_brand_daily_used_count(current_account_name)
+                                        self.logger.info(
+                                            "账号 [%s] 已记录品牌采集完成：%d/%d（完成品牌：%s）",
+                                            current_account_name, used_after, BRAND_DAILY_ACCOUNT_LIMIT, name
+                                        )
+                                    else:
+                                        self.logger.warning(
+                                            "账号 [%s] 品牌采集记录写入失败（brand_id=%s, brand_name=%s）",
+                                            current_account_name, row.get('id'), name
+                                        )
                             self.db.update_last_gather_time(row['id'])
                             self.logger.info(f"已更新采集时间: {name}")
                         target_stats = dict(self.crawler.last_target_stats or {})
@@ -5400,8 +5462,8 @@ class App:
                                 self.logger.warning(f"切换主页等待异常，将继续执行：{wait_err}")
 
                 if quota_exhausted:
-                    self.logger.info("本次采集因参与账号今日额度用完而结束")
-                    self.ui_set_status("已停止：参与账号今日额度已用完")
+                    self.logger.info("本次采集因参与账号近24小时额度用完而结束")
+                    self.ui_set_status("已停止：参与账号近24小时额度已用完")
                 elif self.crawler and self.crawler.stop_requested:
                     self.logger.info("任务被用户停止")
                     self.ui_set_status("已停止")
