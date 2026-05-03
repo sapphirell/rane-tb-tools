@@ -2,6 +2,12 @@
 
 这个目录用于在 `spider` 项目内运行 NapCatQQ，用一个 QQ 号登录后接收 QQ 群消息。
 
+完整服务器部署流程见：
+
+```text
+../../hobby-box/docs/QQ群监控服务器部署说明.md
+```
+
 ## 启动
 
 先复制环境变量并修改 WebUI token：
