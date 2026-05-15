@@ -429,7 +429,15 @@ class XHSCrawler:
     def crawl_author(self, brand: Dict):
         """处理单个作者（支持三种采集模式）"""
         try:
-            spd_setting = brand.get('rednote_spd_setting', 1)  # 获取采集配置
+            try:
+                spd_setting = int(brand.get('rednote_spd_setting', 1) or 1)  # 获取采集配置
+            except (TypeError, ValueError):
+                spd_setting = 1
+            if spd_setting not in (1, 2, 3):
+                logging.warning(
+                    f"品牌[{brand['brand_name']}]采集配置异常: {brand.get('rednote_spd_setting')}，已按全量采集处理"
+                )
+                spd_setting = 1
             logging.info(f"品牌[{brand['brand_name']}]采集配置: {spd_setting}")
             # 配置检查
             if spd_setting == 3:
@@ -577,7 +585,13 @@ class DatabaseManager:
                 WHERE (rednote_url != '' OR rednote_url2 != '')
                   AND is_delete = 0
                   AND is_brand = 1
-                ORDER BY spider_index DESC, last_gather_time ASC
+                ORDER BY
+                    CASE
+                        WHEN last_gather_time IS NULL OR last_gather_time <= '1000-01-01 00:00:00' THEN 0
+                        ELSE 1
+                    END ASC,
+                    last_gather_time ASC,
+                    id DESC
             """
             cursor.execute(sql)
             return cursor.fetchall()

@@ -197,8 +197,8 @@ CRAWL_MODE_TITLES = {
 }
 CRAWL_MODE_DESCRIPTIONS = {
     CrawlMode.HOT: "优先采集最近 7 天发帖数 ≥ 2 的品牌，发帖多的排前面",
-    CrawlMode.REVERSE: "按最后采集时间倒序补抓，适合先处理更久没跑过的品牌",
-    CrawlMode.FULL: "补齐全部品牌列表，避免漏抓",
+    CrawlMode.REVERSE: "优先采集没跑过的品牌，再补抓最久没跑过的品牌",
+    CrawlMode.FULL: "按没跑过、最久没跑过的顺序补齐全部品牌列表",
 }
 BRAND_RECENT_GATHER_FILTER_OPTIONS = [
     ("8小时内未采集", 8),
@@ -636,7 +636,13 @@ class DatabaseManager:
                   AND b.is_delete = 0
                   AND b.is_brand = 1
                   {recent_filter_sql}
-                ORDER BY b.last_gather_time DESC, b.id DESC
+                ORDER BY
+                    CASE
+                        WHEN b.last_gather_time IS NULL OR b.last_gather_time <= '1000-01-01 00:00:00' THEN 0
+                        ELSE 1
+                    END ASC,
+                    b.last_gather_time ASC,
+                    b.id DESC
             """
             params = tuple(recent_filter_params)
         else:
@@ -652,7 +658,13 @@ class DatabaseManager:
                   AND b.is_delete = 0
                   AND b.is_brand = 1
                   {recent_filter_sql}
-                ORDER BY b.last_gather_time DESC, b.id DESC
+                ORDER BY
+                    CASE
+                        WHEN b.last_gather_time IS NULL OR b.last_gather_time <= '1000-01-01 00:00:00' THEN 0
+                        ELSE 1
+                    END ASC,
+                    b.last_gather_time ASC,
+                    b.id DESC
             """
             params = tuple(recent_filter_params)
         cur, _ = self._exec(sql, params)
@@ -3108,13 +3120,26 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
             self.check_stop()
 
             if self.target_type == TargetType.BRAND:
-                spd_setting = row.get('rednote_spd_setting', 1)
+                try:
+                    spd_setting = int(row.get('rednote_spd_setting', 1) or 1)
+                except (TypeError, ValueError):
+                    spd_setting = 1
+                if spd_setting not in (1, 2, 3):
+                    self.logger.warning(
+                        "品牌[%s] 采集配置异常：%s，已按全量采集处理",
+                        row.get('brand_name', ''),
+                        row.get('rednote_spd_setting')
+                    )
+                    spd_setting = 1
                 if spd_setting == 3:
                     self.logger.info(f"品牌[{row.get('brand_name', '')}] 配置不采集，跳过")
                     return True
                 max_scroll = self.max_scroll_default
             else:
-                spd_setting = row.get('rednote_spd_setting_for_artist', 3)
+                try:
+                    spd_setting = int(row.get('rednote_spd_setting_for_artist', 3) or 3)
+                except (TypeError, ValueError):
+                    spd_setting = 3
                 if spd_setting == 3:
                     self.logger.info(f"艺术家[{row.get('brand_name', '')}] 配置不采集，跳过")
                     return True
