@@ -1,0 +1,18 @@
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: spider-napcat
+    restart: unless-stopped
+    environment:
+      NAPCAT_UID: "1000"
+      NAPCAT_GID: "1000"
+      NAPCAT_WEBUI_TOKEN: "${NAPCAT_WEBUI_TOKEN:-change-me}"
+      NAPCAT_GIDMAP: ""
+      NAPCAT_UIDMAP: ""
+    ports:
+      - "6099:6099"
+      - "3000:3000"
+      - "3001:3001"
+    volumes:
+      - ./data/napcat:/app/napcat/config
+      - ./data/ntqq:/app/.config/QQ
