@@ -515,10 +515,10 @@ class ArtistXHSCrawler:
 class ArtistDatabaseManager:
     def __init__(self):
         self.connection = pymysql.connect(
-            host='111.229.182.88',
+            host='222.186.135.83',
             port=3306,
-            user='root',
-            password='s*xNvd%v@',
+            user='sukitime_remote',
+            password='FtpMysql_222186_3fa72f1c9893',
             database='sukitime',
             charset='utf8mb4',
             cursorclass=pymysql.cursors.DictCursor
