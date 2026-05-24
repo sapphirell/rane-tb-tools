@@ -4,15 +4,19 @@ from pathlib import Path
 
 
 project_dir = Path(SPEC).resolve().parent
+binaries = [
+    (str(project_dir / 'bin' / 'chromedriver.exe'), 'bin'),
+]
+
+edge_driver = project_dir / 'bin' / 'msedgedriver.exe'
+if edge_driver.exists():
+    binaries.append((str(edge_driver), 'bin'))
 
 
 a = Analysis(
     ['gui_xhs.py'],
     pathex=[str(project_dir)],
-    binaries=[
-        (str(project_dir / 'bin' / 'chromedriver.exe'), 'bin'),
-        (str(project_dir / 'bin' / 'msedgedriver.exe'), 'bin'),
-    ],
+    binaries=binaries,
     datas=[
         (str(project_dir / 'stealth.min.js'), '.'),
     ],

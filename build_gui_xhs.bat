@@ -39,8 +39,7 @@ if not exist "%~dp0bin\chromedriver.exe" (
     exit /b 1
 )
 if not exist "%~dp0bin\msedgedriver.exe" (
-    echo Missing bin\msedgedriver.exe
-    exit /b 1
+    echo Warning: Missing bin\msedgedriver.exe, build will continue with ChromeDriver only.
 )
 
 echo [4/5] Stopping old gui_xhs processes...

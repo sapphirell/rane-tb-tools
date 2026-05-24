@@ -2931,22 +2931,21 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
                 self.logger.error(f"笔记处理失败 {note_url}: {e}", exc_info=True)
                 return None
             finally:
-                if self.stop_requested:
-                    return
-                restored = False
-                try:
-                    self.driver.back()
-                    WebDriverWait(self.driver, 8).until(
-                        EC.presence_of_element_located((By.TAG_NAME, "body"))
-                    )
-                    restored = True
-                except Exception as back_err:
-                    self.logger.warning(f"返回列表页失败，将重新打开原主页: {back_err}")
-                if not restored and feed_url:
+                if not self.stop_requested:
+                    restored = False
                     try:
-                        self._driver_get(feed_url)
-                    except Exception as open_err:
-                        self.logger.warning(f"重新打开原主页失败: {open_err}")
+                        self.driver.back()
+                        WebDriverWait(self.driver, 8).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "body"))
+                        )
+                        restored = True
+                    except Exception as back_err:
+                        self.logger.warning(f"返回列表页失败，将重新打开原主页: {back_err}")
+                    if not restored and feed_url:
+                        try:
+                            self._driver_get(feed_url)
+                        except Exception as open_err:
+                            self.logger.warning(f"重新打开原主页失败: {open_err}")
 
         self.logger.info(f"打开URL(单窗口复用): {origin_note_url} -> {note_url}")
 
