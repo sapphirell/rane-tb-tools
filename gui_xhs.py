@@ -67,7 +67,7 @@ LOG_ROTATE_BACKUP_COUNT = 4
 LOG_SIZE_REFRESH_INTERVAL_MS = 5000
 BRAND_DAILY_ACCOUNT_LIMIT = 200
 BRAND_DAILY_ACCOUNT_WINDOW_SEC = 24 * 3600
-BRAND_ACCOUNT_ROTATE_EVERY = 10
+BRAND_ACCOUNT_ROTATE_EVERY = 1
 LOGIN_QR_CAPTURE_INTERVAL_SEC = 10.0
 LOGIN_QR_REEMIT_INTERVAL_SEC = 25.0
 
@@ -1940,8 +1940,8 @@ class XHSCrawler:
             ok, reason = self._wait_for_session_ready(
                 timeout_sec=45,
                 stage="风控恢复",
-                allow_cookie_fallback=False,
-                cross_page_validation=True
+                allow_cookie_fallback=True,
+                cross_page_validation=False
             )
             if not ok:
                 self.logger.warning("风控恢复后重启浏览器仍未确认登录态：%s", reason)
@@ -2234,12 +2234,38 @@ class XHSCrawler:
             pass
         return False
 
+    @staticmethod
+    def _is_likely_login_action_text(text: str) -> bool:
+        """判断文案是否像真正的登录入口，避免帖子标题/正文包含“登录”时误判。"""
+        text = re.sub(r"\s+", "", str(text or ""))
+        if not text:
+            return False
+        exact_texts = {
+            "登录",
+            "立即登录",
+            "扫码登录",
+            "二维码登录",
+            "手机号登录",
+            "密码登录",
+            "登录/注册",
+            "登录注册",
+        }
+        if text in exact_texts:
+            return True
+        login_phrases = [
+            "请先登录",
+            "登录后查看更多",
+            "登录以继续",
+            "未登录",
+            "去登录",
+        ]
+        return any(phrase in text for phrase in login_phrases)
+
     def _detect_logged_out_reason(self) -> str:
         checks = [
             ("login-btn-css", By.CSS_SELECTOR, "button[class*='login'], a[class*='login'], div[class*='login']"),
-            ("login-text-btn", By.XPATH, "//button[contains(normalize-space(.), '登录')]"),
-            ("login-text-link", By.XPATH, "//a[contains(normalize-space(.), '登录')]"),
-            ("login-text-div", By.XPATH, "//div[contains(normalize-space(.), '登录') and @role='button']"),
+            ("login-text-btn", By.XPATH, "//button[contains(normalize-space(.), '登录') or contains(normalize-space(.), '扫码')]"),
+            ("login-text-action", By.XPATH, "//*[@role='button' and (contains(normalize-space(.), '登录') or contains(normalize-space(.), '扫码'))]"),
         ]
         for label, by, selector in checks:
             try:
@@ -2249,7 +2275,7 @@ class XHSCrawler:
                         if not e.is_displayed():
                             continue
                         txt = str(e.text or "").strip()
-                        if "登录" in txt or "扫码" in txt:
+                        if self._is_likely_login_action_text(txt):
                             return f"{label}:{txt[:30]}"
                     except Exception:
                         continue
@@ -3317,7 +3343,7 @@ class App:
         self._log_size_after_id = None
         self._captcha_prompt_active = False
         self.master.title("小红书爬虫 · 采集控制台（数据库Cookie管理版）")
-        self.master.geometry("920x820")
+        self.master.geometry("920x900")
         compact_style = ttk.Style(self.master)
         compact_style.configure("Compact.TButton", padding=(4, 1))
         compact_style.configure("Compact.TCheckbutton", padding=(0, 0))
@@ -3345,6 +3371,32 @@ class App:
         ttk.Button(
             acc_frame, text="刷新列表", command=self.load_accounts, style="Compact.TButton"
         ).pack(side='left', padx=4, pady=4)
+
+        quota_frame = ttk.LabelFrame(master, text=f"账号额度（近24小时，每账号最多 {BRAND_DAILY_ACCOUNT_LIMIT} 个品牌）")
+        quota_frame.pack(fill='x', padx=8, pady=(0, 6))
+        quota_top = ttk.Frame(quota_frame)
+        quota_top.pack(fill='x', padx=6, pady=(4, 2))
+        self.var_account_quota_status = tk.StringVar(value="额度：等待刷新")
+        ttk.Label(quota_top, textvariable=self.var_account_quota_status).pack(side='left')
+        ttk.Button(
+            quota_top, text="刷新额度", command=self.refresh_account_quota_panel, style="Compact.TButton"
+        ).pack(side='right')
+        self.tree_account_quota = ttk.Treeview(
+            quota_frame,
+            columns=("account", "used", "remaining", "status"),
+            show="headings",
+            height=4
+        )
+        quota_columns = {
+            "account": ("账号", 260),
+            "used": ("已采集", 90),
+            "remaining": ("剩余", 90),
+            "status": ("状态", 90),
+        }
+        for key, (title, width) in quota_columns.items():
+            self.tree_account_quota.heading(key, text=title)
+            self.tree_account_quota.column(key, width=width, anchor="w" if key == "account" else "center")
+        self.tree_account_quota.pack(fill='x', padx=6, pady=(0, 6))
 
         # --- 采集参数 ---
         frm = ttk.LabelFrame(master, text="采集参数（可运行中随时修改）")
@@ -3606,6 +3658,7 @@ class App:
         self.maintenance_thread: Optional[threading.Thread] = None
         self.upload_thread: Optional[threading.Thread] = None
         self.crawler: Optional[XHSCrawler] = None
+        self.crawler_pool: Dict[str, XHSCrawler] = {}
         self.detector_crawler: Optional[XHSCrawler] = None
         self.db: Optional[DatabaseManager] = None
         self.failed_upload_spider_ids: List[int] = []
@@ -3613,6 +3666,7 @@ class App:
 
         # 缓存账号列表 {name: cookie_json_list}
         self.account_map = {}
+        self.account_quota_usage_map: Dict[str, int] = {}
         self.current_account_name: Optional[str] = None
 
         self.start_ts = None
@@ -4110,6 +4164,67 @@ class App:
     def _is_valid_account_name(self, account_name: str) -> bool:
         return bool(account_name and account_name in self.account_map)
 
+    def _render_account_quota_rows(self, account_names: List[str], usage_map: Dict[str, int]):
+        """刷新账号额度表格。"""
+        def _apply():
+            if not hasattr(self, "tree_account_quota"):
+                return
+            for item in self.tree_account_quota.get_children():
+                self.tree_account_quota.delete(item)
+            available_count = 0
+            for name in account_names:
+                used = max(0, int(usage_map.get(name, 0) or 0))
+                remaining = max(0, BRAND_DAILY_ACCOUNT_LIMIT - used)
+                if remaining > 0:
+                    available_count += 1
+                status = "可用" if remaining > 0 else "已满"
+                self.tree_account_quota.insert(
+                    "",
+                    "end",
+                    values=(name, f"{used}/{BRAND_DAILY_ACCOUNT_LIMIT}", remaining, status)
+                )
+            self.account_quota_usage_map = {
+                name: max(0, int(usage_map.get(name, 0) or 0))
+                for name in account_names
+            }
+            self.var_account_quota_status.set(
+                f"额度：{available_count}/{len(account_names)} 个账号可用"
+                if account_names else "额度：暂无账号"
+            )
+
+        self.ui(_apply)
+
+    def refresh_account_quota_panel(
+            self,
+            account_names: Optional[List[str]] = None,
+            usage_map: Optional[Dict[str, int]] = None
+    ):
+        """异步刷新账号近24小时剩余额度展示。"""
+        names = [
+            str(name or "").strip()
+            for name in (account_names if account_names is not None else self._get_ordered_account_names())
+            if str(name or "").strip()
+        ]
+        if usage_map is not None:
+            self._render_account_quota_rows(names, usage_map)
+            return
+
+        def _load_usage():
+            usage: Dict[str, int] = {}
+            try:
+                if names:
+                    db = DatabaseManager()
+                    try:
+                        usage = db.fetch_brand_daily_usage(names)
+                    finally:
+                        db.connection.close()
+            except Exception as e:
+                self.logger.warning(f"刷新账号额度失败: {e}")
+                usage = dict(getattr(self, "account_quota_usage_map", {}) or {})
+            self._render_account_quota_rows(names, usage)
+
+        threading.Thread(target=_load_usage, daemon=True).start()
+
     def _default_account_settings(self) -> Dict:
         return {
             "scroll_sleep": "10.5",
@@ -4456,6 +4571,7 @@ class App:
                         self.btn_remove_acc.config(state='disabled')
 
                 self.ui(_ui_update)
+                self.refresh_account_quota_panel(cb_values)
             except Exception as e:
                 self.logger.error(f"加载账号列表失败: {e}")
 
@@ -4493,6 +4609,9 @@ class App:
                         db.connection.close()
                 except Exception:
                     pass
+
+        if target_type == TargetType.BRAND:
+            self.refresh_account_quota_panel(account_names, usage_map)
 
         result = {"accounts": None}
         win = tk.Toplevel(self.master)
@@ -5174,23 +5293,23 @@ class App:
             # 暂停完全由 pause_event 控制，不再改写用户输入的等待参数，
             # 避免恢复后界面残留 99999999 或被错误保存到账号配置中。
             self.btn_resume.config(state='normal')
-            self.var_status.set("已暂停：等待验证码处理后恢复运行")
-            self.var_sleep_text.set("已暂停：等待扫码/验证码处理")
+            self.var_status.set("已暂停：等待账号状态确认后恢复运行")
+            self.var_sleep_text.set("已暂停：等待登录/验证处理")
             self.sleep_bar['value'] = 0
             if self._captcha_prompt_active:
                 return
             self._captcha_prompt_active = True
 
             log_msg = (
-                f"检测到验证码页面({captcha_type}, {where})，采集已暂停。\n"
-                f"请在浏览器中完成扫码/风控验证后，点击“恢复运行”。"
+                f"检测到账号需要处理({captcha_type}, {where})，采集已暂停。\n"
+                f"请在浏览器中确认登录/验证状态后，点击“恢复运行”。"
             )
             self.logger.warning(log_msg)
 
             # 新增：弹出模态对话框提醒用户 (兼容 Mac/Windows)
             messagebox.showwarning(
-                "验证码提醒",
-                f"检测到小红书验证码拦截！\n\n位置: {where}\n类型: {captcha_type}\n\n请前往浏览器手动完成验证，\n完成后点击 GUI 上的【恢复运行】按钮。"
+                "采集暂停",
+                f"检测到账号需要处理。\n\n位置: {where}\n类型: {captcha_type}\n\n请前往浏览器确认登录/验证状态，\n完成后点击 GUI 上的【恢复运行】按钮。"
             )
             self._set_refresh_login_qr_button_state(self._last_login_qr_payload is not None)
 
@@ -5263,6 +5382,29 @@ class App:
             quota_full_accounts = set()
             account_cursor = 0
             current_account_processed = 0
+            crawler_pool: Dict[str, XHSCrawler] = {}
+            self.crawler_pool = crawler_pool
+
+            def close_all_crawlers(persist: bool = False):
+                for account_name, crawler in list(crawler_pool.items()):
+                    if persist and self.db:
+                        try:
+                            snapshot = crawler.driver.get_cookies() if crawler and crawler.driver else []
+                            if snapshot:
+                                self.db.upsert_xhs_cookie(account_name, snapshot)
+                                self.account_map[account_name] = snapshot
+                                self.logger.info("关闭前账号 [%s] Cookie 已刷新回写（%d条）", account_name, len(snapshot))
+                        except Exception as refresh_err:
+                            self.logger.warning("关闭前账号 [%s] Cookie 回写失败: %s", account_name, refresh_err)
+                    try:
+                        if crawler and crawler.driver:
+                            crawler.driver.quit()
+                    except Exception:
+                        pass
+                crawler_pool.clear()
+                self.crawler_pool = crawler_pool
+                self.crawler = None
+
             try:
                 self.logger.info("初始化DB")
                 self.db = DatabaseManager()
@@ -5278,26 +5420,40 @@ class App:
                 if background_mode and bool(self.var_headless.get()):
                     self.logger.info("已启用无头模式，离屏运行设置将被自动忽略。")
 
-                def close_current_crawler():
+                def persist_crawler_cookies(account_name: str, crawler: Optional[XHSCrawler], stage: str):
+                    if not account_name or not crawler or not crawler.driver:
+                        return
                     try:
-                        if self.crawler and self.crawler.driver:
-                            self.crawler.driver.quit()
-                    except Exception:
-                        pass
-                    self.crawler = None
+                        snapshot = crawler.driver.get_cookies()
+                        if snapshot:
+                            self.db.upsert_xhs_cookie(account_name, snapshot)
+                            self.account_map[account_name] = snapshot
+                            self.logger.info("%s账号 [%s] Cookie 已刷新回写（%d条）", stage, account_name, len(snapshot))
+                    except Exception as refresh_err:
+                        self.logger.warning("%s账号 [%s] Cookie 回写失败: %s", stage, account_name, refresh_err)
 
                 def switch_to_account(account_name: str):
                     nonlocal current_account_name
                     if current_account_name == account_name and self.crawler:
                         return
-                    close_current_crawler()
+                    if current_account_name and current_account_name in crawler_pool:
+                        persist_crawler_cookies(current_account_name, crawler_pool.get(current_account_name), "切换前")
                     self.db.update_cookie_usage(account_name)
-                    selected_cookies = self.account_map.get(account_name) or []
-                    self.logger.info(f"切换并登录账号 [{account_name}]...")
-                    self.ui_set_status(f"切换账号：{account_name}")
                     self.current_account_name = account_name
                     current_account_name = account_name
-                    self.crawler = XHSCrawler(
+
+                    cached_crawler = crawler_pool.get(account_name)
+                    if cached_crawler and cached_crawler.driver:
+                        self.crawler = cached_crawler
+                        self.crawler.max_scroll_default = max_scroll
+                        self.logger.info("切换到已打开的账号 [%s]，复用现有浏览器会话", account_name)
+                        self.ui_set_status(f"切换账号：{account_name}")
+                        return
+
+                    selected_cookies = self.account_map.get(account_name) or []
+                    self.logger.info(f"首次切换账号 [{account_name}]，启动浏览器并登录...")
+                    self.ui_set_status(f"打开账号：{account_name}")
+                    crawler = XHSCrawler(
                         target_type=target_type,
                         account_name=account_name,
                         url_checker=url_checker,
@@ -5315,15 +5471,38 @@ class App:
                         logger=self.logger,
                         on_login_qr_detected=self.on_login_qr_detected
                     )
-                    latest_cookies = self.crawler.login(cookie_list=selected_cookies)
-                    try:
-                        snapshot = latest_cookies if latest_cookies else self.crawler.driver.get_cookies()
-                        if snapshot:
-                            self.db.upsert_xhs_cookie(account_name, snapshot)
-                            self.account_map[account_name] = snapshot
-                            self.logger.info(f"账号 [{account_name}] Cookie 已刷新回写（{len(snapshot)}条）")
-                    except Exception as refresh_err:
-                        self.logger.warning(f"回写最新 Cookie 失败 [{account_name}]: {refresh_err}")
+                    self.crawler = crawler
+                    crawler_pool[account_name] = crawler
+                    self.crawler_pool = crawler_pool
+                    latest_cookies = crawler.login(cookie_list=selected_cookies)
+                    snapshot = latest_cookies if latest_cookies else crawler.driver.get_cookies()
+                    if snapshot:
+                        self.db.upsert_xhs_cookie(account_name, snapshot)
+                        self.account_map[account_name] = snapshot
+                        self.logger.info(f"账号 [{account_name}] Cookie 已刷新回写（{len(snapshot)}条）")
+
+                def warm_up_selected_crawlers():
+                    """品牌多账号采集前预先打开各账号浏览器，后续轮转时直接复用。"""
+                    if target_type != TargetType.BRAND or len(selected_accounts) <= 1:
+                        return
+                    self.logger.info("开始预先打开 %d 个采集账号浏览器，后续将直接交替复用", len(selected_accounts))
+                    for account_name in selected_accounts:
+                        if account_name in quota_full_accounts:
+                            continue
+                        used = self.db.get_brand_daily_used_count(account_name)
+                        if used >= BRAND_DAILY_ACCOUNT_LIMIT:
+                            quota_full_accounts.add(account_name)
+                            self.logger.info(
+                                "账号 [%s] 近24小时品牌打开额度已满：%d/%d，跳过预打开",
+                                account_name, used, BRAND_DAILY_ACCOUNT_LIMIT
+                            )
+                            continue
+                        switch_to_account(account_name)
+                    if crawler_pool:
+                        first_account = pick_available_account(force_next=False)
+                        if first_account:
+                            switch_to_account(first_account)
+                    self.logger.info("采集账号浏览器预打开完成：%d 个", len(crawler_pool))
 
                 def pick_available_account(*, force_next: bool = False) -> Optional[str]:
                     nonlocal account_cursor, current_account_processed
@@ -5376,6 +5555,7 @@ class App:
                         recent_hours_text
                     )
                 self.logger.info(f"待处理数量：{self.total_rows}")
+                warm_up_selected_crawlers()
 
                 for idx, row in enumerate(rows, start=1):
                     if self.crawler and self.crawler.stop_requested:
@@ -5436,6 +5616,9 @@ class App:
                                     )
                                     if recorded:
                                         used_after = self.db.get_brand_daily_used_count(current_account_name)
+                                        quota_usage_snapshot = dict(getattr(self, "account_quota_usage_map", {}) or {})
+                                        quota_usage_snapshot[current_account_name] = used_after
+                                        self._render_account_quota_rows(selected_accounts, quota_usage_snapshot)
                                         self.logger.info(
                                             "账号 [%s] 已记录品牌采集完成：%d/%d（完成品牌：%s）",
                                             current_account_name, used_after, BRAND_DAILY_ACCOUNT_LIMIT, name
@@ -5502,11 +5685,7 @@ class App:
                 self.logger.exception(f"运行异常：{e}")
                 self.ui_set_status("异常")
             finally:
-                try:
-                    if self.crawler:
-                        self.crawler.driver.quit()
-                except Exception:
-                    pass
+                close_all_crawlers(persist=bool(self.db))
                 try:
                     if self.db:
                         self.db.connection.close()
@@ -5524,6 +5703,11 @@ class App:
         self.ui_set_status("运行中…")
 
     def stop(self):
+        for crawler in list(getattr(self, "crawler_pool", {}).values()):
+            try:
+                crawler.request_stop()
+            except Exception:
+                pass
         if self.crawler:
             self.crawler.request_stop()
             self.ui_set_status("停止中…")
@@ -5569,6 +5753,14 @@ class App:
                 self.crawler.request_stop()
         except Exception:
             pass
+        for crawler in list(getattr(self, "crawler_pool", {}).values()):
+            try:
+                crawler.request_stop()
+                if crawler.driver:
+                    crawler.driver.quit()
+            except Exception:
+                pass
+        self.crawler_pool.clear()
         self._quit_detector_browser()
         try:
             self.upload_stop_event.set()
