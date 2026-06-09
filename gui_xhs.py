@@ -225,6 +225,7 @@ class DatabaseManager:
         )
         self.connection = pymysql.connect(**self._conn_args)
         self._has_likes_col_spider = None
+        self._has_text_col_spider = None
         self._has_likes_col_artist = None
         self._ensure_xhs_cookie_quota_columns()
         self._ensure_xhs_brand_crawl_quota_table()
@@ -563,6 +564,16 @@ class DatabaseManager:
             self._has_likes_col_spider = False
         return self._has_likes_col_spider
 
+    def _check_text_col_spider(self) -> bool:
+        if self._has_text_col_spider is not None:
+            return self._has_text_col_spider
+        try:
+            cur, _ = self._exec("SHOW COLUMNS FROM spider_log LIKE 'text'")
+            self._has_text_col_spider = bool(cur.fetchone())
+        except Exception:
+            self._has_text_col_spider = False
+        return self._has_text_col_spider
+
     def _check_likes_col_artist(self) -> bool:
         if self._has_likes_col_artist is not None:
             return self._has_likes_col_artist
@@ -701,6 +712,9 @@ class DatabaseManager:
         images = ','.join(data.get('images') or [])[:2000]
         like_count = int(data.get('like_count') or 0)
         has_likes = self._check_likes_col_spider()
+        has_text = self._check_text_col_spider()
+        comments = data.get('comments') if isinstance(data.get('comments'), list) else []
+        comments_json = json.dumps(comments, ensure_ascii=False)
         now = int(time.time())
 
         # 构建 SQL
@@ -714,6 +728,10 @@ class DatabaseManager:
         if has_likes:
             cols.append("likes")
             vals.append(like_count)
+
+        if has_text:
+            cols.append("`text`")
+            vals.append(comments_json)
 
         inserted = self._insert_with_url_md5_dedup(
             table_name="spider_log",
@@ -2982,6 +3000,152 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
             self.logger.error(f"笔记处理失败 {note_url}: {e}", exc_info=True)
             return None
 
+    def _expand_visible_comment_replies(self):
+        """尽量展开当前详情页已露出的评论回复，避免只采到父评论。"""
+        for _ in range(3):
+            self.check_stop()
+            clicked = False
+            try:
+                buttons = self.driver.find_elements(By.CSS_SELECTOR, ".comments-container .show-more")
+            except Exception:
+                buttons = []
+            for btn in buttons[:6]:
+                try:
+                    if not btn.is_displayed():
+                        continue
+                    text = str(btn.text or "").strip()
+                    if "展开" not in text:
+                        continue
+                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                    time.sleep(0.1)
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    clicked = True
+                    time.sleep(0.3)
+                except Exception:
+                    continue
+            if not clicked:
+                break
+
+    def _extract_comments_from_current_page(self) -> List[Dict]:
+        """从当前笔记详情页提取按楼层组织的评论 JSON 列表。"""
+        try:
+            self._expand_visible_comment_replies()
+        except Exception as e:
+            self.logger.warning("展开评论回复失败: %s", e)
+
+        script = r"""
+const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+const container = document.querySelector('.comments-container');
+if (!container) return [];
+const readComment = (item) => {
+  if (!item) return null;
+  const nameEl = item.querySelector('.author .name');
+  const contentEl = item.querySelector('.content .note-text');
+  const dateEl = item.querySelector('.info .date span');
+  if (!nameEl || !contentEl) return null;
+  const speakerName = normalize(nameEl.innerText || nameEl.textContent);
+  const content = normalize(contentEl.innerText || contentEl.textContent);
+  const replyTime = normalize(dateEl ? (dateEl.innerText || dateEl.textContent) : '');
+  if (!speakerName || !content) return null;
+  const isAuthor = Array.from(item.querySelectorAll('.author .tag'))
+    .some((tag) => normalize(tag.innerText || tag.textContent) === '作者');
+  return {
+    speaker_name: speakerName,
+    is_author: isAuthor,
+    content,
+    reply_time: replyTime
+  };
+};
+const result = [];
+const floors = Array.from(container.querySelectorAll('.parent-comment'));
+for (const floor of floors) {
+  const parentItem = floor.querySelector(':scope > .comment-item');
+  const parentComment = readComment(parentItem);
+  if (!parentComment) continue;
+  const replies = [];
+  const replyItems = Array.from(floor.querySelectorAll('.reply-container .comment-item-sub'));
+  const seenReplies = new Set();
+  for (const replyItem of replyItems) {
+    const reply = readComment(replyItem);
+    if (!reply) continue;
+    const key = [reply.speaker_name, reply.is_author ? '1' : '0', reply.content, reply.reply_time].join('\u0001');
+    if (seenReplies.has(key)) continue;
+    seenReplies.add(key);
+    replies.push(reply);
+    if (replies.length >= 50) break;
+  }
+  result.push({
+    comment: parentComment,
+    replies
+  });
+  if (result.length >= 50) break;
+}
+return result;
+"""
+        try:
+            floors = self.driver.execute_script(script) or []
+        except Exception as e:
+            self.logger.warning("评论提取失败: %s", e)
+            return []
+
+        def normalize_comment(item: Dict) -> Optional[Dict]:
+            if not isinstance(item, dict):
+                return None
+            speaker_name = str(item.get("speaker_name") or "").strip()
+            content = str(item.get("content") or "").strip()
+            reply_time = str(item.get("reply_time") or "").strip()
+            is_author = bool(item.get("is_author"))
+            if not speaker_name or not content:
+                return None
+            return {
+                "speaker_name": speaker_name[:120],
+                "is_author": is_author,
+                "content": content[:1000],
+                "reply_time": reply_time[:80],
+            }
+
+        normalized: List[Dict] = []
+        seen_floors = set()
+        total_comments = 0
+        for floor in floors:
+            if not isinstance(floor, dict):
+                continue
+            comment = normalize_comment(floor.get("comment"))
+            if not comment:
+                continue
+            floor_key = (
+                comment["speaker_name"],
+                comment["is_author"],
+                comment["content"],
+                comment["reply_time"],
+            )
+            if floor_key in seen_floors:
+                continue
+            seen_floors.add(floor_key)
+            replies: List[Dict] = []
+            seen_replies = set()
+            for reply in floor.get("replies") or []:
+                normalized_reply = normalize_comment(reply)
+                if not normalized_reply:
+                    continue
+                reply_key = (
+                    normalized_reply["speaker_name"],
+                    normalized_reply["is_author"],
+                    normalized_reply["content"],
+                    normalized_reply["reply_time"],
+                )
+                if reply_key in seen_replies:
+                    continue
+                seen_replies.add(reply_key)
+                replies.append(normalized_reply)
+            total_comments += 1 + len(replies)
+            normalized.append({
+                "comment": comment,
+                "replies": replies,
+            })
+        self.logger.info("评论提取完成：%d 个楼层，合计 %d 条", len(normalized), total_comments)
+        return normalized
+
     def _extract_note_detail_from_current_page(self, note_url: str) -> Dict:
         """从当前已打开的笔记详情页提取内容。"""
         img_urls = []
@@ -3052,6 +3216,8 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
         except Exception as title_e:
             self.logger.warning(f"标题提取失败: {title_e}")
 
+        comments = self._extract_comments_from_current_page()
+
         baseUrl = note_url.split('?', 1)[0]
         return {
             'images': img_urls,
@@ -3060,6 +3226,7 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
             'title': title,
             'auth_time': auth_time,
             'like_count': like_count,
+            'comments': comments,
         }
 
     def process_quick_data(self, new_links: set, stats: Optional[Dict[str, int]] = None):
