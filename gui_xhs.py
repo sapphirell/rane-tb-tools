@@ -68,6 +68,7 @@ LOG_SIZE_REFRESH_INTERVAL_MS = 5000
 BRAND_DAILY_ACCOUNT_LIMIT = 200
 BRAND_DAILY_ACCOUNT_WINDOW_SEC = 24 * 3600
 BRAND_ACCOUNT_ROTATE_EVERY = 1
+BRAND_NOTE_ACCOUNT_ROTATE_EVERY = 1
 LOGIN_QR_CAPTURE_INTERVAL_SEC = 10.0
 LOGIN_QR_REEMIT_INTERVAL_SEC = 25.0
 
@@ -3305,7 +3306,11 @@ return result;
             except Exception:
                 pass
 
-    def crawl_target(self, row: Dict):
+    def crawl_target(
+            self,
+            row: Dict,
+            note_detail_handler: Optional[Callable[[List[str], Dict, Dict[str, int]], None]] = None
+    ):
         current_stats = self._new_crawl_stats()
         self.last_target_stats = current_stats
         try:
@@ -3348,6 +3353,9 @@ return result;
 
                 if spd_setting == 1:
                     def handle_full_collect(note_urls: List[str]):
+                        if note_detail_handler:
+                            note_detail_handler(note_urls, row, current_stats)
+                            return
                         for note_url in note_urls:
                             self.check_stop()
                             base_url = normalize_xhs_note_url_for_dedup(note_url)
@@ -3842,6 +3850,7 @@ class App:
         self.done_rows = 0
 
         self.skip_event = threading.Event()
+        self.pause_event = threading.Event()
         self.upload_stop_event = threading.Event()
         self.auto_process_enabled = False
         self.auto_process_after_id = None
@@ -5453,6 +5462,26 @@ class App:
         self.var_sleep_text.set("当前无等待")
         self.sleep_bar['value'] = 0
 
+    def reset_pause_state_for_new_run(self):
+        """开始新一轮采集前清理上一次遗留的暂停与扫码提示状态。"""
+        self.pause_event.clear()
+        self._captcha_prompt_active = False
+        self._set_refresh_login_qr_button_state(False)
+
+    def sync_pause_controls(self):
+        """同步暂停事件与 GUI 按钮状态，避免线程已暂停但无法恢复。"""
+        try:
+            is_running = bool(self.running_thread and self.running_thread.is_alive())
+            if is_running and self.pause_event.is_set():
+                self.btn_resume.config(state='normal')
+                if not self._captcha_prompt_active:
+                    self.var_status.set("已暂停：可点击恢复运行")
+                    self.var_sleep_text.set("已暂停：可点击恢复运行")
+            elif not is_running:
+                self.btn_resume.config(state='disabled')
+        except Exception:
+            pass
+
     # ---------- 验证码回调 ----------
     def on_captcha_detected(self, where: str, captcha_type: str = "unknown"):
         """当爬虫线程检测到验证码时调用此方法"""
@@ -5490,6 +5519,7 @@ class App:
             mm = (elapsed % 3600) // 60
             ss = elapsed % 60
             self.var_duration.set(f"已用时：{hh:02d}:{mm:02d}:{ss:02d}")
+        self.sync_pause_controls()
         self._tick_after_id = self.master.after(1000, self._tick)
 
     # ---------- 控制 ----------
@@ -5515,8 +5545,8 @@ class App:
 
         selected_acc_name = selected_accounts[0]
         self.current_account_name = selected_acc_name
+        self.reset_pause_state_for_new_run()
         self.clear_login_qr_preview()
-        self._set_refresh_login_qr_button_state(False)
 
         try:
             max_scroll = int(self.var_max_scroll.get())
@@ -5602,7 +5632,7 @@ class App:
                 def switch_to_account(account_name: str):
                     nonlocal current_account_name
                     if current_account_name == account_name and self.crawler:
-                        return
+                        return self.crawler
                     if current_account_name and current_account_name in crawler_pool:
                         persist_crawler_cookies(current_account_name, crawler_pool.get(current_account_name), "切换前")
                     self.db.update_cookie_usage(account_name)
@@ -5615,7 +5645,7 @@ class App:
                         self.crawler.max_scroll_default = max_scroll
                         self.logger.info("切换到已打开的账号 [%s]，复用现有浏览器会话", account_name)
                         self.ui_set_status(f"切换账号：{account_name}")
-                        return
+                        return self.crawler
 
                     selected_cookies = self.account_map.get(account_name) or []
                     self.logger.info(f"首次切换账号 [{account_name}]，启动浏览器并登录...")
@@ -5631,6 +5661,7 @@ class App:
                         on_sleep=self.on_sleep,
                         on_captcha_detected=self.on_captcha_detected,
                         skip_event=self.skip_event,
+                        pause_event=self.pause_event,
                         max_scroll_default=max_scroll,
                         headless=self.var_headless.get(),
                         run_in_background=background_mode,
@@ -5647,6 +5678,7 @@ class App:
                         self.db.upsert_xhs_cookie(account_name, snapshot)
                         self.account_map[account_name] = snapshot
                         self.logger.info(f"账号 [{account_name}] Cookie 已刷新回写（{len(snapshot)}条）")
+                    return crawler
 
                 def warm_up_selected_crawlers():
                     """品牌多账号采集前预先打开各账号浏览器，后续轮转时直接复用。"""
@@ -5695,6 +5727,116 @@ class App:
                         account_cursor = idx
                         return account_name
                     return None
+
+                note_account_cursor = 0
+
+                def pick_note_detail_account() -> Optional[str]:
+                    """按笔记详情访问维度轮流选择账号。"""
+                    nonlocal note_account_cursor
+                    if target_type != TargetType.BRAND or len(selected_accounts) <= 1:
+                        return current_account_name or (selected_accounts[0] if selected_accounts else None)
+                    total_accounts = len(selected_accounts)
+                    for offset in range(total_accounts):
+                        idx = (note_account_cursor + offset) % total_accounts
+                        account_name = selected_accounts[idx]
+                        if account_name in quota_full_accounts:
+                            continue
+                        note_account_cursor = (idx + BRAND_NOTE_ACCOUNT_ROTATE_EVERY) % total_accounts
+                        return account_name
+                    return None
+
+                def process_note_details_with_account_rotation(
+                        note_urls: List[str],
+                        row: Dict,
+                        current_stats: Dict[str, int]
+                ):
+                    """让多个账号在同一个品牌内轮流打开笔记详情。"""
+                    if target_type != TargetType.BRAND or len(selected_accounts) <= 1:
+                        active_crawler = self.crawler
+                        if not active_crawler:
+                            fallback_account = current_account_name or (selected_accounts[0] if selected_accounts else "")
+                            if fallback_account:
+                                active_crawler = switch_to_account(fallback_account)
+                        if not active_crawler:
+                            return
+                        for note_url in note_urls:
+                            active_crawler.check_stop()
+                            base_url = normalize_xhs_note_url_for_dedup(note_url)
+                            if url_checker and url_checker(base_url):
+                                XHSCrawler._inc_stat(current_stats, "skipped_existing_urls")
+                                active_crawler.logger.info(f"已存在，跳过详情访问: {base_url}")
+                                continue
+                            XHSCrawler._inc_stat(current_stats, "opened_urls")
+                            detail = active_crawler.process_single_note(note_url, keep_current_window=True)
+                            if not detail:
+                                continue
+                            if target_type == TargetType.BRAND:
+                                detail.update({'brand_id': row['id'], 'brand_name': row.get('brand_name', '')})
+                            else:
+                                detail.update({
+                                    'artist_id': row['id'],
+                                    'artist_name': row.get('brand_name', ''),
+                                    'full_get': 0
+                                })
+                            if insert_cb:
+                                inserted = insert_cb(detail)
+                                XHSCrawler._inc_stat(
+                                    current_stats,
+                                    "inserted_urls" if inserted is not False else "skipped_existing_urls"
+                                )
+                        return
+
+                    feed_crawler = self.crawler
+                    feed_account = current_account_name
+                    brand_name = row.get('brand_name', '')
+                    try:
+                        for note_url in note_urls:
+                            if feed_crawler:
+                                feed_crawler.check_stop()
+                            base_url = normalize_xhs_note_url_for_dedup(note_url)
+                            if url_checker and url_checker(base_url):
+                                XHSCrawler._inc_stat(current_stats, "skipped_existing_urls")
+                                self.logger.info(f"已存在，跳过详情访问: {base_url}")
+                                continue
+
+                            detail_account = pick_note_detail_account()
+                            if not detail_account:
+                                self.logger.warning("没有可用于打开笔记详情的账号，跳过：%s", base_url)
+                                continue
+
+                            detail_crawler = switch_to_account(detail_account)
+                            if not detail_crawler:
+                                self.logger.warning("账号 [%s] 浏览器不可用，跳过笔记：%s", detail_account, base_url)
+                                continue
+
+                            try:
+                                detail_crawler.max_scroll_default = int(self.var_max_scroll.get())
+                            except Exception:
+                                detail_crawler.max_scroll_default = max_scroll
+
+                            detail_crawler.check_stop()
+                            self.logger.info(
+                                "品牌[%s] 笔记详情由账号 [%s] 打开：%s",
+                                brand_name,
+                                detail_account,
+                                base_url
+                            )
+                            XHSCrawler._inc_stat(current_stats, "opened_urls")
+                            detail = detail_crawler.process_single_note(
+                                note_url,
+                                keep_current_window=detail_crawler is feed_crawler
+                            )
+                            if not detail:
+                                continue
+
+                            detail.update({'brand_id': row['id'], 'brand_name': brand_name})
+                            if insert_cb:
+                                inserted = insert_cb(detail)
+                                stat_key = "inserted_urls" if inserted is not False else "skipped_existing_urls"
+                                XHSCrawler._inc_stat(current_stats, stat_key)
+                    finally:
+                        if feed_account and feed_crawler and not feed_crawler.stop_requested:
+                            switch_to_account(feed_account)
 
                 if target_type == TargetType.BRAND:
                     rows = self.db.fetch_brand_urls(
@@ -5770,7 +5912,17 @@ class App:
                         except Exception:
                             pass
 
-                        ok = self.crawler.crawl_target(row)
+                        note_detail_handler = (
+                            process_note_details_with_account_rotation
+                            if target_type == TargetType.BRAND
+                            else None
+                        )
+                        if (
+                                target_type == TargetType.BRAND
+                                and current_account_name in selected_accounts
+                        ):
+                            note_account_cursor = selected_accounts.index(current_account_name)
+                        ok = self.crawler.crawl_target(row, note_detail_handler=note_detail_handler)
                         if ok:
                             if target_type == TargetType.BRAND:
                                 current_account_processed += 1
@@ -5852,6 +6004,7 @@ class App:
                 self.logger.exception(f"运行异常：{e}")
                 self.ui_set_status("异常")
             finally:
+                self.reset_pause_state_for_new_run()
                 close_all_crawlers(persist=bool(self.db))
                 try:
                     if self.db:
@@ -5884,7 +6037,8 @@ class App:
 
     def resume(self):
         """扫码/风控完成后，手动恢复采集"""
-        if not self.crawler:
+        crawlers = list(getattr(self, "crawler_pool", {}).values())
+        if not self.crawler and not crawlers:
             return
         try:
             self.btn_resume.config(state='disabled')
@@ -5895,10 +6049,12 @@ class App:
         self.var_sleep_text.set("正在恢复浏览器会话，请稍候")
         self._set_refresh_login_qr_button_state(False)
         self.logger.info("已点击“恢复运行”，将重启当前浏览器会话后继续采集")
-        try:
-            self.crawler.resume()
-        except Exception:
-            pass
+        for crawler in crawlers or [self.crawler]:
+            try:
+                if crawler:
+                    crawler.resume()
+            except Exception:
+                pass
 
     def skip_current_wait(self):
         self.skip_event.set()
