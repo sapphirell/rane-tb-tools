@@ -44,6 +44,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+from xhs_comments import XHSCommentCrawler, extract_note_id, normalize_note_url, write_result
+
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
@@ -65,6 +67,8 @@ def get_runtime_base_dir() -> str:
 LOG_ROTATE_MAX_BYTES = 5 * 1024 * 1024
 LOG_ROTATE_BACKUP_COUNT = 4
 LOG_SIZE_REFRESH_INTERVAL_MS = 5000
+# DRIVER_SERVICE_ARGS 仅记录浏览器驱动警告与错误，避免完整 DevTools 通信持续占用磁盘。
+DRIVER_SERVICE_ARGS = ["--log-level=WARNING"]
 BRAND_DAILY_ACCOUNT_LIMIT = 200
 BRAND_DAILY_ACCOUNT_WINDOW_SEC = 24 * 3600
 BRAND_ACCOUNT_ROTATE_EVERY = 1
@@ -182,12 +186,20 @@ def _legacy_profile_key(name: str) -> str:
 class TargetType:
     BRAND = 'brand'  # 写 spider_log
     ARTIST = 'artist'  # 写 artist_spider_log
+    COMMENT = 'comment'  # 写评论 JSON 文件，不写入 spider_log
 
 
 class CrawlMode:
     HOT = 'hot'
     REVERSE = 'reverse'
     FULL = 'full'
+
+
+class ArtistCrawlMode:
+    """创作者采集排序模式。"""
+
+    DEFAULT = 'default'
+    UNCOLLECTED_FIRST = 'uncollected_first'
 
 
 CRAWL_MODE_ORDER = [CrawlMode.HOT, CrawlMode.REVERSE, CrawlMode.FULL]
@@ -207,6 +219,15 @@ BRAND_RECENT_GATHER_FILTER_OPTIONS = [
     ("24小时内未采集", 24),
     ("不限制", 0),
 ]
+ARTIST_CRAWL_MODE_TITLES = {
+    ArtistCrawlMode.DEFAULT: "默认排序",
+    ArtistCrawlMode.UNCOLLECTED_FIRST: "未采集优先",
+}
+ARTIST_CRAWL_MODE_DESCRIPTIONS = {
+    ArtistCrawlMode.DEFAULT: "按原有权重和最近采集时间排序",
+    ArtistCrawlMode.UNCOLLECTED_FIRST: "优先采集从未跑过的创作者，再按最久未采集排序",
+}
+ARTIST_CRAWL_MODE_ORDER = [ArtistCrawlMode.UNCOLLECTED_FIRST, ArtistCrawlMode.DEFAULT]
 
 
 class DatabaseManager:
@@ -228,6 +249,7 @@ class DatabaseManager:
         self._has_likes_col_spider = None
         self._has_text_col_spider = None
         self._has_likes_col_artist = None
+        self._has_is_pinned_rule_col_artist = None
         self._ensure_xhs_cookie_quota_columns()
         self._ensure_xhs_brand_crawl_quota_table()
 
@@ -478,6 +500,148 @@ class DatabaseManager:
         _, affected = self._exec("DELETE FROM xhs_cookies WHERE account_name = %s", (account_name,))
         return int(affected or 0)
 
+    # --- 评论采集数据 ---
+    def save_xhs_note_comments(self, result: Dict, account_name: str) -> int:
+        """将一篇笔记及其评论采集结果原子写入数据库，返回写入的评论数量。"""
+        note_id = str(result.get("note_id") or "").strip()
+        note_url = str(result.get("note_url") or "").strip()
+        if not note_id or not note_url:
+            raise ValueError("评论采集结果缺少笔记 ID 或笔记地址")
+
+        raw_comments = result.get("comments")
+        if not isinstance(raw_comments, list):
+            raise ValueError("评论采集结果格式无效")
+
+        now = int(time.time())
+        comment_rows: List[Tuple] = []
+        for comment in raw_comments:
+            if not isinstance(comment, dict):
+                raise ValueError("评论采集结果包含无效评论")
+            comment_key = str(comment.get("comment_key") or "").strip()
+            comment_note_id = str(comment.get("note_id") or "").strip()
+            if not comment_key or comment_note_id != note_id:
+                raise ValueError("评论唯一键或所属笔记 ID 无效")
+            comment_rows.append((
+                note_id,
+                comment_key,
+                str(comment.get("comment_id") or "").strip(),
+                str(comment.get("parent_comment_key") or "").strip(),
+                str(comment.get("parent_comment_id") or "").strip(),
+                str(comment.get("user_id") or "").strip(),
+                str(comment.get("user_name") or "").strip(),
+                str(comment.get("content") or "").strip(),
+                str(comment.get("create_time") or "").strip(),
+                str(comment.get("location") or "").strip(),
+                int(comment.get("like_count") or 0),
+                int(comment.get("reply_count") or 0),
+                str(comment.get("reply_to_user_id") or "").strip(),
+                str(comment.get("reply_to_user_name") or "").strip(),
+                1 if bool(comment.get("is_reply")) else 0,
+                1 if bool(comment.get("is_author")) else 0,
+                now,
+                now,
+                now,
+                now,
+            ))
+
+        total_comment_count = max(int(result.get("total_comments") or 0), len(comment_rows))
+        collected_comment_count = len(comment_rows)
+        self._ensure_conn()
+        try:
+            self.connection.begin()
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO xhs_note (
+                        note_id,
+                        note_url,
+                        source_account_name,
+                        total_comment_count,
+                        collected_comment_count,
+                        first_collected_at,
+                        last_collected_at,
+                        created_at,
+                        updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        note_url = VALUES(note_url),
+                        source_account_name = VALUES(source_account_name),
+                        total_comment_count = VALUES(total_comment_count),
+                        collected_comment_count = VALUES(collected_comment_count),
+                        first_collected_at = IF(first_collected_at = 0, VALUES(first_collected_at), first_collected_at),
+                        last_collected_at = VALUES(last_collected_at),
+                        updated_at = VALUES(updated_at)
+                    """,
+                    (
+                        note_id,
+                        note_url,
+                        str(account_name or "").strip(),
+                        total_comment_count,
+                        collected_comment_count,
+                        now,
+                        now,
+                        now,
+                        now,
+                    )
+                )
+                if comment_rows:
+                    cursor.executemany(
+                        """
+                        INSERT INTO xhs_note_comment (
+                            note_id,
+                            comment_key,
+                            platform_comment_id,
+                            parent_comment_key,
+                            parent_platform_comment_id,
+                            user_id,
+                            user_name,
+                            content,
+                            publish_time,
+                            location,
+                            like_count,
+                            reply_count,
+                            reply_to_user_id,
+                            reply_to_user_name,
+                            is_reply,
+                            is_author,
+                            first_collected_at,
+                            last_collected_at,
+                            created_at,
+                            updated_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            platform_comment_id = VALUES(platform_comment_id),
+                            parent_comment_key = VALUES(parent_comment_key),
+                            parent_platform_comment_id = VALUES(parent_platform_comment_id),
+                            user_id = VALUES(user_id),
+                            user_name = VALUES(user_name),
+                            content = VALUES(content),
+                            publish_time = VALUES(publish_time),
+                            location = VALUES(location),
+                            like_count = VALUES(like_count),
+                            reply_count = VALUES(reply_count),
+                            reply_to_user_id = VALUES(reply_to_user_id),
+                            reply_to_user_name = VALUES(reply_to_user_name),
+                            is_reply = VALUES(is_reply),
+                            is_author = VALUES(is_author),
+                            first_collected_at = IF(first_collected_at = 0, VALUES(first_collected_at), first_collected_at),
+                            last_collected_at = VALUES(last_collected_at),
+                            updated_at = VALUES(updated_at)
+                        """,
+                        comment_rows,
+                    )
+            self.connection.commit()
+        except Exception:
+            try:
+                self.connection.rollback()
+            except Exception:
+                pass
+            raise
+        return collected_comment_count
+
     # --- 字段检测 ---
     def fetch_account_settings(self, account_name: str) -> Optional[Dict]:
         cur, _ = self._exec(
@@ -584,6 +748,16 @@ class DatabaseManager:
         except Exception:
             self._has_likes_col_artist = False
         return self._has_likes_col_artist
+
+    def _check_is_pinned_rule_col_artist(self) -> bool:
+        if self._has_is_pinned_rule_col_artist is not None:
+            return self._has_is_pinned_rule_col_artist
+        try:
+            cur, _ = self._exec("SHOW COLUMNS FROM artist_spider_log LIKE 'is_pinned_rule'")
+            self._has_is_pinned_rule_col_artist = bool(cur.fetchone())
+        except Exception:
+            self._has_is_pinned_rule_col_artist = False
+        return self._has_is_pinned_rule_col_artist
 
     # --- 品牌 ---
     def _normalize_crawl_modes(self, crawl_modes) -> List[str]:
@@ -746,15 +920,31 @@ class DatabaseManager:
         return inserted
 
     # --- 艺术家 ---
-    def fetch_artists(self) -> list:
-        sql = """
+    def fetch_artists(self, crawl_mode: str = ArtistCrawlMode.DEFAULT) -> list:
+        """获取需要采集的创作者列表，并按指定采集模式排序。"""
+        order_sql = """
+            ORDER BY spider_index DESC, last_gather_time ASC
+        """
+        if crawl_mode == ArtistCrawlMode.UNCOLLECTED_FIRST:
+            order_sql = """
+            ORDER BY
+                CASE
+                    WHEN last_gather_time IS NULL OR last_gather_time <= '1000-01-01 00:00:00' THEN 0
+                    ELSE 1
+                END ASC,
+                last_gather_time ASC,
+                spider_index DESC,
+                id DESC
+            """
+
+        sql = f"""
             SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting_for_artist 
             FROM brand 
             WHERE is_delete = 0 
               AND (is_bjd_artist = 1 or is_bjd_hairstylist = 1)
               AND (rednote_url != '' OR rednote_url2 != '')
               AND rednote_spd_setting_for_artist != 3
-            ORDER BY spider_index DESC, last_gather_time ASC
+            {order_sql}
         """
         cur, _ = self._exec(sql)
         return cur.fetchall()
@@ -777,6 +967,7 @@ class DatabaseManager:
         images = ','.join(data.get('images') or [])[:2000]
         now = int(time.time())
         has_likes = self._check_likes_col_artist()
+        has_is_pinned_rule = self._check_is_pinned_rule_col_artist()
         likes = int(data.get('like_count') or 0)
 
         cols = ["msg_type", "status", "origin_type", "title", "content", "url", "images", "brand_id", "brand_name",
@@ -793,6 +984,9 @@ class DatabaseManager:
         ]
         cols.append("url_md5")
         vals.append(url_md5)
+        if has_is_pinned_rule:
+            cols.append("is_pinned_rule")
+            vals.append(1 if int(data.get('is_pinned_rule') or 0) == 1 else 0)
 
         inserted = self._insert_with_url_md5_dedup(
             table_name="artist_spider_log",
@@ -1248,6 +1442,7 @@ class XHSCrawler:
 
         self.all_links = set()
         self.collected_quick_data = []
+        self.note_card_meta: Dict[str, Dict[str, int]] = {}
 
     def _setup_started_browser(self, *, headless: bool):
         """浏览器启动后统一注入反检测脚本与基础指纹配置。"""
@@ -1652,6 +1847,23 @@ class XHSCrawler:
                 return major_version
         return 0
 
+    def _detect_driver_major_version(self, driver_path: str) -> int:
+        """读取 driver 可执行文件的主版本号，读取失败时返回 0。"""
+        if not driver_path or not os.path.isfile(driver_path):
+            return 0
+        try:
+            result = subprocess.run(
+                [driver_path, "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except Exception:
+            return 0
+        output = (result.stdout or result.stderr or "").strip()
+        return self._extract_major_version(output)
+
     def _sort_cached_driver_candidates(self, cache_candidates: List[str], browser_name: str) -> List[str]:
         """优先选择与当前浏览器主版本一致的缓存 driver，其次按最近更新时间排序。"""
         browser_major = self._detect_browser_major_version(browser_name)
@@ -1665,6 +1877,7 @@ class XHSCrawler:
         return sorted(set(cache_candidates), key=sort_key, reverse=True)
 
     def _resolve_driver_executable(self, browser_name: str) -> str:
+        """选择与当前浏览器主版本一致的本地 driver，避免启动已知不兼容的缓存。"""
         base_dir = get_resource_base_dir()
         bin_dir = os.path.join(base_dir, "bin")
         tmp_dir = os.path.join(base_dir, "tmp")
@@ -1735,9 +1948,27 @@ class XHSCrawler:
                 if system_chrome_driver:
                     candidates.append(system_chrome_driver)
 
+        browser_major = self._detect_browser_major_version(browser_name)
+        skipped_versions = []
         for path in candidates:
-            if path and os.path.isfile(path):
+            if not path or not os.path.isfile(path):
+                continue
+            if browser_major <= 0:
                 return path
+
+            driver_major = self._detect_driver_major_version(path)
+            if driver_major == browser_major:
+                return path
+            skipped_versions.append(driver_major or "未知")
+
+        if skipped_versions:
+            versions = ", ".join(str(version) for version in sorted(set(skipped_versions), key=str))
+            self.logger.info(
+                "本地 %sDriver 与浏览器主版本 %s 不一致（已有: %s），交由 Selenium 自动解析",
+                "Edge" if browser_name == "edge" else "Chrome",
+                browser_major,
+                versions,
+            )
         return ""
 
     def _ensure_driver_executable(self, driver_path: str):
@@ -1758,10 +1989,10 @@ class XHSCrawler:
         driver_path = self._resolve_driver_executable("chrome")
         if driver_path:
             self._ensure_driver_executable(driver_path)
-            service = ChromeService(executable_path=driver_path, log_output=log_path, service_args=["--verbose"])
+            service = ChromeService(executable_path=driver_path, log_output=log_path, service_args=DRIVER_SERVICE_ARGS)
             self.logger.info(f"使用本地 ChromeDriver: {driver_path}")
         else:
-            service = ChromeService(log_output=log_path, service_args=["--verbose"])
+            service = ChromeService(log_output=log_path, service_args=DRIVER_SERVICE_ARGS)
             self.logger.warning("未找到可复用的本地 ChromeDriver（bin/缓存/PATH），改用 Selenium 自动解析 driver（首次或版本变更会较慢）")
         options = self._build_chrome_options(profile_dir, headless=headless)
         self.logger.info(f"ChromeDriver 日志路径: {log_path}")
@@ -1773,7 +2004,7 @@ class XHSCrawler:
                     "本地 ChromeDriver 启动失败，自动回退 Selenium 解析 driver: %s",
                     local_err
                 )
-                fallback_service = ChromeService(log_output=log_path, service_args=["--verbose"])
+                fallback_service = ChromeService(log_output=log_path, service_args=DRIVER_SERVICE_ARGS)
                 return chrome_webdriver.WebDriver(service=fallback_service, options=options)
             raise
 
@@ -1782,10 +2013,10 @@ class XHSCrawler:
         driver_path = self._resolve_driver_executable("edge")
         if driver_path:
             self._ensure_driver_executable(driver_path)
-            service = EdgeService(executable_path=driver_path, log_output=log_path, service_args=["--verbose"])
+            service = EdgeService(executable_path=driver_path, log_output=log_path, service_args=DRIVER_SERVICE_ARGS)
             self.logger.info(f"使用本地 EdgeDriver: {driver_path}")
         else:
-            service = EdgeService(log_output=log_path, service_args=["--verbose"])
+            service = EdgeService(log_output=log_path, service_args=DRIVER_SERVICE_ARGS)
             self.logger.warning("未找到可复用的本地 EdgeDriver（bin/缓存/PATH），改用 Selenium 自动解析 driver（首次或版本变更会较慢）")
         options = self._build_edge_options(profile_dir, headless=headless)
         self.logger.info(f"EdgeDriver 日志路径: {log_path}")
@@ -1797,7 +2028,7 @@ class XHSCrawler:
                     "本地 EdgeDriver 启动失败，自动回退 Selenium 解析 driver: %s",
                     local_err
                 )
-                fallback_service = EdgeService(log_output=log_path, service_args=["--verbose"])
+                fallback_service = EdgeService(log_output=log_path, service_args=DRIVER_SERVICE_ARGS)
                 return edge_webdriver.WebDriver(service=fallback_service, options=options)
             raise
 
@@ -2881,7 +3112,16 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
                     link_element = item.find_element(By.CSS_SELECTOR, 'a.cover.mask.ld[href^="/user/profile/"]')
                     raw_url = link_element.get_attribute('href')
                     clean_url = raw_url.replace('&amp;', '&')
-                    if clean_url and clean_url not in seen_links:
+                    if not clean_url:
+                        continue
+                    base_url = normalize_xhs_note_url_for_dedup(clean_url)
+                    if base_url:
+                        old_meta = self.note_card_meta.get(base_url) or {}
+                        is_pinned_rule = 1 if self._is_note_item_pinned_rule(item) else 0
+                        self.note_card_meta[base_url] = {
+                            'is_pinned_rule': max(int(old_meta.get('is_pinned_rule') or 0), is_pinned_rule)
+                        }
+                    if clean_url not in seen_links:
                         current_links.append(clean_url)
                         seen_links.add(clean_url)
                 except Exception:
@@ -2889,6 +3129,23 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
         except Exception as e:
             self.logger.warning(f"提取链接异常: {e}")
         return current_links
+
+    def _is_note_item_pinned_rule(self, item) -> bool:
+        """识别小红书创作者主页卡片是否为置顶帖。"""
+        try:
+            tag_elements = item.find_elements(
+                By.CSS_SELECTOR,
+                '.top-tag-area .top-wrapper, .top-wrapper'
+            )
+            return any(str(tag.text or '').strip() == '置顶' for tag in tag_elements)
+        except Exception:
+            return False
+
+    def get_note_card_is_pinned_rule(self, note_url: str) -> int:
+        """返回列表卡片记录的置顶帖标识。"""
+        base_url = normalize_xhs_note_url_for_dedup(note_url)
+        meta = self.note_card_meta.get(base_url) if base_url else None
+        return 1 if meta and int(meta.get('is_pinned_rule') or 0) == 1 else 0
 
     def extract_current_links(self):
         """提取当前虚拟列表中可见的笔记链接，兼容旧调用。"""
@@ -3000,6 +3257,36 @@ return {ok: true, tag: el.tagName || '', cls: el.className || ''};
         except Exception as e:
             self.logger.error(f"笔记处理失败 {note_url}: {e}", exc_info=True)
             return None
+
+    def collect_note_comments(
+            self,
+            note_url: str,
+            *,
+            max_comments: int = 0,
+            max_rounds: int = 240,
+            page_wait_seconds: float = 1.0,
+    ) -> Dict:
+        """复用当前账号浏览器采集单篇笔记评论，不新建独立登录会话。"""
+        def navigate(url: str):
+            self._driver_get(url)
+            self._detect_and_handle_captcha("comment")
+
+        def check_stop():
+            self.check_stop()
+            self._detect_and_handle_captcha("comment")
+
+        comment_crawler = XHSCommentCrawler(
+            driver=self.driver,
+            page_wait_seconds=page_wait_seconds,
+            navigate=navigate,
+            check_stop=check_stop,
+            logger=self.logger,
+        )
+        return comment_crawler.crawl(
+            note_url,
+            max_comments=max_comments,
+            max_rounds=max_rounds,
+        )
 
     def _expand_visible_comment_replies(self):
         """尽量展开当前详情页已露出的评论回复，避免只采到父评论。"""
@@ -3261,7 +3548,8 @@ return result;
                     'url': clean_url,
                     'images': [cover_url] if cover_url else [],
                     'title': title,
-                    'content': ''
+                    'content': '',
+                    'is_pinned_rule': self.get_note_card_is_pinned_rule(clean_url)
                 })
             except Exception as e:
                 self.logger.error(f"快速采集异常: {e}")
@@ -3373,7 +3661,8 @@ return result;
                                     detail.update({
                                         'artist_id': row['id'],
                                         'artist_name': row.get('brand_name', ''),
-                                        'full_get': 0
+                                        'full_get': 0,
+                                        'is_pinned_rule': self.get_note_card_is_pinned_rule(note_url)
                                     })
                                 if self.insert_callback:
                                     inserted = self.insert_callback(detail)
@@ -3410,6 +3699,7 @@ return result;
 
                 self.all_links.clear()
                 self.collected_quick_data.clear()
+                self.note_card_meta.clear()
             for k in current_stats.keys():
                 self.total_crawl_stats[k] = int(self.total_crawl_stats.get(k, 0)) + int(current_stats.get(k, 0))
             return True
@@ -3519,6 +3809,10 @@ class App:
         self._captcha_prompt_active = False
         self.master.title("小红书爬虫 · 采集控制台（数据库Cookie管理版）")
         self.master.geometry("920x900")
+        self.var_comment_url = tk.StringVar(value="")
+        self.var_comment_max_count = tk.StringVar(value="0")
+        self.var_comment_max_rounds = tk.StringVar(value="240")
+        self.var_comment_wait = tk.StringVar(value="1.0")
         compact_style = ttk.Style(self.master)
         compact_style.configure("Compact.TButton", padding=(4, 1))
         compact_style.configure("Compact.TCheckbutton", padding=(0, 0))
@@ -3626,6 +3920,10 @@ class App:
             command=lambda: self.on_target_type_change(TargetType.ARTIST),
             style="Compact.TRadiobutton"
         ).pack(side='left', padx=8, pady=4)
+        self.btn_comment_crawl = ttk.Button(
+            type_frame, text="采集评论", command=self.start_comment_crawl, style="Compact.TButton"
+        )
+        self.btn_comment_crawl.pack(side='left', padx=(12, 8), pady=2)
 
         shutdown_frame = ttk.LabelFrame(master, text="自动关机")
         shutdown_frame.pack(fill='x', padx=8, pady=(0, 6))
@@ -4162,10 +4460,11 @@ class App:
             return
         self.master.after_idle(self.master.focus_set)
 
-    def ui_set_buttons(self, *, start=None, stop=None, resume=None, skip=None, add_acc=None, remove_acc=None):
+    def ui_set_buttons(self, *, start=None, comment=None, stop=None, resume=None, skip=None, add_acc=None, remove_acc=None):
         def _apply():
             try:
                 if start is not None: self.btn_start.config(state=start)
+                if comment is not None: self.btn_comment_crawl.config(state=comment)
                 if stop is not None: self.btn_stop.config(state=stop)
                 if resume is not None: self.btn_resume.config(state=resume)
                 if skip is not None: self.btn_skip.config(state=skip)
@@ -4764,8 +5063,8 @@ class App:
             return names
         return list(self.account_map.keys())
 
-    def choose_run_accounts(self, target_type: str) -> Optional[List[str]]:
-        """启动采集前选择本次参与账号。"""
+    def choose_run_accounts(self, target_type: str, *, single_select: bool = False) -> Optional[List[str]]:
+        """启动采集前从账号池选择本次参与账号。"""
         account_names = self._get_ordered_account_names()
         if not account_names:
             messagebox.showwarning("提示", "当前没有可用账号，请先新增账号")
@@ -4799,6 +5098,8 @@ class App:
         header_text = "请选择本次参与采集的账号"
         if target_type == TargetType.BRAND:
             header_text += f"（每账号近24小时最多打开 {BRAND_DAILY_ACCOUNT_LIMIT} 个品牌）"
+        elif single_select:
+            header_text = "请选择本次评论采集账号（一篇笔记使用同一账号完成）"
         ttk.Label(win, text=header_text).pack(anchor="w", padx=16, pady=(14, 8))
 
         body = ttk.Frame(win)
@@ -4808,7 +5109,7 @@ class App:
             used = int(usage_map.get(name, 0))
             remaining = max(0, BRAND_DAILY_ACCOUNT_LIMIT - used)
             disabled = target_type == TargetType.BRAND and remaining <= 0
-            var = tk.BooleanVar(value=not disabled)
+            var = tk.BooleanVar(value=(not disabled) and (not single_select or idx == 0))
             check_vars[name] = var
             row = ttk.Frame(body)
             row.grid(row=idx, column=0, sticky="ew", pady=2)
@@ -4823,9 +5124,13 @@ class App:
         actions.pack(fill="x", padx=16, pady=(4, 14))
 
         def select_available():
+            first_available = True
             for acc_name, var in check_vars.items():
                 if target_type == TargetType.BRAND and int(usage_map.get(acc_name, 0)) >= BRAND_DAILY_ACCOUNT_LIMIT:
                     var.set(False)
+                elif single_select:
+                    var.set(first_available)
+                    first_available = False
                 else:
                     var.set(True)
 
@@ -4838,6 +5143,9 @@ class App:
             if not selected:
                 messagebox.showwarning("提示", "请至少勾选一个可用账号", parent=win)
                 return
+            if single_select and len(selected) != 1:
+                messagebox.showwarning("提示", "单篇评论采集请只选择一个账号", parent=win)
+                return
             result["accounts"] = selected
             win.destroy()
 
@@ -4845,7 +5153,10 @@ class App:
             result["accounts"] = None
             win.destroy()
 
-        ttk.Button(actions, text="全选可用", command=select_available, style="Compact.TButton").pack(side="left", padx=(0, 6))
+        ttk.Button(
+            actions, text="选择账号" if single_select else "全选可用",
+            command=select_available, style="Compact.TButton"
+        ).pack(side="left", padx=(0, 6))
         ttk.Button(actions, text="清空", command=clear_all, style="Compact.TButton").pack(side="left", padx=6)
         ttk.Button(actions, text="开始本次采集", command=confirm, style="Compact.TButton").pack(side="right", padx=(6, 0))
         ttk.Button(actions, text="取消", command=cancel, style="Compact.TButton").pack(side="right", padx=6)
@@ -4986,6 +5297,96 @@ class App:
         except Exception:
             pass
         return result if result["modes"] else None
+
+    def choose_artist_crawl_mode(self) -> Optional[Dict]:
+        """启动创作者采集前选择采集策略。"""
+        result = {"mode": None, "artist_count": 0}
+        win = tk.Toplevel(self.master)
+        win.title("选择采集策略")
+        win.transient(self.master)
+        win.grab_set()
+        win.resizable(False, False)
+
+        ttk.Label(win, text="请选择本次创作者采集策略").pack(anchor="w", padx=16, pady=(14, 8))
+
+        mode_var = tk.StringVar(value=ArtistCrawlMode.UNCOLLECTED_FIRST)
+        count_var = tk.StringVar(value="需要采集的创作者数量：计算中…")
+        strategy_hint_var = tk.StringVar(value="")
+        count_label = ttk.Label(win, textvariable=count_var)
+
+        for mode in ARTIST_CRAWL_MODE_ORDER:
+            row = ttk.Frame(win)
+            row.pack(fill="x", padx=16, pady=4)
+            ttk.Radiobutton(
+                row,
+                value=mode,
+                variable=mode_var,
+                style="Compact.TRadiobutton"
+            ).pack(side="left")
+            text_box = ttk.Frame(row)
+            text_box.pack(side="left", fill="x", expand=True)
+            ttk.Label(text_box, text=ARTIST_CRAWL_MODE_TITLES[mode]).pack(anchor="w")
+            ttk.Label(text_box, text=ARTIST_CRAWL_MODE_DESCRIPTIONS[mode]).pack(anchor="w")
+
+        ttk.Label(win, textvariable=strategy_hint_var).pack(anchor="w", padx=16, pady=(6, 4))
+        count_label.pack(anchor="w", padx=16, pady=(0, 8))
+
+        actions = ttk.Frame(win)
+        actions.pack(fill="x", padx=16, pady=(8, 14))
+
+        preview_db = None
+        try:
+            preview_db = DatabaseManager()
+        except Exception as e:
+            self.logger.warning(f"初始化创作者采集策略预览数据库失败: {e}")
+            count_var.set("需要采集的创作者数量：读取失败")
+
+        def refresh_preview(*_args):
+            mode = str(mode_var.get() or ArtistCrawlMode.DEFAULT)
+            strategy_hint_var.set(f"本次策略：{ARTIST_CRAWL_MODE_TITLES.get(mode, mode)}")
+            if not preview_db:
+                count_var.set("需要采集的创作者数量：读取失败")
+                return
+            try:
+                rows = preview_db.fetch_artists(mode)
+                count_var.set(f"需要采集的创作者数量：{len(rows)} 位")
+                result["artist_count"] = len(rows)
+            except Exception as e:
+                self.logger.warning(f"预览采集创作者数量失败: {e}")
+                count_var.set("需要采集的创作者数量：读取失败")
+
+        def confirm():
+            mode = str(mode_var.get() or ArtistCrawlMode.DEFAULT)
+            if mode not in ARTIST_CRAWL_MODE_TITLES:
+                messagebox.showwarning("提示", "请选择采集策略", parent=win)
+                return
+            result["mode"] = mode
+            win.destroy()
+
+        def cancel():
+            result["mode"] = None
+            win.destroy()
+
+        mode_var.trace_add("write", refresh_preview)
+        refresh_preview()
+
+        ttk.Button(actions, text="开始", command=confirm, style="Compact.TButton").pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text="取消", command=cancel, style="Compact.TButton").pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        try:
+            win.update_idletasks()
+            x = self.master.winfo_rootx() + max(0, (self.master.winfo_width() - win.winfo_width()) // 2)
+            y = self.master.winfo_rooty() + 150
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        self.master.wait_window(win)
+        try:
+            if preview_db:
+                preview_db.connection.close()
+        except Exception:
+            pass
+        return result if result["mode"] else None
 
     def _purge_account_profile_dirs(self, account_name: str) -> int:
         """清理账号本地浏览器会话目录，确保新增账号时进入扫码流程。"""
@@ -5431,6 +5832,199 @@ class App:
 
         self.ui(_apply)
 
+    def _choose_comment_crawl_config(self) -> bool:
+        """打开单篇评论采集参数窗口，返回用户是否确认启动。"""
+        result = {"confirmed": False}
+        win = tk.Toplevel(self.master)
+        win.title("采集单篇评论")
+        win.transient(self.master)
+        win.grab_set()
+        win.resizable(False, False)
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", padx=16, pady=(14, 8))
+        ttk.Label(body, text="笔记地址：").grid(row=0, column=0, padx=(0, 6), pady=4, sticky="e")
+        url_entry = ttk.Entry(body, textvariable=self.var_comment_url, width=74)
+        url_entry.grid(row=0, column=1, columnspan=5, pady=4, sticky="ew")
+        ttk.Label(body, text="最多评论数：").grid(row=1, column=0, padx=(0, 6), pady=4, sticky="e")
+        ttk.Entry(body, textvariable=self.var_comment_max_count, width=9).grid(
+            row=1, column=1, padx=(0, 12), pady=4, sticky="w"
+        )
+        ttk.Label(body, text="最多滚动轮数：").grid(row=1, column=2, padx=(0, 6), pady=4, sticky="e")
+        ttk.Entry(body, textvariable=self.var_comment_max_rounds, width=9).grid(
+            row=1, column=3, padx=(0, 12), pady=4, sticky="w"
+        )
+        ttk.Label(body, text="每轮等待(秒)：").grid(row=1, column=4, padx=(0, 6), pady=4, sticky="e")
+        ttk.Entry(body, textvariable=self.var_comment_wait, width=9).grid(row=1, column=5, pady=4, sticky="w")
+
+        actions = ttk.Frame(win)
+        actions.pack(fill="x", padx=16, pady=(4, 14))
+
+        def confirm():
+            if not (self.var_comment_url.get() or "").strip():
+                messagebox.showwarning("提示", "请填写小红书笔记地址", parent=win)
+                return
+            result["confirmed"] = True
+            win.destroy()
+
+        def cancel():
+            win.destroy()
+
+        ttk.Button(actions, text="开始采集", command=confirm, style="Compact.TButton").pack(side="right", padx=(6, 0))
+        ttk.Button(actions, text="取消", command=cancel, style="Compact.TButton").pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        try:
+            win.update_idletasks()
+            x = self.master.winfo_rootx() + max(0, (self.master.winfo_width() - win.winfo_width()) // 2)
+            y = self.master.winfo_rooty() + 120
+            win.geometry(f"+{x}+{y}")
+            url_entry.focus_set()
+        except Exception:
+            pass
+        self.master.wait_window(win)
+        return bool(result["confirmed"])
+
+    def start_comment_crawl(self):
+        """使用 GUI 账号池采集单篇笔记评论及楼中楼。"""
+        if self.running_thread and self.running_thread.is_alive():
+            messagebox.showinfo("提示", "已有采集任务在进行中，请先停止当前任务")
+            return
+
+        if not self._choose_comment_crawl_config():
+            return
+
+        raw_url = (self.var_comment_url.get() or "").strip()
+        if not raw_url:
+            messagebox.showwarning("提示", "请先填写小红书笔记地址")
+            return
+        try:
+            note_url = normalize_note_url(raw_url)
+            note_id = extract_note_id(note_url)
+        except ValueError as exc:
+            messagebox.showerror("地址无效", str(exc))
+            return
+
+        try:
+            max_comments = max(0, int((self.var_comment_max_count.get() or "0").strip()))
+            max_rounds = max(1, min(1000, int((self.var_comment_max_rounds.get() or "240").strip())))
+            comment_wait = max(0.3, float((self.var_comment_wait.get() or "1.0").strip()))
+        except (TypeError, ValueError):
+            messagebox.showerror("参数无效", "最多评论数、滚动轮数和等待时间需要填写有效数字")
+            return
+
+        selected_accounts = self.choose_run_accounts(TargetType.COMMENT, single_select=True)
+        if not selected_accounts:
+            return
+        account_name = selected_accounts[0]
+
+        self.current_account_name = account_name
+        self.reset_pause_state_for_new_run()
+        self.clear_login_qr_preview()
+        self.ui_set_buttons(
+            start='disabled', comment='disabled', stop='normal', resume='disabled', skip='normal',
+            add_acc='disabled', remove_acc='disabled'
+        )
+        self.done_rows = 0
+        self.total_rows = 1
+        self.ui_update_progress()
+        self.start_ts = time.time()
+        if self._tick_after_id is None:
+            self._tick()
+        self.ui_set_status(f"准备采集评论：{account_name}")
+
+        def run_comment_task():
+            db = None
+            crawler: Optional[XHSCrawler] = None
+            completed_normally = False
+            try:
+                db = DatabaseManager()
+                db.update_cookie_usage(account_name)
+                selected_cookies = self.account_map.get(account_name) or []
+                background_mode = bool(self.var_background_mode.get())
+                crawler = XHSCrawler(
+                    target_type=TargetType.COMMENT,
+                    account_name=account_name,
+                    get_scroll_sleep=self.get_scroll_sleep,
+                    get_detail_sleep=self.get_detail_sleep,
+                    get_login_qr_offset=self.get_login_qr_offset,
+                    on_sleep=self.on_sleep,
+                    on_captcha_detected=self.on_captcha_detected,
+                    skip_event=self.skip_event,
+                    pause_event=self.pause_event,
+                    max_scroll_default=max_rounds,
+                    headless=bool(self.var_headless.get()),
+                    run_in_background=background_mode,
+                    browser=self.var_browser.get(),
+                    logger=self.logger,
+                    on_login_qr_detected=self.on_login_qr_detected,
+                )
+                self.crawler = crawler
+                self.crawler_pool = {account_name: crawler}
+                latest_cookies = crawler.login(cookie_list=selected_cookies)
+                snapshot = latest_cookies or crawler.driver.get_cookies()
+                if snapshot:
+                    db.upsert_xhs_cookie(account_name, snapshot)
+                    self.account_map[account_name] = snapshot
+
+                self.logger.info("账号 [%s] 开始采集单篇评论：%s", account_name, note_url)
+                result = crawler.collect_note_comments(
+                    note_url,
+                    max_comments=max_comments,
+                    max_rounds=max_rounds,
+                    page_wait_seconds=comment_wait,
+                )
+                output_path = Path(get_runtime_base_dir()) / "output" / f"xhs_comments_{note_id}.json"
+                write_result(result, output_path)
+                persisted_comment_count = db.save_xhs_note_comments(result, account_name)
+                self.done_rows = 1
+                self.ui_update_progress()
+                self.logger.info(
+                    "评论采集完成：账号 [%s]，共 %d/%d 条，数据库已写入 %d 条，输出：%s",
+                    account_name,
+                    result.get("collected_comments", 0),
+                    result.get("total_comments", 0),
+                    persisted_comment_count,
+                    output_path,
+                )
+                self.ui_set_status("评论采集完成")
+                completed_normally = True
+            except KeyboardInterrupt:
+                self.logger.info("评论采集已停止")
+                self.ui_set_status("已停止")
+            except Exception as exc:
+                self.logger.exception("评论采集失败：%s", exc)
+                self.ui_set_status("评论采集异常")
+            finally:
+                if crawler and crawler.driver:
+                    try:
+                        snapshot = crawler.driver.get_cookies() or []
+                        if snapshot and db:
+                            db.upsert_xhs_cookie(account_name, snapshot)
+                            self.account_map[account_name] = snapshot
+                    except Exception as persist_err:
+                        self.logger.warning("评论采集结束后回写账号 [%s] Cookie 失败：%s", account_name, persist_err)
+                    try:
+                        crawler.driver.quit()
+                    except Exception:
+                        pass
+                self.crawler = None
+                self.crawler_pool = {}
+                try:
+                    if db and db.connection:
+                        db.connection.close()
+                except Exception:
+                    pass
+                self.reset_pause_state_for_new_run()
+                self.ui_set_buttons(
+                    start='normal', comment='normal', stop='disabled', resume='disabled', skip='disabled',
+                    add_acc='normal', remove_acc='normal'
+                )
+                if completed_normally:
+                    self.ui(lambda: self._clear_sleep_bar())
+
+        self.running_thread = threading.Thread(target=run_comment_task, daemon=True)
+        self.running_thread.start()
+
     # ---------- 动态读取 ----------
     def get_scroll_sleep(self) -> float:
         try:
@@ -5533,12 +6127,19 @@ class App:
             "modes": [CrawlMode.FULL],
             "recent_gather_hours": 0,
             "brand_count": 0,
+            "mode": ArtistCrawlMode.DEFAULT,
+            "artist_count": 0,
         }
         if target_type == TargetType.BRAND:
             selected_strategy = self.choose_crawl_mode()
             if not selected_strategy:
                 return
             crawl_strategy = selected_strategy
+        else:
+            selected_strategy = self.choose_artist_crawl_mode()
+            if not selected_strategy:
+                return
+            crawl_strategy.update(selected_strategy)
         selected_accounts = self.choose_run_accounts(target_type)
         if not selected_accounts:
             return
@@ -5557,6 +6158,7 @@ class App:
         self.save_account_settings(self.cb_account.get() if self._is_valid_account_name(self.cb_account.get()) else selected_acc_name)
 
         self.btn_start.config(state='disabled')
+        self.btn_comment_crawl.config(state='disabled')
         self.btn_add_acc.config(state='disabled')  # 运行时不可新增
         self.btn_remove_acc.config(state='disabled')
         self.btn_stop.config(state='normal')
@@ -5844,7 +6446,7 @@ class App:
                         recent_gather_hours=int(crawl_strategy.get("recent_gather_hours") or 0)
                     )
                 else:
-                    rows = self.db.fetch_artists()
+                    rows = self.db.fetch_artists(crawl_strategy.get("mode") or ArtistCrawlMode.DEFAULT)
                 self.total_rows = len(rows)
                 self.ui_update_progress()
                 if target_type == TargetType.BRAND:
@@ -5862,6 +6464,12 @@ class App:
                         "品牌采集策略：%s；%s",
                         " + ".join(selected_modes) if selected_modes else "未选择",
                         recent_hours_text
+                    )
+                else:
+                    artist_mode = str(crawl_strategy.get("mode") or ArtistCrawlMode.DEFAULT)
+                    self.logger.info(
+                        "创作者采集策略：%s",
+                        ARTIST_CRAWL_MODE_TITLES.get(artist_mode, artist_mode)
                     )
                 self.logger.info(f"待处理数量：{self.total_rows}")
                 warm_up_selected_crawlers()
@@ -6012,7 +6620,7 @@ class App:
                 except Exception:
                     pass
 
-                self.ui_set_buttons(start='normal', stop='disabled', resume='disabled', skip='disabled',
+                self.ui_set_buttons(start='normal', comment='normal', stop='disabled', resume='disabled', skip='disabled',
                                     add_acc='normal', remove_acc='normal')
                 self.ui(lambda: self._clear_sleep_bar())
                 if completed_normally:
