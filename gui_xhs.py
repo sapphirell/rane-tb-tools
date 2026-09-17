@@ -69,7 +69,8 @@ LOG_ROTATE_BACKUP_COUNT = 4
 LOG_SIZE_REFRESH_INTERVAL_MS = 5000
 # DRIVER_SERVICE_ARGS 仅记录浏览器驱动警告与错误，避免完整 DevTools 通信持续占用磁盘。
 DRIVER_SERVICE_ARGS = ["--log-level=WARNING"]
-BRAND_DAILY_ACCOUNT_LIMIT = 200
+# 小红书品牌采集账号近24小时额度上限，界面展示与采集轮换逻辑统一使用此值。
+BRAND_DAILY_ACCOUNT_LIMIT = 400
 BRAND_DAILY_ACCOUNT_WINDOW_SEC = 24 * 3600
 BRAND_ACCOUNT_ROTATE_EVERY = 1
 BRAND_NOTE_ACCOUNT_ROTATE_EVERY = 1
@@ -2164,7 +2165,11 @@ class XHSCrawler:
             pass
 
     def _restart_browser_session_after_captcha(self, resume_url: str = "") -> bool:
-        """风控扫码后重启当前浏览器会话，重新挂载账号 profile。"""
+        """风控扫码后重新挂载账号登录态。"""
+        return self._restart_browser_session(resume_url)
+
+    def _restart_browser_session(self, resume_url: str = "") -> bool:
+        """重建当前账号浏览器，保留 profile 并验证登录态。"""
         resume_url = str(resume_url or "").strip()
         cookie_snapshot = []
         try:
@@ -2177,7 +2182,7 @@ class XHSCrawler:
                 try:
                     db.upsert_xhs_cookie(self.account_name, cookie_snapshot)
                     self.logger.info(
-                        "风控扫码后已保存账号 [%s] 最新 Cookie（%d条）",
+                        "会话重建前已保存账号 [%s] 最新 Cookie（%d条）",
                         self.account_name,
                         len(cookie_snapshot)
                     )
@@ -2187,9 +2192,9 @@ class XHSCrawler:
                     except Exception:
                         pass
             except Exception as save_err:
-                self.logger.warning("风控扫码后保存 Cookie 失败: %s", save_err)
+                self.logger.warning("会话重建前保存 Cookie 失败: %s", save_err)
 
-        self.logger.info("风控恢复后重启当前浏览器会话，以重新挂载登录态（账号: %s）", self.account_name or "-")
+        self.logger.info("会话重建后重启当前浏览器会话，以重新挂载登录态（账号: %s）", self.account_name or "-")
         try:
             if self.driver:
                 self.driver.quit()
@@ -2214,17 +2219,17 @@ class XHSCrawler:
                     except Exception:
                         continue
                 if injected:
-                    self.logger.info("风控恢复后已重新注入 Cookie：%d 条", injected)
+                    self.logger.info("会话重建后已重新注入 Cookie：%d 条", injected)
                     self._driver_refresh()
 
             ok, reason = self._wait_for_session_ready(
                 timeout_sec=45,
-                stage="风控恢复",
+                stage="会话恢复",
                 allow_cookie_fallback=True,
                 cross_page_validation=False
             )
             if not ok:
-                self.logger.warning("风控恢复后重启浏览器仍未确认登录态：%s", reason)
+                self.logger.warning("会话重建后重启浏览器仍未确认登录态：%s", reason)
                 return False
             try:
                 latest_snapshot = self.driver.get_cookies() or []
@@ -2233,7 +2238,7 @@ class XHSCrawler:
                     try:
                         db.upsert_xhs_cookie(self.account_name, latest_snapshot)
                         self.logger.info(
-                            "风控恢复后已回写账号 [%s] Cookie（%d条）",
+                            "会话重建后已回写账号 [%s] Cookie（%d条）",
                             self.account_name,
                             len(latest_snapshot)
                         )
@@ -2243,16 +2248,16 @@ class XHSCrawler:
                         except Exception:
                             pass
             except Exception as save_latest_err:
-                self.logger.warning("风控恢复后回写 Cookie 失败: %s", save_latest_err)
+                self.logger.warning("会话重建后回写 Cookie 失败: %s", save_latest_err)
 
             if resume_url:
                 try:
                     self._driver_get(resume_url)
                 except Exception as open_err:
-                    self.logger.warning("风控恢复后返回原页面失败，将继续当前页: %s", open_err)
+                    self.logger.warning("会话重建后返回原页面失败，将继续当前页: %s", open_err)
             return True
         except Exception as e:
-            self.logger.exception("风控恢复后重启浏览器会话失败: %s", e)
+            self.logger.exception("会话重建后重启浏览器会话失败: %s", e)
             return False
 
     # ---- stop / pause ----
@@ -3624,11 +3629,53 @@ return result;
             except Exception:
                 pass
 
+    @staticmethod
+    def _is_browser_session_crash(error: Exception) -> bool:
+        """仅识别浏览器崩溃或会话断开，普通页面错误不重启浏览器。"""
+        if not isinstance(error, WebDriverException):
+            return False
+        message = str(error).lower()
+        return any(marker in message for marker in (
+            "tab crashed", "session deleted because of page crash",
+            "invalid session id", "disconnected", "chrome not reachable",
+            "not connected to devtools",
+        ))
+
     def crawl_target(
             self,
             row: Dict,
             note_detail_handler: Optional[Callable[[List[str], Dict, Dict[str, int]], None]] = None
     ):
+        """采集当前对象；浏览器崩溃时重建会话并重试一次，失败则停止任务。"""
+        for attempt in range(2):
+            self.check_stop()
+            try:
+                return self._crawl_target_once(row, note_detail_handler)
+            except WebDriverException as error:
+                if not self._is_browser_session_crash(error):
+                    raise
+                # 已入库数据保留；重试通过现有数据库查重跳过这些笔记。
+                for key, value in self.last_target_stats.items():
+                    self.total_crawl_stats[key] += value
+                self.logger.error("账号 [%s] 浏览器会话已损坏：%s", self.account_name, error)
+                if attempt == 0:
+                    self.check_stop()
+                    self.all_links.clear()
+                    self.collected_quick_data.clear()
+                    self.note_card_meta.clear()
+                    if self._restart_browser_session():
+                        self.logger.info("浏览器已恢复，重试当前对象：%s", row.get('brand_name', ''))
+                        continue
+                self.request_stop()
+                self.logger.error("浏览器恢复失败，已停止采集；当前对象未完成，请重新开始采集")
+                raise KeyboardInterrupt("浏览器恢复失败")
+
+    def _crawl_target_once(
+            self,
+            row: Dict,
+            note_detail_handler: Optional[Callable[[List[str], Dict, Dict[str, int]], None]] = None
+    ):
+        """执行一次对象采集，将会话损坏交给外层恢复。"""
         current_stats = self._new_crawl_stats()
         self.last_target_stats = current_stats
         try:
@@ -3730,6 +3777,8 @@ return result;
                 self.all_links.clear()
                 self.collected_quick_data.clear()
                 self.note_card_meta.clear()
+            # 页面操作可能在内部被捕获；完成前确认渲染进程仍可用。
+            self.driver.execute_script("return 1")
             for k in current_stats.keys():
                 self.total_crawl_stats[k] = int(self.total_crawl_stats.get(k, 0)) + int(current_stats.get(k, 0))
             return True
@@ -3738,6 +3787,8 @@ return result;
             return False
         except Exception as e:
             self.logger.error(f"对象采集失败 {resolve_rednote_url(row)}: {e}")
+            if self._is_browser_session_crash(e):
+                raise
             return False
 
 
@@ -6590,7 +6641,8 @@ class App:
                         target_stats = dict(self.crawler.last_target_stats or {})
                         total_stats = dict(self.crawler.total_crawl_stats or {})
                         self.logger.info(
-                            "处理完成[%s]：打开URL=%d，入库=%d，DB已存在跳过=%d；累计 打开URL=%d，入库=%d，DB已存在跳过=%d",
+                            "%s[%s]：打开URL=%d，入库=%d，DB已存在跳过=%d；累计 打开URL=%d，入库=%d，DB已存在跳过=%d",
+                            "采集完成" if ok else "采集失败",
                             name,
                             int(target_stats.get("opened_urls", 0)),
                             int(target_stats.get("inserted_urls", 0)),
@@ -6607,7 +6659,7 @@ class App:
                     except Exception as e:
                         self.logger.error(f"处理异常 {row.get('brand_name')}: {e}")
                     finally:
-                        self.done_rows = idx
+                        self.done_rows = idx - 1 if self.crawler and self.crawler.stop_requested else idx
                         self.ui_update_progress()
                         if (
                                 idx < self.total_rows
@@ -6635,9 +6687,9 @@ class App:
                     self.logger.info("任务结束")
                     self.ui_set_status("已完成")
                     completed_normally = True
-            except KeyboardInterrupt:
-                self.logger.info("用户停止或被验证码拦截")
-                self.ui_set_status("已停止")
+            except KeyboardInterrupt as stop_reason:
+                self.logger.info("采集已停止：%s", stop_reason)
+                self.ui_set_status("已停止：浏览器恢复失败" if str(stop_reason) == "浏览器恢复失败" else "已停止")
             except Exception as e:
                 self.logger.exception(f"运行异常：{e}")
                 self.ui_set_status("异常")

@@ -43,6 +43,9 @@ DEFAULT_PAGE_WAIT_SECONDS = 1.0
 DEFAULT_MAX_ROUNDS = 240
 DEFAULT_IDLE_ROUNDS = 8
 
+# 单轮最多连续展开的回复批次，避免一个超长楼层阻塞后续评论加载。
+MAX_REPLY_EXPAND_PASSES = 8
+
 
 def normalize_note_url(original_url: str) -> str:
     """将笔记地址统一为 explore 地址并保留必要的 xsec 参数。"""
@@ -335,22 +338,42 @@ return {floors, total_comments: totalText};
 
 SCROLL_COMMENTS_SCRIPT = r"""
 const container = document.querySelector(".comments-container, [class*='comments-container']");
-const candidates = container ? [container, ...container.querySelectorAll('*')] : [];
-const scrollables = candidates.filter((node) => node.scrollHeight > node.clientHeight + 8);
-const commentScrollable = scrollables.find((node) => /comment/i.test(String(node.className || '')));
-const scrollable = commentScrollable || scrollables[0];
+if (!container) {
+  return {before: 0, after: 0, height: 0, viewport: 0, at_bottom: true, target: ''};
+}
+const canScroll = (node) => Boolean(node && node.scrollHeight > node.clientHeight + 8);
+const explicitTargets = [
+  container.closest('.note-scroller'),
+  container.closest('[class*="note-scroller"]'),
+  container.closest('.interaction-container'),
+  container.closest('[class*="interaction-container"]')
+].filter(Boolean);
+let scrollable = explicitTargets.find(canScroll) || null;
 if (!scrollable) {
-  return {before: 0, after: 0, height: 0, viewport: 0, at_bottom: true};
+  let ancestor = container;
+  while (ancestor) {
+    const style = window.getComputedStyle(ancestor);
+    if (canScroll(ancestor) && /(auto|scroll|overlay)/.test(style.overflowY || '')) {
+      scrollable = ancestor;
+      break;
+    }
+    ancestor = ancestor.parentElement;
+  }
+}
+if (!scrollable) {
+  return {before: 0, after: 0, height: 0, viewport: 0, at_bottom: true, target: ''};
 }
 const target = scrollable;
 const before = target.scrollTop;
 target.scrollTop = target.scrollHeight;
+target.dispatchEvent(new Event('scroll', {bubbles: true}));
 return {
   before,
   after: target.scrollTop,
   height: target.scrollHeight,
   viewport: target.clientHeight,
-  at_bottom: target.scrollTop + target.clientHeight >= target.scrollHeight - 8
+  at_bottom: target.scrollTop + target.clientHeight >= target.scrollHeight - 8,
+  target: String(target.className || target.tagName || '')
 };
 """
 
@@ -358,20 +381,32 @@ return {
 EXPAND_REPLIES_SCRIPT = r"""
 const container = document.querySelector(".comments-container, [class*='comments-container']");
 if (!container) return {clicked: 0, remaining: 0};
+const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+const expandPattern = /(?:展开|查看|更多).*(?:回复|评论)|(?:回复|评论).*(?:展开|查看|更多)|\d+\s*条回复/;
+const clickHistory = window.__xhsCommentCrawlerClickHistory || new WeakMap();
+window.__xhsCommentCrawlerClickHistory = clickHistory;
 let clicked = 0;
 const nodes = Array.from(container.querySelectorAll('.show-more, button, [role="button"]'));
 for (const node of nodes) {
-  const text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-  if (!/展开|更多回复|条回复/.test(text) || /^回复$/.test(text)) continue;
+  const text = compact(node.innerText || node.textContent);
+  if (!expandPattern.test(text) || /^回复$/.test(text)) continue;
   const style = window.getComputedStyle(node);
   if (style.display === 'none' || style.visibility === 'hidden') continue;
+  const floor = node.closest('.parent-comment, [class*="parent-comment"]');
+  const replyCount = floor ? floor.querySelectorAll(
+    '.reply-container .comment-item-sub, .reply-container [class*="comment-item-sub"]'
+  ).length : 0;
+  const state = `${text}\u0001${replyCount}`;
+  const previous = clickHistory.get(node);
+  if (previous && previous.state === state && Date.now() - previous.clickedAt < 5000) continue;
   try {
+    clickHistory.set(node, {state, clickedAt: Date.now()});
     node.click();
     clicked += 1;
   } catch (_) {}
-  if (clicked >= 40) break;
+  if (clicked >= 8) break;
 }
-const remaining = nodes.filter((node) => /展开|更多回复|条回复/.test(String(node.innerText || node.textContent || ''))).length;
+const remaining = nodes.filter((node) => expandPattern.test(compact(node.innerText || node.textContent))).length;
 return {clicked, remaining};
 """
 
@@ -419,10 +454,17 @@ class XHSCommentCrawler:
             raise RuntimeError("评论区没有加载出来，请确认页面可访问且已在浏览器中完成登录") from exc
 
     def _expand_visible_replies(self) -> int:
-        """点击当前已渲染评论中的楼中楼展开控件。"""
-        self._check_stop()
-        result = self.driver.execute_script(EXPAND_REPLIES_SCRIPT) or {}
-        return int(result.get("clicked") or 0)
+        """分批点击当前评论的回复控件，并等待楼中楼异步内容写入 DOM。"""
+        clicked_total = 0
+        for _ in range(MAX_REPLY_EXPAND_PASSES):
+            self._check_stop()
+            result = self.driver.execute_script(EXPAND_REPLIES_SCRIPT) or {}
+            clicked = int(result.get("clicked") or 0)
+            if clicked <= 0:
+                break
+            clicked_total += clicked
+            time.sleep(self.page_wait_seconds)
+        return clicked_total
 
     def _scroll_comments(self) -> Dict[str, Any]:
         """滚动评论容器到底部，触发下一批评论加载。"""
@@ -474,16 +516,18 @@ class XHSCommentCrawler:
                 break
 
             scroll_state = self._scroll_comments()
-            changed = added > 0 or expanded > 0
+            moved = int(scroll_state.get("after") or 0) > int(scroll_state.get("before") or 0)
+            changed = added > 0 or moved
             at_bottom = bool(scroll_state.get("at_bottom"))
             idle = 0 if changed else idle + 1
             self.logger.info(
-                "评论采集第 %d 轮：新增 %d，已展开 %d，累计 %d%s",
+                "评论采集第 %d 轮：新增 %d，已展开 %d，累计 %d%s，滚动容器 %s",
                 round_index + 1,
                 added,
                 expanded,
                 len(merged),
                 f"/{total_comments}" if total_comments else "",
+                scroll_state.get("target") or "未找到",
             )
             if idle >= max(1, int(idle_rounds)) and at_bottom:
                 break

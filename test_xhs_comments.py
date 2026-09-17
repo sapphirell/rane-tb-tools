@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import call, patch
 
 from xhs_comments import (
     EXPAND_REPLIES_SCRIPT,
     SCROLL_COMMENTS_SCRIPT,
+    XHSCommentCrawler,
     extract_note_id,
     flatten_comment_floors,
     group_comment_floors,
@@ -108,6 +110,36 @@ class XHSCommentHelpersTest(unittest.TestCase):
         self.assertNotIn("window.scrollTo", SCROLL_COMMENTS_SCRIPT)
         self.assertNotIn("document.scrollingElement", SCROLL_COMMENTS_SCRIPT)
         self.assertNotIn("scrollIntoView", EXPAND_REPLIES_SCRIPT)
+
+    def test_comment_scroll_uses_detail_panel_ancestor(self):
+        self.assertIn("container.closest('.note-scroller')", SCROLL_COMMENTS_SCRIPT)
+        self.assertIn("ancestor = ancestor.parentElement", SCROLL_COMMENTS_SCRIPT)
+        self.assertIn("new Event('scroll'", SCROLL_COMMENTS_SCRIPT)
+
+    def test_reply_expansion_supports_more_pages_without_duplicate_clicks(self):
+        self.assertIn("更多", EXPAND_REPLIES_SCRIPT)
+        self.assertIn("replyCount", EXPAND_REPLIES_SCRIPT)
+        self.assertIn("__xhsCommentCrawlerClickHistory", EXPAND_REPLIES_SCRIPT)
+
+    def test_reply_expansion_waits_for_each_async_page(self):
+        class FakeDriver:
+            """按顺序返回两批点击结果和结束状态。"""
+
+            def __init__(self):
+                self.results = iter(({"clicked": 2}, {"clicked": 1}, {"clicked": 0}))
+
+            def execute_script(self, script):
+                self.assert_script = script
+                return next(self.results)
+
+        crawler = XHSCommentCrawler.__new__(XHSCommentCrawler)
+        crawler.driver = FakeDriver()
+        crawler.page_wait_seconds = 0.6
+        crawler._check_stop = lambda: None
+        with patch("xhs_comments.time.sleep") as mocked_sleep:
+            self.assertEqual(crawler._expand_visible_replies(), 3)
+        self.assertEqual(crawler.driver.assert_script, EXPAND_REPLIES_SCRIPT)
+        self.assertEqual(mocked_sleep.call_args_list, [call(0.6), call(0.6)])
 
 
 if __name__ == "__main__":
