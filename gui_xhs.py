@@ -75,6 +75,8 @@ BRAND_ACCOUNT_ROTATE_EVERY = 1
 BRAND_NOTE_ACCOUNT_ROTATE_EVERY = 1
 LOGIN_QR_CAPTURE_INTERVAL_SEC = 10.0
 LOGIN_QR_REEMIT_INTERVAL_SEC = 25.0
+# 艺术家补采策略只处理对应身份收录作品少于此数量的艺术家。
+ARTIST_WORK_COUNT_THRESHOLD = 3
 
 
 def convert_xhs_url(original_url: str) -> str:
@@ -200,6 +202,7 @@ class ArtistCrawlMode:
 
     DEFAULT = 'default'
     UNCOLLECTED_FIRST = 'uncollected_first'
+    LOW_WORK_COUNT = 'low_work_count'
 
 
 CRAWL_MODE_ORDER = [CrawlMode.HOT, CrawlMode.REVERSE, CrawlMode.FULL]
@@ -222,12 +225,18 @@ BRAND_RECENT_GATHER_FILTER_OPTIONS = [
 ARTIST_CRAWL_MODE_TITLES = {
     ArtistCrawlMode.DEFAULT: "默认排序",
     ArtistCrawlMode.UNCOLLECTED_FIRST: "未采集优先",
+    ArtistCrawlMode.LOW_WORK_COUNT: "妆图 / 毛图少于 3 张",
 }
 ARTIST_CRAWL_MODE_DESCRIPTIONS = {
     ArtistCrawlMode.DEFAULT: "按原有权重和最近采集时间排序",
     ArtistCrawlMode.UNCOLLECTED_FIRST: "优先采集从未跑过的创作者，再按最久未采集排序",
+    ArtistCrawlMode.LOW_WORK_COUNT: "只采集对应妆图或毛图少于 3 张的创作者",
 }
-ARTIST_CRAWL_MODE_ORDER = [ArtistCrawlMode.UNCOLLECTED_FIRST, ArtistCrawlMode.DEFAULT]
+ARTIST_CRAWL_MODE_ORDER = [
+    ArtistCrawlMode.LOW_WORK_COUNT,
+    ArtistCrawlMode.UNCOLLECTED_FIRST,
+    ArtistCrawlMode.DEFAULT,
+]
 
 
 class DatabaseManager:
@@ -925,6 +934,8 @@ class DatabaseManager:
         order_sql = """
             ORDER BY spider_index DESC, last_gather_time ASC
         """
+        work_count_filter_sql = ""
+        query_params: Tuple[int, ...] = ()
         if crawl_mode == ArtistCrawlMode.UNCOLLECTED_FIRST:
             order_sql = """
             ORDER BY
@@ -936,6 +947,24 @@ class DatabaseManager:
                 spider_index DESC,
                 id DESC
             """
+        elif crawl_mode == ArtistCrawlMode.LOW_WORK_COUNT:
+            # 妆师只看妆图，毛娘只看毛图；同一品牌同时具备两种身份时，任一身份不足阈值即可进入列表。
+            work_count_filter_sql = """
+              AND (
+                    (is_bjd_artist = 1 AND (
+                        SELECT COUNT(*)
+                        FROM bjd_faceup faceup
+                        WHERE faceup.brand_id = brand.id
+                    ) < %s)
+                    OR (is_bjd_hairstylist = 1 AND (
+                        SELECT COUNT(*)
+                        FROM custom_wig wig
+                        WHERE wig.brand_id = brand.id
+                          AND wig.is_delete = 0
+                    ) < %s)
+              )
+            """
+            query_params = (ARTIST_WORK_COUNT_THRESHOLD, ARTIST_WORK_COUNT_THRESHOLD)
 
         sql = f"""
             SELECT id, brand_name, rednote_url, rednote_url2, rednote_spd_setting_for_artist 
@@ -944,9 +973,10 @@ class DatabaseManager:
               AND (is_bjd_artist = 1 or is_bjd_hairstylist = 1)
               AND (rednote_url != '' OR rednote_url2 != '')
               AND rednote_spd_setting_for_artist != 3
+            {work_count_filter_sql}
             {order_sql}
         """
-        cur, _ = self._exec(sql)
+        cur, _ = self._exec(sql, query_params)
         return cur.fetchall()
 
     def is_url_exists_artist(self, url: str) -> bool:
